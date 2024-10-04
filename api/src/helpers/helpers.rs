@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
 use mongodb::bson::DateTime as BsonDateTime;
+use serde::{Serialize};
+use actix_web::{HttpResponse};
 
 pub fn validlonlat(coords: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
     coords.into_iter().map(|mut pair| {
@@ -24,5 +26,13 @@ pub fn bsondate2string(date: &BsonDateTime) -> String {
     match datetime {
         Some(dt) => dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         None => String::from("Invalid timestamp"),
+    }
+}
+
+pub fn create_response<T: Serialize>(results: Vec<T>) -> HttpResponse {
+    if results.is_empty() {
+        HttpResponse::NotFound().json("No results found")
+    } else {
+        HttpResponse::Ok().json(results)
     }
 }

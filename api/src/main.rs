@@ -1,6 +1,7 @@
 use api::helpers::filters;
 use api::helpers::transforms;
 use api::helpers::schema;
+use api::helpers::helpers;
 
 use mongodb::{options::FindOptions, bson::Document, error::Result};
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
@@ -60,7 +61,21 @@ async fn search_data_schema(query_params: web::Query<serde_json::Value>) -> impl
     };
     let munged_results = transforms::transform_timeseries(params.clone(), timeseries, data_info, results);
 
-    HttpResponse::Ok().json(munged_results)
+    // return results ///////////////////////////////////////////////
+    let compression: Option<String> = params.get("compression")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    if let Some(compression) = compression {
+        if compression == "minimal" {
+            let r = transforms::timeseries_stub(munged_results.clone());
+            helpers::create_response(r)
+        } else {
+            helpers::create_response(munged_results)
+        }
+    } else {
+        helpers::create_response(munged_results)
+    }
 }
 
 #[actix_web::main]
@@ -91,7 +106,6 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(|| {
         App::new()
-            .service(get_query_params)
             .service(search_data_schema)
     })
     .bind(("0.0.0.0", 8080))?

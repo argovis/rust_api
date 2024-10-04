@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde::ser::{Serializer, SerializeSeq};
 use mongodb::bson::DateTime as BsonDateTime;
 
 // generic structs ////////////////////////////////////////////////////////////
@@ -24,6 +25,12 @@ pub trait IsTimeseries {
     fn set_data(&mut self, data: Vec<Vec<f64>>);
     fn timeseries(&mut self) -> Option<&mut Vec<String>>;
     fn set_timeseries(&mut self, timeseries: Vec<String>);
+    fn set_data_info(&mut self, data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>));
+    fn _id(&self) -> String;
+    fn longitude(&self) -> f64;
+    fn latitude(&self) -> f64;
+    fn level(&self) -> f64;
+    fn metadata(&self) -> Vec<String>;
 }
 
 pub trait IsTimeseriesMeta {
@@ -45,7 +52,8 @@ pub struct BsoseSchema {
     cell_z_size: f64,
     reference_density_profile: f64,
     data: Vec<Vec<f64>>,
-    timeseries: Option<Vec<String>> // since this field isnt present in the data collection, but gets munged on later
+    timeseries: Option<Vec<String>>, // since this field isnt present in the data collection, but gets munged on later
+    data_info: Option<(Vec<String>, Vec<String>, Vec<Vec<String>>)>,
 }
 
 impl IsTimeseries for BsoseSchema {
@@ -68,6 +76,30 @@ impl IsTimeseries for BsoseSchema {
     fn set_timeseries(&mut self, timeseries: Vec<String>) {
         self.timeseries = Some(timeseries);
     }
+
+    fn set_data_info(&mut self, data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>)) {
+        self.data_info = Some(data_info);
+    }
+
+    fn _id(&self) -> String {
+        self._id.clone()
+    }
+
+    fn longitude(&self) -> f64 {
+        self.geolocation.coordinates[0]
+    }
+
+    fn latitude(&self) -> f64 {
+        self.geolocation.coordinates[1]
+    }
+
+    fn level(&self) -> f64 {
+        self.level
+    }
+
+    fn metadata(&self) -> Vec<String> {
+        self.metadata.clone()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -88,5 +120,29 @@ pub struct BsoseMeta {
 impl IsTimeseriesMeta for BsoseMeta {
     fn get_timeseries_meta(&self) -> bool {
         return true;
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct TimeseriesStub {
+    pub _id: String,
+    pub longitude: f64,
+    pub latitude: f64,
+    pub level: f64,
+    pub metadata: Vec<String>,
+}
+
+impl Serialize for TimeseriesStub {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(5))?;
+        seq.serialize_element(&self._id)?;
+        seq.serialize_element(&self.longitude)?;
+        seq.serialize_element(&self.latitude)?;
+        seq.serialize_element(&self.level)?;
+        seq.serialize_element(&self.metadata)?;
+        seq.end()
     }
 }

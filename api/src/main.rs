@@ -2,14 +2,17 @@ use api::helpers::filters;
 use api::helpers::transforms;
 use api::helpers::schema;
 
-use mongodb::{options::{FindOptions}};
+use mongodb::{options::FindOptions, bson::Document, error::Result};
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use futures::stream::StreamExt;
 use std::env;
+use serde::de::DeserializeOwned;
+use mongodb::bson::DateTime;
 
 static CLIENT: Lazy<Mutex<Option<mongodb::Client>>> = Lazy::new(|| Mutex::new(None));
+static TIMESERIES: Lazy<Mutex<Option<Vec<DateTime>>>> = Lazy::new(|| Mutex::new(None));
 
 #[get("/query_params")]
 async fn get_query_params(query_params: web::Query<serde_json::Value>) -> impl Responder {
@@ -37,15 +40,7 @@ async fn search_data_schema(query_params: web::Query<serde_json::Value>) -> impl
             //.limit(page_size)
     };
 
-    let mut cursor = {
-        let options = options_builder.build(); 
-        let guard = match CLIENT.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let client = guard.as_ref().unwrap();
-        client.database("argo").collection::<schema::DataSchema>("bsose").find(filter, options).await.unwrap()
-    }; // in theory the mutex is unlocked here, holding it as little as possible
+    let mut cursor = generate_cursor::<schema::BsoseSchema>("argo", "bsose", filter, Some(options_builder.build())).await.unwrap();
 
     // extract results from db //////////////////////////////////////
     let mut results = Vec::new();
@@ -63,7 +58,11 @@ async fn search_data_schema(query_params: web::Query<serde_json::Value>) -> impl
     }
 
     // transform results ////////////////////////////////////////////
-    let munged_results = transforms::transform_timeseries(params.clone(), results);
+    let timeseries = {
+        let ts = TIMESERIES.lock().unwrap();
+        ts.clone().unwrap()
+    };
+    let munged_results = transforms::transform_timeseries(params.clone(), timeseries, results);
 
     HttpResponse::Ok().json(munged_results)
 }
@@ -76,6 +75,23 @@ async fn main() -> std::io::Result<()> {
     let client = mongodb::Client::with_options(client_options).unwrap(); 
     *CLIENT.lock().unwrap() = Some(client);
 
+    // some generic data useful to have on hand
+    let mut filter = mongodb::bson::doc! {"data_type": "BSOSE-profile"};
+    let mut options = FindOptions::builder().limit(1).build();
+    let mut metacursor = generate_cursor::<schema::BsoseMeta>("argo", "timeseriesMeta", filter, Some(options)).await.unwrap();
+    let mut metadata = Vec::new();
+    while let Some(result) = metacursor.next().await {
+        match result {
+            Ok(document) => {
+                metadata.push(document);
+            },  
+            Err(e) => {
+                eprintln!("Error: {}", e);
+            }
+        }
+    }
+    *TIMESERIES.lock().unwrap() = Some(metadata[0].timeseries.clone());
+
     HttpServer::new(|| {
         App::new()
             .service(get_query_params)
@@ -84,4 +100,30 @@ async fn main() -> std::io::Result<()> {
     .bind(("0.0.0.0", 8080))?
     .run()
     .await
+}
+
+// async fn generate_cursor<T: DeserializeOwned>(db_name: &str, collection_name: &str, filter: Document, options: Option<FindOptions>) -> Result<mongodb::Cursor<T>> {
+//     let guard = match CLIENT.lock() {
+//         Ok(guard) => guard,
+//         Err(poisoned) => poisoned.into_inner(),
+//     };
+//     let client = match guard.as_ref() {
+//         Some(client) => client,
+//         None => return Err(mongodb::error::Error::from(std::io::Error::new(std::io::ErrorKind::Other, "Client is None"))),
+//     };
+//     client.database(db_name).collection::<T>(collection_name).find(filter, options).await
+// }
+
+async fn generate_cursor<T: DeserializeOwned>(db_name: &str, collection_name: &str, filter: Document, options: Option<FindOptions>) -> Result<mongodb::Cursor<T>> {
+    let client = {
+        let guard = match CLIENT.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard.as_ref() {
+            Some(client) => client.clone(),
+            None => return Err(mongodb::error::Error::from(std::io::Error::new(std::io::ErrorKind::Other, "Client is None"))),
+        }
+    };
+    client.database(db_name).collection::<T>(collection_name).find(filter, options).await
 }

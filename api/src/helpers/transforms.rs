@@ -1,4 +1,5 @@
 use super::schema;
+use super::helpers;
 use chrono::{DateTime, Utc};
 use mongodb::bson::DateTime as BsonDateTime;
 
@@ -6,20 +7,30 @@ pub fn print_query_params(params: serde_json::Value) {
     println!("{:?}", params);
 }
 
-pub fn transform_timeseries<T: schema::IsTimeseries>(params: serde_json::Value, ts: Vec<BsonDateTime>, results: Vec<T>) -> Vec<T> {
+pub fn transform_timeseries<T: schema::IsTimeseries + Clone>(params: serde_json::Value, ts: Vec<BsonDateTime>, results: Vec<T>) -> Vec<T> {
     
     // extract query parameters //////////////////////////////////////
     let start_date = params.get("startDate")
-        .and_then(|v| v.as_str())  // Extract as a string
-        .and_then(|s| s.parse::<DateTime<Utc>>().ok())  // Try parsing as DateTime<Utc>
-        .map(|dt| BsonDateTime::from_millis(dt.timestamp_millis()));  // Convert to BSON DateTime
+        .and_then(|v| v.as_str())
+        .and_then(helpers::string2bsondate);
 
     let end_date = params.get("endDate")
-        .and_then(|v| v.as_str())  // Extract as a string
-        .and_then(|s| s.parse::<DateTime<Utc>>().ok())  // Try parsing as DateTime<Utc>
-        .map(|dt| BsonDateTime::from_millis(dt.timestamp_millis()));  // Convert to BSON DateTime
+        .and_then(|v| v.as_str())
+        .and_then(helpers::string2bsondate);
 
 
+    // apply appropriate filters ////////////////////////////////////
+    let mut r = results.clone();
+
+    if start_date.is_some() || end_date.is_some() {
+        r = filter_timerange(start_date, end_date, ts, r);
+    }
+
+    return r;
+}
+
+pub fn filter_timerange<T: schema::IsTimeseries>(start_date: Option<BsonDateTime>, end_date: Option<BsonDateTime>, ts: Vec<BsonDateTime>, mut results: Vec<T>) -> Vec<T> {
+    // todo: sliced ts should be appended to the results
     let start_index = start_date.and_then(|start_date| {
         ts.iter().position(|&t| t >= start_date)
     }).unwrap_or(0);
@@ -28,13 +39,14 @@ pub fn transform_timeseries<T: schema::IsTimeseries>(params: serde_json::Value, 
         ts.iter().rposition(|&t| t < end_date).map(|idx| idx + 1)
     }).unwrap_or(ts.len());
 
-    let ts_slice = &ts[start_index..end_index];
-    println!("{:?}", ts_slice);
+    for result in &mut results {
+        let data = result.data();
+        *data = data.iter().map(|inner_vec| {
+            let slice = &inner_vec[start_index..end_index];
+            slice.to_vec()
+        }).collect();
+    }
 
-    // // transform results ////////////////////////////////////////////
-    // if start_date.is_some() || end_date.is_some() {
-    //     let timeseries_meta = collection.find_one(doc! { "_id": results[0].metadata[0] }, None).unwrap();
-    // }
+    results
 
-    return results;
 }

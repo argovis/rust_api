@@ -20,6 +20,7 @@ pub struct SourceMeta {
 
 pub trait IsTimeseries {
     fn get_timeseries(&self) -> bool;
+    fn data(&mut self) -> &mut Vec<Vec<f64>>;
 }
 
 pub trait IsTimeseriesMeta {
@@ -46,6 +47,10 @@ pub struct BsoseSchema {
 impl IsTimeseries for BsoseSchema {
     fn get_timeseries(&self) -> bool {
         return true;
+    }
+
+    fn data(&mut self) -> &mut Vec<Vec<f64>> {
+        &mut self.data
     }
 }
 

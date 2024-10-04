@@ -38,7 +38,10 @@ pub fn filter_timerange<T: schema::IsTimeseries>(start_date: Option<BsonDateTime
         ts.iter().rposition(|&t| t < end_date).map(|idx| idx + 1)
     }).unwrap_or(ts.len());
 
-    let time_window = ts[start_index..end_index].to_vec();
+    let time_window: Vec<String> = ts[start_index..end_index]
+        .iter()
+        .map(|t| helpers::bsondate2string(t))
+        .collect();
 
     for result in &mut results {
         let data = result.data();

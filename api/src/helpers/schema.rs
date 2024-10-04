@@ -21,8 +21,8 @@ pub struct SourceMeta {
 pub trait IsTimeseries {
     fn get_timeseries(&self) -> bool;
     fn data(&mut self) -> &mut Vec<Vec<f64>>;
-    fn timeseries(&mut self) -> Option<&mut Vec<BsonDateTime>>;
-    fn set_timeseries(&mut self, timeseries: Vec<BsonDateTime>);
+    fn timeseries(&mut self) -> Option<&mut Vec<String>>;
+    fn set_timeseries(&mut self, timeseries: Vec<String>);
 }
 
 pub trait IsTimeseriesMeta {
@@ -44,7 +44,7 @@ pub struct BsoseSchema {
     cell_z_size: f64,
     reference_density_profile: f64,
     data: Vec<Vec<f64>>,
-    timeseries: Option<Vec<BsonDateTime>> // since this field isnt present in the data collection, but gets munged on later
+    timeseries: Option<Vec<String>> // since this field isnt present in the data collection, but gets munged on later
 }
 
 impl IsTimeseries for BsoseSchema {
@@ -56,11 +56,11 @@ impl IsTimeseries for BsoseSchema {
         &mut self.data
     }
 
-    fn timeseries(&mut self) -> Option<&mut Vec<BsonDateTime>> {
+    fn timeseries(&mut self) -> Option<&mut Vec<String>> {
         self.timeseries.as_mut()
     }
 
-    fn set_timeseries(&mut self, timeseries: Vec<BsonDateTime>) {
+    fn set_timeseries(&mut self, timeseries: Vec<String>) {
         self.timeseries = Some(timeseries);
     }
 }

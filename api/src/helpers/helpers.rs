@@ -17,3 +17,12 @@ pub fn string2bsondate(date_str: &str) -> Option<BsonDateTime> {
     date_str.parse::<DateTime<Utc>>().ok()
         .map(|dt| BsonDateTime::from_millis(dt.timestamp_millis()))
 }
+
+pub fn bsondate2string(date: &BsonDateTime) -> String {
+    let millis = date.timestamp_millis();
+    let datetime = DateTime::<Utc>::from_timestamp(millis / 1000, (millis % 1000) as u32 * 1_000_000);
+    match datetime {
+        Some(dt) => dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        None => String::from("Invalid timestamp"),
+    }
+}

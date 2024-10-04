@@ -13,16 +13,7 @@ use mongodb::bson::DateTime;
 
 static CLIENT: Lazy<Mutex<Option<mongodb::Client>>> = Lazy::new(|| Mutex::new(None));
 static TIMESERIES: Lazy<Mutex<Option<Vec<DateTime>>>> = Lazy::new(|| Mutex::new(None));
-//static BSOSE_DATA_INFO: Lazy<Mutex<Option<(Vec<String>, Vec<String>, Vec<Vec<String>>)>>> = Lazy::new(|| Mutex::new(None));
-
-#[get("/query_params")]
-async fn get_query_params(query_params: web::Query<serde_json::Value>) -> impl Responder {
-    let params = query_params.into_inner();
-
-    transforms::print_query_params(params.clone());
-
-    HttpResponse::Ok().json(params)
-}
+static BSOSE_DATA_INFO: Lazy<Mutex<Option<(Vec<String>, Vec<String>, Vec<Vec<String>>)>>> = Lazy::new(|| Mutex::new(None));
 
 #[get("/search")]
 async fn search_data_schema(query_params: web::Query<serde_json::Value>) -> impl Responder {
@@ -63,7 +54,11 @@ async fn search_data_schema(query_params: web::Query<serde_json::Value>) -> impl
         let ts = TIMESERIES.lock().unwrap();
         ts.clone().unwrap()
     };
-    let munged_results = transforms::transform_timeseries(params.clone(), timeseries, results);
+    let data_info = {
+        let di = BSOSE_DATA_INFO.lock().unwrap();
+        di.clone().unwrap()
+    };
+    let munged_results = transforms::transform_timeseries(params.clone(), timeseries, data_info, results);
 
     HttpResponse::Ok().json(munged_results)
 }
@@ -92,8 +87,7 @@ async fn main() -> std::io::Result<()> {
         }
     }
     *TIMESERIES.lock().unwrap() = Some(metadata[0].timeseries.clone());
-    //*BSOSE_DATA_INFO.lock().unwrap() = Some((metadata[0].data_info.clone()));
-    //println!("{:?}", BSOSE_DATA_INFO.lock().unwrap());
+    *BSOSE_DATA_INFO.lock().unwrap() = Some(metadata[0].data_info.clone());
 
     HttpServer::new(|| {
         App::new()

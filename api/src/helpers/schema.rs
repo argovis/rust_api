@@ -21,6 +21,7 @@ pub struct SourceMeta {
 pub trait IsTimeseries {
     fn get_timeseries(&self) -> bool;
     fn data(&mut self) -> &mut Vec<Vec<f64>>;
+    fn set_data(&mut self, data: Vec<Vec<f64>>);
     fn timeseries(&mut self) -> Option<&mut Vec<String>>;
     fn set_timeseries(&mut self, timeseries: Vec<String>);
 }
@@ -54,6 +55,10 @@ impl IsTimeseries for BsoseSchema {
 
     fn data(&mut self) -> &mut Vec<Vec<f64>> {
         &mut self.data
+    }
+
+    fn set_data(&mut self, data: Vec<Vec<f64>>) {
+        self.data = data;
     }
 
     fn timeseries(&mut self) -> Option<&mut Vec<String>> {

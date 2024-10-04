@@ -2,11 +2,7 @@ use super::schema;
 use super::helpers;
 use mongodb::bson::DateTime as BsonDateTime;
 
-pub fn print_query_params(params: serde_json::Value) {
-    println!("{:?}", params);
-}
-
-pub fn transform_timeseries<T: schema::IsTimeseries + Clone>(params: serde_json::Value, ts: Vec<BsonDateTime>, results: Vec<T>) -> Vec<T> {
+pub fn transform_timeseries<T: schema::IsTimeseries + Clone>(params: serde_json::Value, ts: Vec<BsonDateTime>, data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>), results: Vec<T>) -> Vec<T> {
     
     // extract query parameters //////////////////////////////////////
     let start_date = params.get("startDate")
@@ -17,6 +13,10 @@ pub fn transform_timeseries<T: schema::IsTimeseries + Clone>(params: serde_json:
         .and_then(|v| v.as_str())
         .and_then(helpers::string2bsondate);
 
+    let data: Vec<String> = params.get("data")
+        .and_then(|v| v.as_str())
+        .map(|s| s.split(',').map(|s| s.to_string()).collect())
+        .unwrap_or_else(Vec::new);
 
     // apply appropriate filters ////////////////////////////////////
     let mut r = results.clone();
@@ -24,6 +24,9 @@ pub fn transform_timeseries<T: schema::IsTimeseries + Clone>(params: serde_json:
     if start_date.is_some() || end_date.is_some() {
         r = filter_timerange(start_date, end_date, ts, r);
     }
+
+    //println!("{:?}", data_info );
+    r = filter_data(data, data_info, r);
 
     return r;
 }
@@ -58,4 +61,27 @@ pub fn filter_timerange<T: schema::IsTimeseries>(start_date: Option<BsonDateTime
 
     results
 
+}
+
+// todo: this will probably be generic over more than just Timeseries
+pub fn filter_data<T: schema::IsTimeseries>(data: Vec<String>, data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>), mut results: Vec<T>) -> Vec<T> {
+
+    if data.is_empty() {
+        for result in &mut results {
+            result.set_data(Vec::new());
+        }
+    } else {
+        let indexes: Vec<usize> = data.iter()
+            .filter_map(|item| data_info.0.iter().position(|x| x == item))
+            .collect();
+
+        for result in &mut results {
+            let filtered_data: Vec<Vec<f64>> = indexes.iter()
+                .filter_map(|&i| result.data().get(i).cloned())
+                .collect();
+            result.set_data(filtered_data);
+        }
+    }
+
+    results
 }

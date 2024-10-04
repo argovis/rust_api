@@ -1,6 +1,5 @@
 use super::schema;
 use super::helpers;
-use chrono::{DateTime, Utc};
 use mongodb::bson::DateTime as BsonDateTime;
 
 pub fn print_query_params(params: serde_json::Value) {
@@ -30,7 +29,7 @@ pub fn transform_timeseries<T: schema::IsTimeseries + Clone>(params: serde_json:
 }
 
 pub fn filter_timerange<T: schema::IsTimeseries>(start_date: Option<BsonDateTime>, end_date: Option<BsonDateTime>, ts: Vec<BsonDateTime>, mut results: Vec<T>) -> Vec<T> {
-    // todo: sliced ts should be appended to the results
+
     let start_index = start_date.and_then(|start_date| {
         ts.iter().position(|&t| t >= start_date)
     }).unwrap_or(0);
@@ -39,12 +38,19 @@ pub fn filter_timerange<T: schema::IsTimeseries>(start_date: Option<BsonDateTime
         ts.iter().rposition(|&t| t < end_date).map(|idx| idx + 1)
     }).unwrap_or(ts.len());
 
+    let time_window = ts[start_index..end_index].to_vec();
+
     for result in &mut results {
         let data = result.data();
         *data = data.iter().map(|inner_vec| {
             let slice = &inner_vec[start_index..end_index];
             slice.to_vec()
         }).collect();
+
+        match result.timeseries() {
+            Some(timeseries) => *timeseries = time_window.clone(),
+            None => result.set_timeseries(time_window.clone()),
+        }
     }
 
     results

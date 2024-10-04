@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use mongodb::bson::DateTime;
+use mongodb::bson::DateTime as BsonDateTime;
 
 // generic structs ////////////////////////////////////////////////////////////
 
@@ -21,6 +21,8 @@ pub struct SourceMeta {
 pub trait IsTimeseries {
     fn get_timeseries(&self) -> bool;
     fn data(&mut self) -> &mut Vec<Vec<f64>>;
+    fn timeseries(&mut self) -> Option<&mut Vec<BsonDateTime>>;
+    fn set_timeseries(&mut self, timeseries: Vec<BsonDateTime>);
 }
 
 pub trait IsTimeseriesMeta {
@@ -41,7 +43,8 @@ pub struct BsoseSchema {
     ctrl_vector_3d_mask: bool,
     cell_z_size: f64,
     reference_density_profile: f64,
-    data: Vec<Vec<f64>>
+    data: Vec<Vec<f64>>,
+    timeseries: Option<Vec<BsonDateTime>> // since this field isnt present in the data collection, but gets munged on later
 }
 
 impl IsTimeseries for BsoseSchema {
@@ -52,6 +55,14 @@ impl IsTimeseries for BsoseSchema {
     fn data(&mut self) -> &mut Vec<Vec<f64>> {
         &mut self.data
     }
+
+    fn timeseries(&mut self) -> Option<&mut Vec<BsonDateTime>> {
+        self.timeseries.as_mut()
+    }
+
+    fn set_timeseries(&mut self, timeseries: Vec<BsonDateTime>) {
+        self.timeseries = Some(timeseries);
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -59,8 +70,8 @@ pub struct BsoseMeta {
     _id: String,
     data_type: String,
     pub data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>),
-    date_updated_argovis: DateTime,
-    pub timeseries: Vec<DateTime>,
+    date_updated_argovis: BsonDateTime,
+    pub timeseries: Vec<BsonDateTime>,
     source: Vec<SourceMeta>,
     cell_area: f64,
     ocean_depth: f64,

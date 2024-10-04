@@ -13,6 +13,7 @@ use mongodb::bson::DateTime;
 
 static CLIENT: Lazy<Mutex<Option<mongodb::Client>>> = Lazy::new(|| Mutex::new(None));
 static TIMESERIES: Lazy<Mutex<Option<Vec<DateTime>>>> = Lazy::new(|| Mutex::new(None));
+//static BSOSE_DATA_INFO: Lazy<Mutex<Option<(Vec<String>, Vec<String>, Vec<Vec<String>>)>>> = Lazy::new(|| Mutex::new(None));
 
 #[get("/query_params")]
 async fn get_query_params(query_params: web::Query<serde_json::Value>) -> impl Responder {
@@ -91,6 +92,8 @@ async fn main() -> std::io::Result<()> {
         }
     }
     *TIMESERIES.lock().unwrap() = Some(metadata[0].timeseries.clone());
+    //*BSOSE_DATA_INFO.lock().unwrap() = Some((metadata[0].data_info.clone()));
+    //println!("{:?}", BSOSE_DATA_INFO.lock().unwrap());
 
     HttpServer::new(|| {
         App::new()

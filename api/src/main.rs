@@ -2,13 +2,12 @@
 todo:
 
 demo critical
-legacy search parameters: mostrecent,batchmeta
-parameter validation
-pagination
+ -- done --
 
 production critical
 rate limiting
 unit testing
+legacy search parameters: mostrecent
 
 nice to have someday
 transform logic as traits?
@@ -37,7 +36,17 @@ static BSOSE_DATA_INFO: Lazy<Mutex<Option<(Vec<String>, Vec<String>, Vec<Vec<Str
 async fn search_data_schema(query_params: web::Query<serde_json::Value>) -> impl Responder {
     let params = query_params.into_inner();
 
-    // todo: validate query params /////////////////////////////////
+    let page: i64 = params.get("page")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let page_size = 1000;
+
+    // validate query params ////////////////////////////////////////
+    match helpers::validate_query_params(&params) {
+        Ok(_) => {},
+        Err(response) => return response,
+    }
 
     // construct filter from query params //////////////////////////
     let filter = filters::filter_timeseries(params.clone());
@@ -45,9 +54,9 @@ async fn search_data_schema(query_params: web::Query<serde_json::Value>) -> impl
     // Search for documents with matching filters //////////////////
     let options_builder = {
         FindOptions::builder()
-            //.sort(mongodb::bson::doc! { "JULD": -1 })
-            //.skip(page * (page_size as u64))
-            //.limit(page_size)
+            .sort(mongodb::bson::doc! { "_id": 1 })
+            .skip(Some((page * page_size) as u64))
+            .limit(page_size)
     };
 
     let mut cursor = generate_cursor::<schema::BsoseSchema>("argo", "bsose", filter, Some(options_builder.build())).await.unwrap();

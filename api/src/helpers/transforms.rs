@@ -125,3 +125,4 @@ pub fn timeseries_stub<T: schema::IsTimeseries>(results: Vec<T>) -> Vec<schema::
 
     r
 }
+

@@ -12,7 +12,6 @@ pub fn filter_timeseries(params: serde_json::Value) -> mongodb::bson::Document {
     let radius = params.get("radius").map(|d| d.as_str().unwrap().parse::<f64>().unwrap());
     let id = params.get("id").map(|p| p.as_str().unwrap());
     let vertical_range = params.get("verticalRange").map(|p| p.as_str().unwrap());
-    // todo: legacy search parameters: mostrecent,batchmeta
 
     // Construct the filter
     let mut filter = mongodb::bson::doc! {};

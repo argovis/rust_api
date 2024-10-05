@@ -1,3 +1,19 @@
+/*
+todo:
+
+demo critical
+legacy search parameters: mostrecent,batchmeta
+parameter validation
+pagination
+
+production critical
+rate limiting
+unit testing
+
+nice to have someday
+transform logic as traits?
+*/
+
 use api::helpers::filters;
 use api::helpers::transforms;
 use api::helpers::schema;
@@ -11,6 +27,7 @@ use futures::stream::StreamExt;
 use std::env;
 use serde::de::DeserializeOwned;
 use mongodb::bson::DateTime;
+use std::collections::HashSet;
 
 static CLIENT: Lazy<Mutex<Option<mongodb::Client>>> = Lazy::new(|| Mutex::new(None));
 static TIMESERIES: Lazy<Mutex<Option<Vec<DateTime>>>> = Lazy::new(|| Mutex::new(None));
@@ -66,6 +83,10 @@ async fn search_data_schema(query_params: web::Query<serde_json::Value>) -> impl
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    let batchmeta: Option<String> = params.get("batchmeta")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     if let Some(compression) = compression {
         if compression == "minimal" {
             let r = transforms::timeseries_stub(munged_results.clone());
@@ -73,6 +94,21 @@ async fn search_data_schema(query_params: web::Query<serde_json::Value>) -> impl
         } else {
             helpers::create_response(munged_results)
         }
+    } else if let Some(_batchmeta) = batchmeta {
+        let unique_metadata: HashSet<_> = munged_results.iter()
+            .flat_map(|item| item.metadata.clone())
+            .collect();
+
+        let filter = mongodb::bson::doc! {
+            "_id": {
+                "$in": unique_metadata.into_iter().collect::<Vec<_>>()
+            }
+        };
+
+        let cursor = generate_cursor::<Document>("argo", "timeseriesMeta", filter, None).await.unwrap();
+        let results: Vec<_> = cursor.map(|doc| doc.unwrap()).collect().await;
+
+        helpers::create_response(results)
     } else {
         helpers::create_response(munged_results)
     }
@@ -112,18 +148,6 @@ async fn main() -> std::io::Result<()> {
     .run()
     .await
 }
-
-// async fn generate_cursor<T: DeserializeOwned>(db_name: &str, collection_name: &str, filter: Document, options: Option<FindOptions>) -> Result<mongodb::Cursor<T>> {
-//     let guard = match CLIENT.lock() {
-//         Ok(guard) => guard,
-//         Err(poisoned) => poisoned.into_inner(),
-//     };
-//     let client = match guard.as_ref() {
-//         Some(client) => client,
-//         None => return Err(mongodb::error::Error::from(std::io::Error::new(std::io::ErrorKind::Other, "Client is None"))),
-//     };
-//     client.database(db_name).collection::<T>(collection_name).find(filter, options).await
-// }
 
 async fn generate_cursor<T: DeserializeOwned>(db_name: &str, collection_name: &str, filter: Document, options: Option<FindOptions>) -> Result<mongodb::Cursor<T>> {
     let client = {

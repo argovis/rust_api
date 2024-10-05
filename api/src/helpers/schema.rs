@@ -42,7 +42,7 @@ pub trait IsTimeseriesMeta {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BsoseSchema {
     _id: String,
-    metadata: Vec<String>,
+    pub metadata: Vec<String>,
     basin: f64,
     geolocation: GeoJSONPoint,
     level: f64,

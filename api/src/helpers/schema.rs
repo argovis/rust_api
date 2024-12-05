@@ -25,6 +25,7 @@ pub trait IsTimeseries {
     fn set_data(&mut self, data: Vec<Vec<f64>>);
     fn timeseries(&mut self) -> Option<&mut Vec<String>>;
     fn set_timeseries(&mut self, timeseries: Vec<String>);
+    fn data_info(&mut self) -> (Vec<String>, Vec<String>, Vec<Vec<String>>);
     fn set_data_info(&mut self, data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>));
     fn _id(&self) -> String;
     fn longitude(&self) -> f64;
@@ -53,7 +54,7 @@ pub struct BsoseSchema {
     reference_density_profile: f64,
     data: Vec<Vec<f64>>,
     timeseries: Option<Vec<String>>, // since this field isnt present in the data collection, but gets munged on later
-    data_info: Option<(Vec<String>, Vec<String>, Vec<Vec<String>>)>,
+    data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>),
 }
 
 impl IsTimeseries for BsoseSchema {
@@ -77,8 +78,12 @@ impl IsTimeseries for BsoseSchema {
         self.timeseries = Some(timeseries);
     }
 
+    fn data_info(&mut self) -> (Vec<String>, Vec<String>, Vec<Vec<String>>) {
+        self.data_info.clone()
+    }
+
     fn set_data_info(&mut self, data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>)) {
-        self.data_info = Some(data_info);
+        self.data_info = data_info;
     }
 
     fn _id(&self) -> String {
@@ -106,7 +111,6 @@ impl IsTimeseries for BsoseSchema {
 pub struct BsoseMeta { 
     _id: String,
     data_type: String,
-    pub data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>),
     date_updated_argovis: BsonDateTime,
     pub timeseries: Vec<BsonDateTime>,
     source: Vec<SourceMeta>,

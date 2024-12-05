@@ -30,9 +30,8 @@ use std::collections::HashSet;
 
 static CLIENT: Lazy<Mutex<Option<mongodb::Client>>> = Lazy::new(|| Mutex::new(None));
 static TIMESERIES: Lazy<Mutex<Option<Vec<DateTime>>>> = Lazy::new(|| Mutex::new(None));
-static BSOSE_DATA_INFO: Lazy<Mutex<Option<(Vec<String>, Vec<String>, Vec<Vec<String>>)>>> = Lazy::new(|| Mutex::new(None));
 
-#[get("/search")]
+#[get("/timeseries/bsose")]
 async fn search_data_schema(query_params: web::Query<serde_json::Value>) -> impl Responder {
     let params = query_params.into_inner();
 
@@ -40,7 +39,7 @@ async fn search_data_schema(query_params: web::Query<serde_json::Value>) -> impl
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(0);
-    let page_size = 1000;
+    //let page_size = 1000;
 
     // validate query params ////////////////////////////////////////
     match helpers::validate_query_params(&params) {
@@ -54,9 +53,9 @@ async fn search_data_schema(query_params: web::Query<serde_json::Value>) -> impl
     // Search for documents with matching filters //////////////////
     let options_builder = {
         FindOptions::builder()
-            .sort(mongodb::bson::doc! { "_id": 1 })
-            .skip(Some((page * page_size) as u64))
-            .limit(page_size)
+            //.sort(mongodb::bson::doc! { "_id": 1 })
+            //.skip(Some((page * page_size) as u64))
+            //.limit(page_size)
     };
 
     let mut cursor = generate_cursor::<schema::BsoseSchema>("argo", "bsose", filter, Some(options_builder.build())).await.unwrap();
@@ -81,11 +80,8 @@ async fn search_data_schema(query_params: web::Query<serde_json::Value>) -> impl
         let ts = TIMESERIES.lock().unwrap();
         ts.clone().unwrap()
     };
-    let data_info = {
-        let di = BSOSE_DATA_INFO.lock().unwrap();
-        di.clone().unwrap()
-    };
-    let munged_results = transforms::transform_timeseries(params.clone(), timeseries, data_info, results);
+
+    let munged_results = transforms::transform_timeseries(params.clone(), timeseries, results);
 
     // return results ///////////////////////////////////////////////
     let compression: Option<String> = params.get("compression")
@@ -147,7 +143,6 @@ async fn main() -> std::io::Result<()> {
         }
     }
     *TIMESERIES.lock().unwrap() = Some(metadata[0].timeseries.clone());
-    *BSOSE_DATA_INFO.lock().unwrap() = Some(metadata[0].data_info.clone());
 
     HttpServer::new(|| {
         App::new()

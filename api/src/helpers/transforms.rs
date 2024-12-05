@@ -2,7 +2,7 @@ use super::schema;
 use super::helpers;
 use mongodb::bson::DateTime as BsonDateTime;
 
-pub fn transform_timeseries<T: schema::IsTimeseries + Clone>(params: serde_json::Value, ts: Vec<BsonDateTime>, data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>), results: Vec<T>) -> Vec<T> {
+pub fn transform_timeseries<T: schema::IsTimeseries + Clone>(params: serde_json::Value, ts: Vec<BsonDateTime>, results: Vec<T>) -> Vec<T> {
     
     // extract query parameters //////////////////////////////////////
     let start_date = params.get("startDate")
@@ -24,7 +24,7 @@ pub fn transform_timeseries<T: schema::IsTimeseries + Clone>(params: serde_json:
     if start_date.is_some() || end_date.is_some() {
         r = slice_timerange(start_date, end_date, ts, r);
     }
-    r = slice_data(data, data_info, r);
+    r = slice_data(data, r);
 
     return r;
 }
@@ -62,7 +62,7 @@ pub fn slice_timerange<T: schema::IsTimeseries>(start_date: Option<BsonDateTime>
 }
 
 // todo: this will probably be generic over more than just Timeseries
-pub fn slice_data<T: schema::IsTimeseries>(data: Vec<String>, data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>), mut results: Vec<T>) -> Vec<T> {
+pub fn slice_data<T: schema::IsTimeseries>(data: Vec<String>, mut results: Vec<T>) -> Vec<T> {
 
     if data.is_empty() {
         for result in &mut results {
@@ -71,11 +71,13 @@ pub fn slice_data<T: schema::IsTimeseries>(data: Vec<String>, data_info: (Vec<St
     } else if data.contains(&"all".to_string()) {
         return results;
     } else {
-        let indexes: Vec<usize> = data.iter()
-            .filter_map(|item| data_info.0.iter().position(|x| x == item))
-            .collect();
-
         for result in &mut results {
+            let data_info = result.data_info();
+
+            let indexes: Vec<usize> = data.iter()
+                .filter_map(|item| data_info.0.iter().position(|x| x == item))
+                .collect();
+
             // only keep the requested data
             let filtered_data: Vec<Vec<f64>> = indexes.iter()
                 .filter_map(|&i| result.data().get(i).cloned())

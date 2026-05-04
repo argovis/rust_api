@@ -1,0 +1,21 @@
+[
+  {
+    "_id": "bsose-profile-meta-2020",
+    "data_type": "BSOSE-profile",
+    "date_updated_argovis": "2026-01-01T00:00:00Z",
+    "timeseries": [
+      "2020-01-15T00:00:00Z",
+      "2020-04-15T00:00:00Z",
+      "2020-07-15T00:00:00Z",
+      "2020-10-15T00:00:00Z"
+    ],
+    "source": [
+      { "source": ["bsose"], "file": "bsose-2020.nc" }
+    ],
+    "cell_area": 10000000000.0,
+    "ocean_depth": 4500.0,
+    "depth_r0_to_bottom": 4000.0,
+    "interior_2d_mask": true,
+    "depth_r0_to_ref_surface": 100.0
+  }
+]

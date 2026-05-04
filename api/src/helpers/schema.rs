@@ -7,14 +7,14 @@ use mongodb::bson::DateTime as BsonDateTime;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GeoJSONPoint {
     #[serde(rename = "type")]
-    location_type: String,
-    coordinates: [f64; 2],
+    pub(crate) location_type: String,
+    pub(crate) coordinates: [f64; 2],
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct SourceMeta { 
-    source: Vec<String>,
-    file: String
+pub struct SourceMeta {
+    pub(crate) source: Vec<String>,
+    pub(crate) file: String,
 }
 
 // categroical traits /////////////////////////////////////////////////////////
@@ -42,19 +42,22 @@ pub trait IsTimeseriesMeta {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BsoseSchema {
-    _id: String,
+    pub(crate) _id: String,
+    // `metadata` is reachable from main.rs (the `batchmeta` branch builds a
+    // unique-set out of it), so it stays fully `pub` rather than `pub(crate)`.
     pub metadata: Vec<String>,
-    basin: f64,
-    geolocation: GeoJSONPoint,
-    level: f64,
-    cell_vertical_fraction: f64,
-    sea_binary_mask_at_t_locaiton: bool,
-    ctrl_vector_3d_mask: bool,
-    cell_z_size: f64,
-    reference_density_profile: f64,
-    data: Vec<Vec<f64>>,
-    timeseries: Option<Vec<String>>, // since this field isnt present in the data collection, but gets munged on later
-    data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>),
+    pub(crate) basin: f64,
+    pub(crate) geolocation: GeoJSONPoint,
+    pub(crate) level: f64,
+    pub(crate) cell_vertical_fraction: f64,
+    pub(crate) sea_binary_mask_at_t_location: bool,
+    pub(crate) ctrl_vector_3d_mask: bool,
+    pub(crate) cell_z_size: f64,
+    pub(crate) reference_density_profile: f64,
+    pub(crate) data: Vec<Vec<f64>>,
+    // Not present in the source collection — gets populated by transforms.
+    pub(crate) timeseries: Option<Vec<String>>,
+    pub(crate) data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>),
 }
 
 impl IsTimeseries for BsoseSchema {
@@ -108,17 +111,19 @@ impl IsTimeseries for BsoseSchema {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct BsoseMeta { 
-    _id: String,
-    data_type: String,
-    date_updated_argovis: BsonDateTime,
+pub struct BsoseMeta {
+    pub(crate) _id: String,
+    pub(crate) data_type: String,
+    pub(crate) date_updated_argovis: BsonDateTime,
+    // `timeseries` is read from main.rs at startup to populate the cached
+    // TIMESERIES global, so it stays fully `pub`.
     pub timeseries: Vec<BsonDateTime>,
-    source: Vec<SourceMeta>,
-    cell_area: f64,
-    ocean_depth: f64,
-    depth_r0_to_bottom: f64,
-    interior_2d_mask: bool,
-    depth_r0_to_ref_surface: f64
+    pub(crate) source: Vec<SourceMeta>,
+    pub(crate) cell_area: f64,
+    pub(crate) ocean_depth: f64,
+    pub(crate) depth_r0_to_bottom: f64,
+    pub(crate) interior_2d_mask: bool,
+    pub(crate) depth_r0_to_ref_surface: f64,
 }
 
 impl IsTimeseriesMeta for BsoseMeta {

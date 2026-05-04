@@ -50,7 +50,7 @@ pub struct BsoseSchema {
     pub(crate) geolocation: GeoJSONPoint,
     pub(crate) level: f64,
     pub(crate) cell_vertical_fraction: f64,
-    pub(crate) sea_binary_mask_at_t_location: bool,
+    pub(crate) sea_binary_mask_at_t_locaiton: bool,
     pub(crate) cell_z_size: f64,
     pub(crate) reference_density_profile: f64,
     pub(crate) data: Vec<Vec<f64>>,

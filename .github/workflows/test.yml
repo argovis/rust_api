@@ -1,0 +1,98 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Unit + integration tests
+    runs-on: ubuntu-latest
+
+    # MongoDB runs as a service container alongside the job. The healthcheck
+    # gates step execution: GitHub Actions waits for it to report healthy
+    # before our `steps` start, so the seed and API can assume Mongo is up.
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping: 1}).ok'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      MONGODB_URI: mongodb://localhost:27017
+      API_URL: http://localhost:8080
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+
+    defaults:
+      run:
+        working-directory: ./api
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Caches ~/.cargo and api/target between runs, keyed off Cargo.lock.
+      # Roughly halves CI time on the second run onward.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: api
+
+      - name: Build binaries and test artifacts
+        run: cargo build --bins --tests
+
+      # Seed must run before the API starts: the API caches the
+      # `timeseriesMeta.timeseries` vector at startup.
+      - name: Seed MongoDB with test fixtures
+        run: cargo run --bin seed_test_db
+
+      - name: Start the API in the background
+        run: |
+          ./target/debug/api > /tmp/api.log 2>&1 &
+          echo $! > /tmp/api.pid
+
+      # Poll until the API answers on its bind port. We accept any HTTP status
+      # (including 404 from /timeseries/bsose with a bogus id) as evidence
+      # that the server is up — connection refused is the only failure.
+      - name: Wait for the API to come up
+        run: |
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              "$API_URL/timeseries/bsose?id=__not_a_real_id__" || true)
+            case "$code" in
+              200|400|404)
+                echo "API is up (HTTP $code after ${i}s)"
+                exit 0
+                ;;
+            esac
+            sleep 1
+          done
+          echo "API never became reachable. Tail of /tmp/api.log:"
+          tail -n 100 /tmp/api.log || true
+          exit 1
+
+      # `--lib` runs unit tests, `--tests` runs integration tests in tests/.
+      # Together they cover everything we wrote.
+      - name: Run tests
+        run: cargo test --lib --tests
+
+      # If anything above failed, the API log is usually the most useful
+      # piece of evidence — surface it in the run output.
+      - name: Dump API log on failure
+        if: failure()
+        run: |
+          echo "----- API log -----"
+          cat /tmp/api.log || true
+
+      - name: Stop the API
+        if: always()
+        run: |
+          if [ -f /tmp/api.pid ]; then
+            kill "$(cat /tmp/api.pid)" 2>/dev/null || true
+          fi

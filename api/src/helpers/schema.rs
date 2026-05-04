@@ -14,7 +14,7 @@ pub struct GeoJSONPoint {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SourceMeta {
     pub(crate) source: Vec<String>,
-    pub(crate) file: String,
+    pub(crate) iter: String,
 }
 
 // categroical traits /////////////////////////////////////////////////////////
@@ -51,7 +51,6 @@ pub struct BsoseSchema {
     pub(crate) level: f64,
     pub(crate) cell_vertical_fraction: f64,
     pub(crate) sea_binary_mask_at_t_location: bool,
-    pub(crate) ctrl_vector_3d_mask: bool,
     pub(crate) cell_z_size: f64,
     pub(crate) reference_density_profile: f64,
     pub(crate) data: Vec<Vec<f64>>,

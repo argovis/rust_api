@@ -36,7 +36,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to match the Rust version in the Dockerfile. Bump both
+      # together when you decide to move.
+      - uses: dtolnay/rust-toolchain@1.88
 
       # Caches ~/.cargo and api/target between runs, keyed off Cargo.lock.
       # Roughly halves CI time on the second run onward.

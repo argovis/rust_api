@@ -1,4 +1,4 @@
-FROM rust:1.81.0
+FROM rust:1.88
 
 RUN apt-get update -y && apt-get install -y nano curl wget libhdf5-serial-dev libnetcdff-dev netcdf-bin
 

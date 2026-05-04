@@ -131,7 +131,7 @@ pub fn timeseries_stub<T: schema::IsTimeseries>(results: Vec<T>) -> Vec<schema::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::helpers::schema::{BsoseSchema, GeoJSONPoint};
+    use crate::helpers::schema::{BsoseSchema, GeoJSONPoint, IsTimeseries};
     use serde_json::json;
 
     // Helper: construct a BsoseSchema directly. Field-level visibility is

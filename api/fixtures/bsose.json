@@ -7,7 +7,6 @@
     "level": 10.0,
     "cell_vertical_fraction": 1.0,
     "sea_binary_mask_at_t_locaiton": true,
-    "ctrl_vector_3d_mask": true,
     "cell_z_size": 5.0,
     "reference_density_profile": 1027.0,
     "data": [
@@ -28,7 +27,6 @@
     "level": 10.0,
     "cell_vertical_fraction": 1.0,
     "sea_binary_mask_at_t_locaiton": true,
-    "ctrl_vector_3d_mask": true,
     "cell_z_size": 5.0,
     "reference_density_profile": 1027.0,
     "data": [
@@ -49,7 +47,6 @@
     "level": 20.0,
     "cell_vertical_fraction": 1.0,
     "sea_binary_mask_at_t_locaiton": true,
-    "ctrl_vector_3d_mask": true,
     "cell_z_size": 5.0,
     "reference_density_profile": 1026.5,
     "data": [
@@ -70,7 +67,6 @@
     "level": 50.0,
     "cell_vertical_fraction": 1.0,
     "sea_binary_mask_at_t_locaiton": true,
-    "ctrl_vector_3d_mask": true,
     "cell_z_size": 10.0,
     "reference_density_profile": 1028.0,
     "data": [

@@ -157,7 +157,6 @@ mod tests {
             level: 5.0,
             cell_vertical_fraction: 1.0,
             sea_binary_mask_at_t_locaiton: true,
-            ctrl_vector_3d_mask: true,
             cell_z_size: 1.0,
             reference_density_profile: 1.0,
             data,

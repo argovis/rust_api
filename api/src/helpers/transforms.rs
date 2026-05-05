@@ -2,9 +2,14 @@ use super::schema;
 use super::helpers;
 use mongodb::bson::DateTime as BsonDateTime;
 
-pub fn transform_timeseries<T: schema::IsTimeseries + Clone>(params: serde_json::Value, ts: Vec<BsonDateTime>, results: Vec<T>) -> Vec<T> {
-    
-    // extract query parameters //////////////////////////////////////
+/// Apply the user's `startDate` / `endDate` / `data` parameters to a single
+/// timeseries document. Returns `None` if the document was filtered out
+/// entirely (e.g. `data=somefield` produced no matching columns).
+pub fn transform_timeseries<T: schema::IsTimeseries>(
+    params: &serde_json::Value,
+    ts: &[BsonDateTime],
+    mut doc: T,
+) -> Option<T> {
     let start_date = params.get("startDate")
         .and_then(|v| v.as_str())
         .and_then(helpers::string2bsondate);
@@ -16,116 +21,113 @@ pub fn transform_timeseries<T: schema::IsTimeseries + Clone>(params: serde_json:
     let data: Vec<String> = params.get("data")
         .and_then(|v| v.as_str())
         .map(|s| s.split(',').map(|s| s.to_string()).collect())
-        .unwrap_or_else(Vec::new);
-
-    // apply appropriate transforms ////////////////////////////////////
-    let mut r = results.clone();
+        .unwrap_or_default();
 
     if start_date.is_some() || end_date.is_some() {
-        r = slice_timerange(start_date, end_date, ts, r);
+        slice_timerange(start_date, end_date, ts, &mut doc);
     }
-    r = slice_data(data, r);
-
-    return r;
+    slice_data(&data, doc)
 }
 
-pub fn slice_timerange<T: schema::IsTimeseries>(start_date: Option<BsonDateTime>, end_date: Option<BsonDateTime>, ts: Vec<BsonDateTime>, mut results: Vec<T>) -> Vec<T> {
+/// Slice the document's data columns and timeseries field to the time window
+/// `[start_date, end_date)`. The window is computed against `ts` (the
+/// timeseries metadata cached at startup); each variable's per-timestep
+/// values are sliced in lockstep. Mutates `doc` in place.
+pub fn slice_timerange<T: schema::IsTimeseries>(
+    start_date: Option<BsonDateTime>,
+    end_date: Option<BsonDateTime>,
+    ts: &[BsonDateTime],
+    doc: &mut T,
+) {
+    let start_index = start_date
+        .and_then(|sd| ts.iter().position(|&t| t >= sd))
+        .unwrap_or(0);
 
-    let start_index = start_date.and_then(|start_date| {
-        ts.iter().position(|&t| t >= start_date)
-    }).unwrap_or(0);
-    
-    let end_index = end_date.and_then(|end_date| {
-        ts.iter().rposition(|&t| t < end_date).map(|idx| idx + 1)
-    }).unwrap_or(ts.len());
+    let end_index = end_date
+        .and_then(|ed| ts.iter().rposition(|&t| t < ed).map(|i| i + 1))
+        .unwrap_or(ts.len());
 
     let time_window: Vec<String> = ts[start_index..end_index]
         .iter()
         .map(|t| helpers::bsondate2string(t))
         .collect();
 
-    for result in &mut results {
-        let data = result.data();
-        *data = data.iter().map(|inner_vec| {
-            let slice = &inner_vec[start_index..end_index];
-            slice.to_vec()
-        }).collect();
+    let data = doc.data();
+    *data = data
+        .iter()
+        .map(|inner| inner[start_index..end_index].to_vec())
+        .collect();
 
-        match result.timeseries() {
-            Some(timeseries) => *timeseries = time_window.clone(),
-            None => result.set_timeseries(time_window.clone()),
-        }
+    match doc.timeseries() {
+        Some(timeseries) => *timeseries = time_window,
+        None => doc.set_timeseries(time_window),
     }
-
-    results
-
 }
 
-// todo: this will probably be generic over more than just Timeseries
-pub fn slice_data<T: schema::IsTimeseries>(data: Vec<String>, mut results: Vec<T>) -> Vec<T> {
-
+/// Apply the `data=` query parameter to a single document. Behaviour mirrors
+/// the previous Vec-based implementation:
+///
+///   - empty `data`: clears the document's `data` field but keeps the row.
+///   - `data` contains "all": leaves everything untouched.
+///   - otherwise: filters the data columns down to the named variables;
+///     returns `None` if no requested variables match (caller drops the row).
+///   - if `data` also contains "except_data_values", clears the data field
+///     after column-filtering, but keeps the row.
+pub fn slice_data<T: schema::IsTimeseries>(
+    data: &[String],
+    mut doc: T,
+) -> Option<T> {
     if data.is_empty() {
-        for result in &mut results {
-            result.set_data(Vec::new());
-        }
-    } else if data.contains(&"all".to_string()) {
-        return results;
-    } else {
-        for result in &mut results {
-            let data_info = result.data_info();
-
-            let indexes: Vec<usize> = data.iter()
-                .filter_map(|item| data_info.0.iter().position(|x| x == item))
-                .collect();
-
-            // only keep the requested data
-            let filtered_data: Vec<Vec<f64>> = indexes.iter()
-                .filter_map(|&i| result.data().get(i).cloned())
-                .collect();
-            result.set_data(filtered_data);
-
-            // create a custom data_info to go with this reduced data, and add it to the result object
-            let filtered_data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>) = (
-                indexes.iter().filter_map(|&i| data_info.0.get(i).cloned()).collect(),
-                data_info.1.clone(),
-                indexes.iter().filter_map(|&i| data_info.2.get(i).cloned()).collect(),
-            );
-            result.set_data_info(filtered_data_info);
-        }
-
-        // if all the data is empty, remove the result
-        let mut i = 0;
-        while i != results.len() {
-            if results[i].data().is_empty() {
-                results.remove(i);
-            } else {
-                i += 1;
-            }
-        }
-
-        // if we set except_data_values, drop the data from every result
-        if data.contains(&"except_data_values".to_string()) {
-            for result in &mut results {
-                result.set_data(Vec::new());
-            }
-        }
+        doc.set_data(Vec::new());
+        return Some(doc);
     }
 
-    results
+    if data.iter().any(|s| s == "all") {
+        return Some(doc);
+    }
+
+    // Specific fields requested — filter columns.
+    let data_info = doc.data_info();
+    let indexes: Vec<usize> = data
+        .iter()
+        .filter_map(|item| data_info.0.iter().position(|x| x == item))
+        .collect();
+
+    let filtered_data: Vec<Vec<f64>> = indexes
+        .iter()
+        .filter_map(|&i| doc.data().get(i).cloned())
+        .collect();
+    doc.set_data(filtered_data);
+
+    let filtered_data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>) = (
+        indexes.iter().filter_map(|&i| data_info.0.get(i).cloned()).collect(),
+        data_info.1.clone(),
+        indexes.iter().filter_map(|&i| data_info.2.get(i).cloned()).collect(),
+    );
+    doc.set_data_info(filtered_data_info);
+
+    // No matching columns -> caller drops the row.
+    if doc.data().is_empty() {
+        return None;
+    }
+
+    // except_data_values clears data after column-filtering.
+    if data.iter().any(|s| s == "except_data_values") {
+        doc.set_data(Vec::new());
+    }
+
+    Some(doc)
 }
 
-pub fn timeseries_stub<T: schema::IsTimeseries>(results: Vec<T>) -> Vec<schema::TimeseriesStub> {
-    let r = results.iter().map(|result| {
-        schema::TimeseriesStub {
-            _id: result._id(),
-            longitude: result.longitude(),
-            latitude: result.latitude(),
-            level: result.level(),
-            metadata: result.metadata(),
-        }
-    }).collect();
-
-    r
+/// Project a single timeseries document down to its summary stub.
+pub fn timeseries_stub<T: schema::IsTimeseries>(result: &T) -> schema::TimeseriesStub {
+    schema::TimeseriesStub {
+        _id: result._id(),
+        longitude: result.longitude(),
+        latitude: result.latitude(),
+        level: result.level(),
+        metadata: result.metadata(),
+    }
 }
 
 #[cfg(test)]
@@ -166,11 +168,10 @@ mod tests {
     }
 
     fn ts(months: &[u32]) -> Vec<BsonDateTime> {
-        // Build a BSON date for each (1st of month, year 2020)
+        // BSON date for the 1st of each named month in 2020.
         months
             .iter()
             .map(|&m| {
-                // milliseconds since epoch for 2020-{m:02}-01T00:00:00Z, computed naively
                 let s = format!("2020-{:02}-01T00:00:00Z", m);
                 let dt = chrono::DateTime::parse_from_rfc3339(&s).unwrap();
                 BsonDateTime::from_millis(dt.timestamp_millis())
@@ -183,8 +184,7 @@ mod tests {
     #[test]
     fn slice_timerange_inclusive_start_exclusive_end() {
         let timeseries = ts(&[1, 2, 3, 4]); // Jan, Feb, Mar, Apr
-        // 2 variables, 4 timestamps each
-        let r = make_bsose(
+        let mut doc = make_bsose(
             "doc1",
             vec![vec![1.0, 2.0, 3.0, 4.0], vec![10.0, 20.0, 30.0, 40.0]],
             &["temp", "salinity"],
@@ -193,11 +193,10 @@ mod tests {
         let start = helpers::string2bsondate("2020-02-01T00:00:00Z");
         let end = helpers::string2bsondate("2020-04-01T00:00:00Z"); // exclusive
 
-        let mut out = slice_timerange(start, end, timeseries, vec![r]);
+        slice_timerange(start, end, &timeseries, &mut doc);
         // Expect indexes 1..3 -> Feb, Mar
-        assert_eq!(out.len(), 1);
-        assert_eq!(*out[0].data(), vec![vec![2.0, 3.0], vec![20.0, 30.0]]);
-        let ts_field = out[0].timeseries().unwrap();
+        assert_eq!(*doc.data(), vec![vec![2.0, 3.0], vec![20.0, 30.0]]);
+        let ts_field = doc.timeseries().unwrap();
         assert_eq!(ts_field.len(), 2);
         assert!(ts_field[0].starts_with("2020-02-01"));
         assert!(ts_field[1].starts_with("2020-03-01"));
@@ -206,81 +205,75 @@ mod tests {
     #[test]
     fn slice_timerange_no_dates_keeps_full_range() {
         let timeseries = ts(&[1, 2, 3]);
-        let r = make_bsose(
+        let mut doc = make_bsose(
             "doc1",
             vec![vec![1.0, 2.0, 3.0]],
             &["temp"],
         );
 
-        let mut out = slice_timerange(None, None, timeseries, vec![r]);
-        assert_eq!(*out[0].data(), vec![vec![1.0, 2.0, 3.0]]);
+        slice_timerange(None, None, &timeseries, &mut doc);
+        assert_eq!(*doc.data(), vec![vec![1.0, 2.0, 3.0]]);
     }
 
     // ---- slice_data ----------------------------------------------------------
 
     #[test]
     fn slice_data_empty_request_drops_data() {
-        let r = make_bsose(
+        let doc = make_bsose(
             "doc1",
             vec![vec![1.0, 2.0], vec![3.0, 4.0]],
             &["temp", "salinity"],
         );
-        let mut out = slice_data(vec![], vec![r]);
-        // when no data params, slice_data drops the data — but the result row
-        // is preserved (the empty-data removal only applies in the "specific
-        // fields" branch).
-        assert_eq!(out.len(), 1);
-        assert!(out[0].data().is_empty());
+        let mut out = slice_data(&[], doc).expect("empty data param keeps the row");
+        assert!(out.data().is_empty());
     }
 
     #[test]
     fn slice_data_all_keeps_everything() {
-        let r = make_bsose(
+        let doc = make_bsose(
             "doc1",
             vec![vec![1.0, 2.0], vec![3.0, 4.0]],
             &["temp", "salinity"],
         );
-        let mut out = slice_data(vec!["all".to_string()], vec![r]);
-        assert_eq!(*out[0].data(), vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+        let mut out = slice_data(&["all".to_string()], doc).unwrap();
+        assert_eq!(*out.data(), vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
     }
 
     #[test]
     fn slice_data_specific_field_filters_columns() {
-        let r = make_bsose(
+        let doc = make_bsose(
             "doc1",
             vec![vec![1.0, 2.0], vec![3.0, 4.0]],
             &["temp", "salinity"],
         );
-        let mut out = slice_data(vec!["salinity".to_string()], vec![r]);
-        assert_eq!(out.len(), 1);
-        assert_eq!(*out[0].data(), vec![vec![3.0, 4.0]]);
+        let mut out = slice_data(&["salinity".to_string()], doc).unwrap();
+        assert_eq!(*out.data(), vec![vec![3.0, 4.0]]);
     }
 
     #[test]
     fn slice_data_unknown_field_drops_result() {
-        let r = make_bsose(
+        let doc = make_bsose(
             "doc1",
             vec![vec![1.0, 2.0]],
             &["temp"],
         );
-        let out = slice_data(vec!["nonexistent".to_string()], vec![r]);
-        // Filtered data is empty -> the result row is removed entirely.
-        assert!(out.is_empty());
+        let out = slice_data(&["nonexistent".to_string()], doc);
+        assert!(out.is_none(), "no matching columns -> row is dropped");
     }
 
     #[test]
     fn slice_data_except_data_values_clears_after_filtering() {
-        let r = make_bsose(
+        let doc = make_bsose(
             "doc1",
             vec![vec![1.0, 2.0]],
             &["temp"],
         );
         let mut out = slice_data(
-            vec!["temp".to_string(), "except_data_values".to_string()],
-            vec![r],
-        );
-        assert_eq!(out.len(), 1);
-        assert!(out[0].data().is_empty());
+            &["temp".to_string(), "except_data_values".to_string()],
+            doc,
+        )
+        .unwrap();
+        assert!(out.data().is_empty());
     }
 
     // ---- transform_timeseries (full pipeline) --------------------------------
@@ -288,7 +281,7 @@ mod tests {
     #[test]
     fn transform_timeseries_combines_time_and_data_slices() {
         let timeseries = ts(&[1, 2, 3, 4]);
-        let r = make_bsose(
+        let doc = make_bsose(
             "doc1",
             vec![vec![1.0, 2.0, 3.0, 4.0], vec![10.0, 20.0, 30.0, 40.0]],
             &["temp", "salinity"],
@@ -300,26 +293,23 @@ mod tests {
             "data":      "salinity",
         });
 
-        let mut out = transform_timeseries(params, timeseries, vec![r]);
-        assert_eq!(out.len(), 1);
-        assert_eq!(*out[0].data(), vec![vec![20.0, 30.0]]);
+        let mut out = transform_timeseries(&params, &timeseries, doc).unwrap();
+        assert_eq!(*out.data(), vec![vec![20.0, 30.0]]);
     }
 
     // ---- timeseries_stub -----------------------------------------------------
 
     #[test]
     fn timeseries_stub_projects_summary_fields() {
-        let r = make_bsose(
+        let doc = make_bsose(
             "doc1",
             vec![vec![1.0, 2.0]],
             &["temp"],
         );
-        let stubs = timeseries_stub(vec![r]);
-        assert_eq!(stubs.len(), 1);
-        assert_eq!(stubs[0]._id, "doc1");
-        assert!((stubs[0].longitude - 10.0).abs() < 1e-9);
-        assert!((stubs[0].latitude - 20.0).abs() < 1e-9);
-        assert!((stubs[0].level - 5.0).abs() < 1e-9);
+        let stub = timeseries_stub(&doc);
+        assert_eq!(stub._id, "doc1");
+        assert!((stub.longitude - 10.0).abs() < 1e-9);
+        assert!((stub.latitude - 20.0).abs() < 1e-9);
+        assert!((stub.level - 5.0).abs() < 1e-9);
     }
 }
-

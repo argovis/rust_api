@@ -1,0 +1,82 @@
+[
+  {
+    "_id": "bsose_doc_001",
+    "metadata": ["bsose-profile-meta-2020"],
+    "basin": 1.0,
+    "geolocation": { "type": "Point", "coordinates": [20.0, 10.0] },
+    "level": 10.0,
+    "cell_vertical_fraction": 1.0,
+    "sea_binary_mask_at_t_locaiton": true,
+    "cell_z_size": 5.0,
+    "reference_density_profile": 1027.0,
+    "data": [
+      [1.1, 2.2, 3.3, 4.4],
+      [34.50, 34.60, 34.70, 34.80]
+    ],
+    "data_info": [
+      ["temp", "salinity"],
+      ["units", "long_name"],
+      [["degC", "Temperature"], ["psu", "Salinity"]]
+    ]
+  },
+  {
+    "_id": "bsose_doc_002",
+    "metadata": ["bsose-profile-meta-2020"],
+    "basin": 1.0,
+    "geolocation": { "type": "Point", "coordinates": [40.0, 30.0] },
+    "level": 10.0,
+    "cell_vertical_fraction": 1.0,
+    "sea_binary_mask_at_t_locaiton": true,
+    "cell_z_size": 5.0,
+    "reference_density_profile": 1027.0,
+    "data": [
+      [5.0, 6.0, 7.0, 8.0],
+      [35.00, 35.10, 35.20, 35.30]
+    ],
+    "data_info": [
+      ["temp", "salinity"],
+      ["units", "long_name"],
+      [["degC", "Temperature"], ["psu", "Salinity"]]
+    ]
+  },
+  {
+    "_id": "bsose_doc_003",
+    "metadata": ["bsose-profile-meta-2020"],
+    "basin": 2.0,
+    "geolocation": { "type": "Point", "coordinates": [-170.0, 50.0] },
+    "level": 20.0,
+    "cell_vertical_fraction": 1.0,
+    "sea_binary_mask_at_t_locaiton": true,
+    "cell_z_size": 5.0,
+    "reference_density_profile": 1026.5,
+    "data": [
+      [-1.0, 0.0, 1.0, 2.0],
+      [33.10, 33.20, 33.30, 33.40]
+    ],
+    "data_info": [
+      ["temp", "salinity"],
+      ["units", "long_name"],
+      [["degC", "Temperature"], ["psu", "Salinity"]]
+    ]
+  },
+  {
+    "_id": "bsose_doc_004",
+    "metadata": ["bsose-profile-meta-2020"],
+    "basin": 1.0,
+    "geolocation": { "type": "Point", "coordinates": [20.0, 10.0] },
+    "level": 50.0,
+    "cell_vertical_fraction": 1.0,
+    "sea_binary_mask_at_t_locaiton": true,
+    "cell_z_size": 10.0,
+    "reference_density_profile": 1028.0,
+    "data": [
+      [0.5, 0.6, 0.7, 0.8],
+      [34.10, 34.20, 34.30, 34.40]
+    ],
+    "data_info": [
+      ["temp", "salinity"],
+      ["units", "long_name"],
+      [["degC", "Temperature"], ["psu", "Salinity"]]
+    ]
+  }
+]

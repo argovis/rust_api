@@ -128,3 +128,198 @@ pub fn timeseries_stub<T: schema::IsTimeseries>(results: Vec<T>) -> Vec<schema::
     r
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::helpers::schema::{BsoseSchema, GeoJSONPoint, IsTimeseries};
+    use serde_json::json;
+
+    // Helper: construct a BsoseSchema directly. Field-level visibility is
+    // `pub(crate)` so this struct literal works from any test in the crate
+    // and gets compile-time field checking — if a schema field is renamed,
+    // the test stops compiling.
+    fn make_bsose(id: &str, data: Vec<Vec<f64>>, var_names: &[&str]) -> BsoseSchema {
+        let names: Vec<String> = var_names.iter().map(|s| s.to_string()).collect();
+        let units = vec!["units".to_string(), "long_name".to_string()];
+        let per_var_info: Vec<Vec<String>> = names
+            .iter()
+            .map(|n| vec!["u".to_string(), n.clone()])
+            .collect();
+
+        BsoseSchema {
+            _id: id.to_string(),
+            metadata: vec!["meta1".to_string()],
+            basin: 1.0,
+            geolocation: GeoJSONPoint {
+                location_type: "Point".to_string(),
+                coordinates: [10.0, 20.0],
+            },
+            level: 5.0,
+            cell_vertical_fraction: 1.0,
+            sea_binary_mask_at_t_locaiton: true,
+            cell_z_size: 1.0,
+            reference_density_profile: 1.0,
+            data,
+            timeseries: None,
+            data_info: (names, units, per_var_info),
+        }
+    }
+
+    fn ts(months: &[u32]) -> Vec<BsonDateTime> {
+        // Build a BSON date for each (1st of month, year 2020)
+        months
+            .iter()
+            .map(|&m| {
+                // milliseconds since epoch for 2020-{m:02}-01T00:00:00Z, computed naively
+                let s = format!("2020-{:02}-01T00:00:00Z", m);
+                let dt = chrono::DateTime::parse_from_rfc3339(&s).unwrap();
+                BsonDateTime::from_millis(dt.timestamp_millis())
+            })
+            .collect()
+    }
+
+    // ---- slice_timerange -----------------------------------------------------
+
+    #[test]
+    fn slice_timerange_inclusive_start_exclusive_end() {
+        let timeseries = ts(&[1, 2, 3, 4]); // Jan, Feb, Mar, Apr
+        // 2 variables, 4 timestamps each
+        let r = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0, 3.0, 4.0], vec![10.0, 20.0, 30.0, 40.0]],
+            &["temp", "salinity"],
+        );
+
+        let start = helpers::string2bsondate("2020-02-01T00:00:00Z");
+        let end = helpers::string2bsondate("2020-04-01T00:00:00Z"); // exclusive
+
+        let mut out = slice_timerange(start, end, timeseries, vec![r]);
+        // Expect indexes 1..3 -> Feb, Mar
+        assert_eq!(out.len(), 1);
+        assert_eq!(*out[0].data(), vec![vec![2.0, 3.0], vec![20.0, 30.0]]);
+        let ts_field = out[0].timeseries().unwrap();
+        assert_eq!(ts_field.len(), 2);
+        assert!(ts_field[0].starts_with("2020-02-01"));
+        assert!(ts_field[1].starts_with("2020-03-01"));
+    }
+
+    #[test]
+    fn slice_timerange_no_dates_keeps_full_range() {
+        let timeseries = ts(&[1, 2, 3]);
+        let r = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0, 3.0]],
+            &["temp"],
+        );
+
+        let mut out = slice_timerange(None, None, timeseries, vec![r]);
+        assert_eq!(*out[0].data(), vec![vec![1.0, 2.0, 3.0]]);
+    }
+
+    // ---- slice_data ----------------------------------------------------------
+
+    #[test]
+    fn slice_data_empty_request_drops_data() {
+        let r = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            &["temp", "salinity"],
+        );
+        let mut out = slice_data(vec![], vec![r]);
+        // when no data params, slice_data drops the data — but the result row
+        // is preserved (the empty-data removal only applies in the "specific
+        // fields" branch).
+        assert_eq!(out.len(), 1);
+        assert!(out[0].data().is_empty());
+    }
+
+    #[test]
+    fn slice_data_all_keeps_everything() {
+        let r = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            &["temp", "salinity"],
+        );
+        let mut out = slice_data(vec!["all".to_string()], vec![r]);
+        assert_eq!(*out[0].data(), vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+    }
+
+    #[test]
+    fn slice_data_specific_field_filters_columns() {
+        let r = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            &["temp", "salinity"],
+        );
+        let mut out = slice_data(vec!["salinity".to_string()], vec![r]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(*out[0].data(), vec![vec![3.0, 4.0]]);
+    }
+
+    #[test]
+    fn slice_data_unknown_field_drops_result() {
+        let r = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0]],
+            &["temp"],
+        );
+        let out = slice_data(vec!["nonexistent".to_string()], vec![r]);
+        // Filtered data is empty -> the result row is removed entirely.
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn slice_data_except_data_values_clears_after_filtering() {
+        let r = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0]],
+            &["temp"],
+        );
+        let mut out = slice_data(
+            vec!["temp".to_string(), "except_data_values".to_string()],
+            vec![r],
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].data().is_empty());
+    }
+
+    // ---- transform_timeseries (full pipeline) --------------------------------
+
+    #[test]
+    fn transform_timeseries_combines_time_and_data_slices() {
+        let timeseries = ts(&[1, 2, 3, 4]);
+        let r = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0, 3.0, 4.0], vec![10.0, 20.0, 30.0, 40.0]],
+            &["temp", "salinity"],
+        );
+
+        let params = json!({
+            "startDate": "2020-02-01T00:00:00Z",
+            "endDate":   "2020-04-01T00:00:00Z",
+            "data":      "salinity",
+        });
+
+        let mut out = transform_timeseries(params, timeseries, vec![r]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(*out[0].data(), vec![vec![20.0, 30.0]]);
+    }
+
+    // ---- timeseries_stub -----------------------------------------------------
+
+    #[test]
+    fn timeseries_stub_projects_summary_fields() {
+        let r = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0]],
+            &["temp"],
+        );
+        let stubs = timeseries_stub(vec![r]);
+        assert_eq!(stubs.len(), 1);
+        assert_eq!(stubs[0]._id, "doc1");
+        assert!((stubs[0].longitude - 10.0).abs() < 1e-9);
+        assert!((stubs[0].latitude - 20.0).abs() < 1e-9);
+        assert!((stubs[0].level - 5.0).abs() < 1e-9);
+    }
+}
+

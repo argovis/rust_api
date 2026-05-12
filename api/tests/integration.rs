@@ -432,3 +432,25 @@ async fn rejects_unparseable_start_date() {
     let resp = get("/timeseries/bsose", &[("startDate", "yesterday")]).await;
     assert_eq!(resp.status(), 400);
 }
+
+#[tokio::test]
+async fn rejects_radius_above_cap() {
+    // BSOSE_CONFIG.max_radius_meters is 5_000_000. Asking for 10_000_000
+    // should be rejected before the cursor opens.
+    let resp = get(
+        "/timeseries/bsose",
+        &[("center", "[0.0, 0.0]"), ("radius", "10000000")],
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn rejects_non_numeric_radius() {
+    let resp = get(
+        "/timeseries/bsose",
+        &[("center", "[0.0, 0.0]"), ("radius", "huge")],
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+}

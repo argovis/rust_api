@@ -4,6 +4,8 @@ use serde::{Serialize};
 use actix_web::{HttpResponse};
 use serde_json::{json, from_str};
 
+use super::dataset_config::DatasetConfig;
+
 pub fn validlonlat(coords: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
     coords.into_iter().map(|mut pair| {
         if pair.len() == 2 {
@@ -105,6 +107,56 @@ pub fn validate_query_params(params: &serde_json::Value) -> Result<(), HttpRespo
     }
 
     // If all validations pass, return Ok(())
+    Ok(())
+}
+
+/// Enforce the dataset's `max_radius_meters` for `center + radius` queries.
+///
+/// `center + radius` is the one geo mode that *isn't* spatially tiled
+/// (Mongo's `$near` handles the bounding internally), so a request with an
+/// unbounded radius could ask for a half-globe disk and return millions of
+/// docs. We cap the radius in config and reject anything past it here.
+///
+/// Only runs when `center` is present in the params: if center is absent,
+/// this mode doesn't apply and the cap is irrelevant. When center IS
+/// present, `validate_query_params` has already required `radius` to be
+/// present as well; we additionally require it to parse as a non-negative
+/// finite f64 (a pre-existing bug elsewhere unwraps that parse — catching
+/// it here makes the error path graceful for callers).
+pub fn validate_radius_cap(
+    params: &serde_json::Value,
+    config: &DatasetConfig,
+) -> Result<(), HttpResponse> {
+    if params.get("center").is_none() {
+        return Ok(());
+    }
+    let radius_str = match params.get("radius").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        // validate_query_params should have caught a missing radius
+        // already; if it didn't, treating this as "no cap to enforce"
+        // hands the request through to the existing error path rather
+        // than masking it with a different 400.
+        None => return Ok(()),
+    };
+    let radius: f64 = match radius_str.parse() {
+        Ok(r) if r.is_finite() && r >= 0.0 => r,
+        _ => {
+            return Err(HttpResponse::BadRequest().json(json!({
+                "error": format!(
+                    "'radius' must be a non-negative finite number, got '{}'",
+                    radius_str
+                )
+            })));
+        }
+    };
+    if radius > config.max_radius_meters {
+        return Err(HttpResponse::BadRequest().json(json!({
+            "error": format!(
+                "radius {} m exceeds the dataset's maximum allowed radius of {} m",
+                radius, config.max_radius_meters
+            )
+        })));
+    }
     Ok(())
 }
 
@@ -282,5 +334,62 @@ mod tests {
             "endDate":   "2020-12-31T23:59:59Z"
         });
         assert!(validate_query_params(&params).is_ok());
+    }
+
+    // ---- validate_radius_cap -------------------------------------------------
+
+    /// Minimal config for radius-cap testing. tile_degrees / levels are
+    /// irrelevant for this validator.
+    const RADIUS_TEST_CONFIG: DatasetConfig = DatasetConfig {
+        tile_degrees: 10.0,
+        max_radius_meters: 1_000_000.0, // 1000 km
+        levels: &[0.0],
+    };
+
+    #[test]
+    fn radius_cap_skipped_when_no_center() {
+        // No center → mode doesn't apply, cap is moot.
+        let params = json!({});
+        assert!(validate_radius_cap(&params, &RADIUS_TEST_CONFIG).is_ok());
+    }
+
+    #[test]
+    fn radius_cap_accepts_radius_at_exactly_the_cap() {
+        let params = json!({"center": "[0,0]", "radius": "1000000"});
+        assert!(validate_radius_cap(&params, &RADIUS_TEST_CONFIG).is_ok());
+    }
+
+    #[test]
+    fn radius_cap_accepts_radius_below_cap() {
+        let params = json!({"center": "[0,0]", "radius": "500000"});
+        assert!(validate_radius_cap(&params, &RADIUS_TEST_CONFIG).is_ok());
+    }
+
+    #[test]
+    fn radius_cap_rejects_radius_above_cap() {
+        let params = json!({"center": "[0,0]", "radius": "1000001"});
+        let err = validate_radius_cap(&params, &RADIUS_TEST_CONFIG).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn radius_cap_rejects_non_numeric_radius() {
+        let params = json!({"center": "[0,0]", "radius": "huge"});
+        let err = validate_radius_cap(&params, &RADIUS_TEST_CONFIG).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn radius_cap_rejects_negative_radius() {
+        let params = json!({"center": "[0,0]", "radius": "-1"});
+        let err = validate_radius_cap(&params, &RADIUS_TEST_CONFIG).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn radius_cap_rejects_non_finite_radius() {
+        let params = json!({"center": "[0,0]", "radius": "inf"});
+        let err = validate_radius_cap(&params, &RADIUS_TEST_CONFIG).unwrap_err();
+        assert_eq!(err.status(), 400);
     }
 }

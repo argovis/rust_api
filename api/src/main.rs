@@ -55,6 +55,9 @@ async fn search_data_schema(
     if let Err(response) = helpers::validate_query_params(&params) {
         return response;
     }
+    if let Err(response) = helpers::validate_radius_cap(&params, config) {
+        return response;
+    }
 
     let start_idx = match pagination::parse_tile_index(&params) {
         Ok(i) => i,

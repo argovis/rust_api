@@ -405,9 +405,15 @@ mod tests {
             })
         );
 
-        // Distinct spatial tiles
-        let spatial: std::collections::HashSet<_> =
-            tiles.iter().map(|t| t.tile_bbox.clone()).collect();
+        // Distinct spatial tiles. BoundingBox holds f64 so we can't put it
+        // in a HashSet (no Eq/Hash); a linear dedup against PartialEq is
+        // fine for a 12-element vector.
+        let mut spatial: Vec<Option<BoundingBox>> = Vec::new();
+        for t in &tiles {
+            if !spatial.iter().any(|b| b == &t.tile_bbox) {
+                spatial.push(t.tile_bbox.clone());
+            }
+        }
         assert_eq!(spatial.len(), 6);
     }
 

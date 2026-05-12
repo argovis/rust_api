@@ -15,3 +15,6 @@ pub use dataset_config::*;
 
 pub mod tile_generator;
 pub use tile_generator::*;
+
+pub mod filter_composer;
+pub use filter_composer::*;

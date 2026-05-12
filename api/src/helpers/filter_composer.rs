@@ -56,22 +56,32 @@ fn build_tile_filter(tile: &TileSpec, config: &DatasetConfig) -> Document {
 
     if let Some(bbox) = &tile.tile_bbox {
         // Build the tile as a 5-point GeoJSON Polygon ring (closed),
-        // matching the same shape the existing `polygon_filter` uses for
-        // user polygons. Mongo treats this via the 2dsphere index on
-        // `geolocation` (a GeoJSON Point field) and avoids the legacy
-        // `$box`-on-coordinates path, which can multiply matches when the
-        // coordinate array is treated as multikey.
+        // matching the shape `polygon_filter` uses for user polygons.
+        // Mongo evaluates this via the 2dsphere index on `geolocation`.
         //
-        // Ring winding order is counter-clockwise (SW → SE → NE → NW → SW),
-        // which is the GeoJSON spec direction for the outer ring of a
-        // small polygon.
+        // Half-open boundary handling: `$geoWithin` is boundary-inclusive
+        // by GeoJSON spec — a point on a polygon edge counts as "within".
+        // That means a doc sitting exactly on a four-corner meeting point
+        // of the tile grid matches all four neighbouring tiles, and a
+        // pagination walk emits it four times. We make tile membership
+        // half-open ([sw, ne) on both axes) by shrinking the NE corner
+        // inward by `TILE_EDGE_EPSILON`. SW is left at the raw boundary,
+        // so each grid point ends up owned by exactly one tile — the one
+        // whose SW corner it sits at. The epsilon is far smaller than any
+        // realistic data resolution, so no real doc falls into the gap.
+        //
+        // Ring winding is CCW (SW → SE → NE → NW → SW), the GeoJSON
+        // convention for the outer ring of a small polygon.
+        const TILE_EDGE_EPSILON: f64 = 1.0e-6; // ~11 cm at the equator
+        let ne_lon = bbox.ne[0] - TILE_EDGE_EPSILON;
+        let ne_lat = bbox.ne[1] - TILE_EDGE_EPSILON;
         let polygon_geom = bson::to_bson(&json!({
             "type": "Polygon",
             "coordinates": [[
                 [bbox.sw[0], bbox.sw[1]],
-                [bbox.ne[0], bbox.sw[1]],
-                [bbox.ne[0], bbox.ne[1]],
-                [bbox.sw[0], bbox.ne[1]],
+                [ne_lon, bbox.sw[1]],
+                [ne_lon, ne_lat],
+                [bbox.sw[0], ne_lat],
                 [bbox.sw[0], bbox.sw[1]],
             ]],
         }))
@@ -305,7 +315,7 @@ mod tests {
     // ---- bbox shape sanity --------------------------------------------------
 
     #[test]
-    fn tile_bbox_emits_closed_ccw_ring() {
+    fn tile_bbox_emits_half_open_closed_ccw_ring() {
         let tile = TileSpec {
             tile_bbox: Some(BoundingBox {
                 sw: [-10.0, -5.0],
@@ -323,19 +333,34 @@ mod tests {
         let ring = rings[0].as_array().unwrap();
         assert_eq!(ring.len(), 5, "ring should be 5 points (closed)");
 
-        // Check the four distinct corners are present in CCW order:
-        // SW, SE, NE, NW.
-        let expected: [[f64; 2]; 5] = [
-            [-10.0, -5.0],
-            [20.0, -5.0],
-            [20.0, 15.0],
-            [-10.0, 15.0],
-            [-10.0, -5.0],
-        ];
-        for (i, exp) in expected.iter().enumerate() {
-            let pt = ring[i].as_array().unwrap();
-            assert!((pt[0].as_f64().unwrap() - exp[0]).abs() < 1e-9);
-            assert!((pt[1].as_f64().unwrap() - exp[1]).abs() < 1e-9);
-        }
+        // SW corner is the raw bbox SW (inclusive). The ring starts here
+        // and ends here (closed).
+        let sw = ring[0].as_array().unwrap();
+        assert!((sw[0].as_f64().unwrap() - -10.0).abs() < 1e-12);
+        assert!((sw[1].as_f64().unwrap() - -5.0).abs() < 1e-12);
+        let last = ring[4].as_array().unwrap();
+        assert_eq!(last[0].as_f64().unwrap(), sw[0].as_f64().unwrap());
+        assert_eq!(last[1].as_f64().unwrap(), sw[1].as_f64().unwrap());
+
+        // NE corner has been shrunk inward by a tiny epsilon so that tile
+        // membership is half-open. We don't assert the exact epsilon
+        // (it's a private constant), only that the NE corner is strictly
+        // less than the raw bbox NE and not absurdly shrunk.
+        let ne = ring[2].as_array().unwrap();
+        let ne_lon = ne[0].as_f64().unwrap();
+        let ne_lat = ne[1].as_f64().unwrap();
+        assert!(ne_lon < 20.0, "NE lon should be shrunk: {}", ne_lon);
+        assert!(ne_lon > 20.0 - 1.0e-3, "NE lon shouldn't be wildly shrunk: {}", ne_lon);
+        assert!(ne_lat < 15.0, "NE lat should be shrunk: {}", ne_lat);
+        assert!(ne_lat > 15.0 - 1.0e-3, "NE lat shouldn't be wildly shrunk: {}", ne_lat);
+
+        // CCW corners (the SE and NW corners use one shrunk axis and one
+        // raw axis — verify the pairing is right).
+        let se = ring[1].as_array().unwrap();
+        assert!((se[0].as_f64().unwrap() - ne_lon).abs() < 1e-12);
+        assert!((se[1].as_f64().unwrap() - -5.0).abs() < 1e-12);
+        let nw = ring[3].as_array().unwrap();
+        assert!((nw[0].as_f64().unwrap() - -10.0).abs() < 1e-12);
+        assert!((nw[1].as_f64().unwrap() - ne_lat).abs() < 1e-12);
     }
 }

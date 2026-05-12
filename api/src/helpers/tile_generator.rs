@@ -23,10 +23,12 @@
 //! composition, and the handler in `main.rs` drives the probe-forward
 //! walk that skips empty tiles.
 //!
-//! Known limitation: polygons that cross the antimeridian produce a naive
-//! bbox spanning most of the globe (min_lon ≈ -180, max_lon ≈ +180),
-//! which produces an excessive tile sequence. The existing user-polygon
-//! filter has the same issue, so we match its behaviour for now.
+//! Antimeridian-crossing polygons (any edge spanning > 180° in longitude)
+//! are detected and split into an east sub-bbox and a west sub-bbox so we
+//! don't over-tile a thin strip across the dateline. Polygons with
+//! multiple antimeridian crossings or those spanning more than a
+//! hemisphere may still over-tile — the unwrapping is intentionally
+//! simple-minded and assumes the polygon has at most one crossing.
 
 use serde_json::Value;
 
@@ -166,19 +168,48 @@ fn polygon_tiles(polygon: &str, config: &DatasetConfig) -> Vec<TileSpec> {
         Err(_) => return Vec::new(),
     };
 
-    let mut min_lon = f64::INFINITY;
-    let mut max_lon = f64::NEG_INFINITY;
+    let mut spatial = Vec::new();
+    for bbox in polygon_bboxes(&coords) {
+        spatial.extend(grid_aligned_tiles(bbox, config.tile_degrees));
+    }
+    cross_levels(spatial, config)
+}
+
+/// Compute the bounding box(es) covering a polygon's vertices, handling
+/// antimeridian-crossing polygons by emitting two sub-bboxes (one east of
+/// the dateline, one west) instead of one bbox that naively spans most of
+/// the globe.
+///
+/// Detection: any edge of the polygon with `|lon_diff| > 180°` must be the
+/// short way around the sphere — i.e. it crosses the antimeridian. (An
+/// edge of exactly 180° is ambiguous and treated as non-crossing.)
+///
+/// Splitting: when crossing is detected, longitudes are *unwrapped* by
+/// adding 360° to negative values, putting everything in `[0°, 540°]`.
+/// The polygon then has a contiguous lon range `[min, max]` in that
+/// space. If `max > 180°` the polygon crosses, and we split into:
+///   - east bbox: `[min, 180°]`
+///   - west bbox: `[-180°, max - 360°]`
+/// Both sub-bboxes share the same lat range (computed across all vertices).
+///
+/// This assumes at most one antimeridian crossing per polygon. Polygons
+/// with multiple crossings or those covering more than a hemisphere will
+/// over-tile but stay correct (Mongo's `$geoWithin` does the actual
+/// polygon intersection per tile).
+fn polygon_bboxes(coords: &[Vec<f64>]) -> Vec<BoundingBox> {
+    if coords.is_empty() {
+        return Vec::new();
+    }
+
+    let crosses_antimeridian = coords.windows(2).any(|w| {
+        w[0].len() >= 2 && w[1].len() >= 2 && (w[0][0] - w[1][0]).abs() > 180.0
+    });
+
     let mut min_lat = f64::INFINITY;
     let mut max_lat = f64::NEG_INFINITY;
-    for pt in &coords {
+    for pt in coords {
         if pt.len() < 2 {
             continue;
-        }
-        if pt[0] < min_lon {
-            min_lon = pt[0];
-        }
-        if pt[0] > max_lon {
-            max_lon = pt[0];
         }
         if pt[1] < min_lat {
             min_lat = pt[1];
@@ -187,20 +218,76 @@ fn polygon_tiles(polygon: &str, config: &DatasetConfig) -> Vec<TileSpec> {
             max_lat = pt[1];
         }
     }
-    if !min_lon.is_finite() || !max_lat.is_finite() {
+    if !min_lat.is_finite() {
         return Vec::new();
     }
 
-    cross_levels(
-        grid_aligned_tiles(
+    if !crosses_antimeridian {
+        let mut min_lon = f64::INFINITY;
+        let mut max_lon = f64::NEG_INFINITY;
+        for pt in coords {
+            if pt.len() < 2 {
+                continue;
+            }
+            if pt[0] < min_lon {
+                min_lon = pt[0];
+            }
+            if pt[0] > max_lon {
+                max_lon = pt[0];
+            }
+        }
+        if !min_lon.is_finite() {
+            return Vec::new();
+        }
+        return vec![BoundingBox {
+            sw: [min_lon, min_lat],
+            ne: [max_lon, max_lat],
+        }];
+    }
+
+    // Unwrapped longitudes: shift negatives into [180°, 360°] so the
+    // polygon becomes contiguous in lon space.
+    let mut min_lon = f64::INFINITY;
+    let mut max_lon = f64::NEG_INFINITY;
+    for pt in coords {
+        if pt.len() < 2 {
+            continue;
+        }
+        let lon = if pt[0] < 0.0 { pt[0] + 360.0 } else { pt[0] };
+        if lon < min_lon {
+            min_lon = lon;
+        }
+        if lon > max_lon {
+            max_lon = lon;
+        }
+    }
+    if !min_lon.is_finite() {
+        return Vec::new();
+    }
+
+    if max_lon > 180.0 && min_lon < 180.0 {
+        // Genuine antimeridian crossing — split.
+        vec![
             BoundingBox {
                 sw: [min_lon, min_lat],
-                ne: [max_lon, max_lat],
+                ne: [180.0, max_lat],
             },
-            config.tile_degrees,
-        ),
-        config,
-    )
+            BoundingBox {
+                sw: [-180.0, min_lat],
+                ne: [max_lon - 360.0, max_lat],
+            },
+        ]
+    } else {
+        // Detection fired but the unwrapped polygon doesn't actually
+        // straddle the dateline (rare, e.g. all vertices in [-180, 0]
+        // but with an edge near the dateline whose lon_diff just
+        // exceeds 180°). Fall back to the unwrapped bbox un-split —
+        // an over-cover that Mongo's polygon filter will trim anyway.
+        vec![BoundingBox {
+            sw: [min_lon, min_lat],
+            ne: [max_lon, max_lat],
+        }]
+    }
 }
 
 /// Tile a bbox into grid-aligned cells of side `tile_degrees`. The grid is
@@ -486,6 +573,98 @@ mod tests {
     fn malformed_polygon_returns_empty() {
         let tiles = generate_tiles(&json!({"polygon": "not json"}), &TEST_CONFIG);
         assert!(tiles.is_empty());
+    }
+
+    #[test]
+    fn polygon_crossing_antimeridian_splits_into_two_sub_bboxes() {
+        // Polygon straddles the antimeridian: vertices at 170°E and 170°W,
+        // i.e. the polygon is a thin strip across the dateline. Naive
+        // bbox would give [-170, 0]→[170, 10] (340° wide); we want two
+        // bboxes covering [170, 0]→[180, 10] and [-180, 0]→[-170, 10].
+        let tiles = generate_tiles(
+            &json!({"polygon": "[[170,0],[-170,0],[-170,10],[170,10],[170,0]]"}),
+            &TEST_CONFIG,
+        );
+
+        // 2 spatial sub-bboxes × 1 spatial tile each × 2 levels = 4 specs.
+        // (Each sub-bbox is exactly 10°×10°, so one tile.)
+        assert_eq!(tiles.len(), 2 * TEST_CONFIG.levels.len());
+
+        let bboxes: Vec<_> = tiles.iter().map(|t| t.tile_bbox.clone()).collect();
+        assert!(bboxes.contains(&Some(BoundingBox {
+            sw: [170.0, 0.0],
+            ne: [180.0, 10.0],
+        })));
+        assert!(bboxes.contains(&Some(BoundingBox {
+            sw: [-180.0, 0.0],
+            ne: [-170.0, 10.0],
+        })));
+    }
+
+    #[test]
+    fn polygon_entirely_east_of_dateline_is_not_split() {
+        // All vertices positive, no edge spans > 180°. Single bbox.
+        let tiles = generate_tiles(
+            &json!({"polygon": "[[10,0],[20,0],[20,10],[10,10],[10,0]]"}),
+            &TEST_CONFIG,
+        );
+        assert_eq!(tiles.len(), TEST_CONFIG.levels.len());
+        assert_eq!(
+            tiles[0].tile_bbox,
+            Some(BoundingBox {
+                sw: [10.0, 0.0],
+                ne: [20.0, 10.0],
+            })
+        );
+    }
+
+    #[test]
+    fn polygon_entirely_west_of_dateline_is_not_split() {
+        // All negatives, no edge spans > 180°. Single bbox.
+        let tiles = generate_tiles(
+            &json!({"polygon": "[[-20,0],[-10,0],[-10,10],[-20,10],[-20,0]]"}),
+            &TEST_CONFIG,
+        );
+        assert_eq!(tiles.len(), TEST_CONFIG.levels.len());
+        assert_eq!(
+            tiles[0].tile_bbox,
+            Some(BoundingBox {
+                sw: [-20.0, 0.0],
+                ne: [-10.0, 10.0],
+            })
+        );
+    }
+
+    #[test]
+    fn polygon_edge_at_exactly_180_lon_diff_is_treated_as_non_crossing() {
+        // Edge from (90, 0) to (-90, 0) has |lon_diff| = 180 exactly,
+        // which is ambiguous (the polygon could go the short way around
+        // either hemisphere). We treat exact-180 as non-crossing, which
+        // gives a 180°-wide bbox covering the eastern hemisphere; Mongo's
+        // $geoWithin will pick its own interpretation.
+        let tiles = generate_tiles(
+            &json!({"polygon": "[[90,0],[-90,0],[-90,10],[90,10],[90,0]]"}),
+            &TEST_CONFIG,
+        );
+        // One bbox spanning [-90, 0]→[90, 10] = 9 lon cells × 1 lat cell.
+        let distinct_bboxes: Vec<_> = {
+            let mut v: Vec<Option<BoundingBox>> = Vec::new();
+            for t in &tiles {
+                if !v.iter().any(|b| b == &t.tile_bbox) {
+                    v.push(t.tile_bbox.clone());
+                }
+            }
+            v
+        };
+        // Some number of distinct tiles, but no SW negative-to-positive split.
+        // We just assert we didn't accidentally split (would produce a
+        // BoundingBox with sw=[-180, _]).
+        assert!(
+            !distinct_bboxes.iter().any(|b| {
+                b.as_ref().map(|bb| bb.sw[0] == -180.0).unwrap_or(false)
+            }),
+            "exact-180° edge shouldn't have triggered an antimeridian split"
+        );
     }
 
     // ---- defensive: dataset with no levels ----------------------------------

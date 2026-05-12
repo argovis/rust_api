@@ -271,6 +271,33 @@ async fn box_crossing_dateline_finds_antimeridian_docs() {
 }
 
 #[tokio::test]
+async fn polygon_crossing_antimeridian_finds_seeded_doc() {
+    // Polygon straddles the dateline: vertices at (170, 45), (-160, 45),
+    // (-160, 55), (170, 55). The tile generator should detect the
+    // antimeridian crossing and emit east + west sub-bboxes covering the
+    // narrow band rather than the naive 330°-wide bbox.
+    //
+    // doc_003 at (-170, 50) sits inside the western piece. The other
+    // seeded docs are far from this band and should be excluded.
+    let docs = get_paged(
+        "/timeseries/bsose",
+        &[
+            ("polygon", "[[170,45],[-160,45],[-160,55],[170,55],[170,45]]"),
+            ("data", "all"),
+        ],
+    )
+    .await;
+    let ids: Vec<&str> = docs.iter().map(|r| r["_id"].as_str().unwrap()).collect();
+    assert_eq!(
+        docs.len(),
+        1,
+        "expected exactly doc_003 in antimeridian polygon, got {:?}",
+        ids
+    );
+    assert!(ids.contains(&"bsose_doc_003"), "ids: {:?}", ids);
+}
+
+#[tokio::test]
 async fn center_radius_filter_matches_nearby_points_across_pages() {
     // 100 km radius around (20, 10) — at the BSOSE radius cap.
     // center+radius gets level-only pagination (no spatial tiling), so

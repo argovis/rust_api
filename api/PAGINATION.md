@@ -106,11 +106,13 @@ antimeridian / north-pole docs aren't lost.
 
 ## Known limitations
 
-- **Antimeridian polygons.** A polygon whose vertices straddle the
-  antimeridian (some near `lon=+180`, others near `lon=-180`) computes
-  a naive bounding box spanning most of the globe and generates a huge
-  tile sequence. Mongo's `$geoWithin` doesn't handle these cleanly
-  either — for now, treat as user input bug.
+- **Polygons spanning more than a hemisphere or with multiple
+  antimeridian crossings.** Single-crossing antimeridian polygons are
+  detected and split into east + west sub-bboxes (no globe-spanning
+  over-tile). Polygons with two or more antimeridian crossings, or
+  polygons covering more than half the sphere, may over-tile — the
+  result is still correct (Mongo's `$geoWithin` does the actual
+  polygon intersection), just slower than ideal.
 - **Grid-aligned user box NE corner.** A user-supplied box whose NE
   corner sits exactly on a tile grid line (e.g.
   `box=[[20,10],[40,30]]`) will lose docs at that exact NE corner,

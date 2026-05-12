@@ -10,10 +10,14 @@
 //!     a `level_index` resolves to.
 //!
 //! This module's job is to translate a `TileSpec` into BSON predicates and
-//! AND them with the user filter. Tile bbox becomes
-//! `geolocation.coordinates: { $geoWithin: { $box: [[sw], [ne]] } }`, which
-//! matches the cartesian-box shape the existing user-box filter already
-//! uses. Level index becomes `level: { $gte: L_i, $lt: L_{i+1} }`, with the
+//! AND them with the user filter. Tile bbox becomes a GeoJSON Polygon on
+//! `geolocation: { $geoWithin: { $geometry: Polygon } }` — same shape the
+//! existing `polygon_filter` uses, so Mongo evaluates it via the 2dsphere
+//! index that's actually present on `geolocation`. We deliberately do NOT
+//! use the legacy `$box` shape on `geolocation.coordinates`, because that
+//! path doesn't hit the 2dsphere index and can return duplicates under
+//! multikey-array semantics when used alone (without an enclosing `$or`).
+//! Level index becomes `level: { $gte: L_i, $lt: L_{i+1} }`, with the
 //! upper bound omitted for the deepest level so the bracket extends to
 //! +infinity (catches anything past the configured maximum).
 //!
@@ -26,8 +30,8 @@
 //! a programming error (the tile generator should never emit one), but if
 //! one slips through we drop the level clause silently rather than panic.
 
-use mongodb::bson::{doc, Bson, Document};
-use serde_json::Value;
+use mongodb::bson::{self, doc, Bson, Document};
+use serde_json::{json, Value};
 
 use super::dataset_config::DatasetConfig;
 use super::filters::filter_timeseries;
@@ -51,18 +55,30 @@ fn build_tile_filter(tile: &TileSpec, config: &DatasetConfig) -> Document {
     let mut out = Document::new();
 
     if let Some(bbox) = &tile.tile_bbox {
-        // Match the format used by the existing user-box filter:
-        //   geolocation.coordinates: { $geoWithin: { $box: [[sw], [ne]] } }
-        // Using cartesian $box (rather than spherical $geometry: Polygon)
-        // is fine at 10° tile scale where planar approximation is accurate
-        // enough, and it's cheap for Mongo to evaluate.
-        let box_array: Vec<Vec<f64>> = vec![
-            vec![bbox.sw[0], bbox.sw[1]],
-            vec![bbox.ne[0], bbox.ne[1]],
-        ];
+        // Build the tile as a 5-point GeoJSON Polygon ring (closed),
+        // matching the same shape the existing `polygon_filter` uses for
+        // user polygons. Mongo treats this via the 2dsphere index on
+        // `geolocation` (a GeoJSON Point field) and avoids the legacy
+        // `$box`-on-coordinates path, which can multiply matches when the
+        // coordinate array is treated as multikey.
+        //
+        // Ring winding order is counter-clockwise (SW → SE → NE → NW → SW),
+        // which is the GeoJSON spec direction for the outer ring of a
+        // small polygon.
+        let polygon_geom = bson::to_bson(&json!({
+            "type": "Polygon",
+            "coordinates": [[
+                [bbox.sw[0], bbox.sw[1]],
+                [bbox.ne[0], bbox.sw[1]],
+                [bbox.ne[0], bbox.ne[1]],
+                [bbox.sw[0], bbox.ne[1]],
+                [bbox.sw[0], bbox.sw[1]],
+            ]],
+        }))
+        .expect("polygon geometry serialization is infallible for finite floats");
         out.insert(
-            "geolocation.coordinates",
-            doc! { "$geoWithin": { "$box": box_array } },
+            "geolocation",
+            doc! { "$geoWithin": { "$geometry": polygon_geom } },
         );
     }
 
@@ -159,9 +175,10 @@ mod tests {
         let f = compose_filter_with_tile(json!({}), &tile, &TEST_CONFIG);
         // No $and wrapping — empty user filter means we return tile alone.
         assert!(f.get_array("$and").is_err());
-        let geo = f.get_document("geolocation.coordinates").unwrap();
+        let geo = f.get_document("geolocation").unwrap();
         let within = geo.get_document("$geoWithin").unwrap();
-        assert!(within.get_array("$box").is_ok());
+        let geom = within.get_document("$geometry").unwrap();
+        assert_eq!(geom.get_str("type").unwrap(), "Polygon");
     }
 
     #[test]
@@ -180,7 +197,7 @@ mod tests {
     fn empty_params_with_full_tile_has_both_clauses_no_and() {
         let f = compose_filter_with_tile(json!({}), &full_tile(0), &TEST_CONFIG);
         assert!(f.get_array("$and").is_err());
-        assert!(f.get_document("geolocation.coordinates").is_ok());
+        assert!(f.get_document("geolocation").is_ok());
         assert!(f.get_document("level").is_ok());
     }
 
@@ -195,8 +212,8 @@ mod tests {
         );
         let parts = f.get_array("$and").expect("should be $and-wrapped");
         assert_eq!(parts.len(), 2);
-        // User filter has $or (from box_filter); tile filter has
-        // geolocation.coordinates. Both should appear, one per element.
+        // User filter has $or (from box_filter); tile filter has a
+        // geolocation Polygon clause. Both should appear, one per element.
         let p0 = parts[0].as_document().unwrap();
         let p1 = parts[1].as_document().unwrap();
         assert!(
@@ -204,8 +221,8 @@ mod tests {
             "user box $or should land in one of the $and clauses"
         );
         assert!(
-            p0.get_document("geolocation.coordinates").is_ok()
-                || p1.get_document("geolocation.coordinates").is_ok(),
+            p0.get_document("geolocation").is_ok()
+                || p1.get_document("geolocation").is_ok(),
             "tile bbox should land in one of the $and clauses"
         );
     }
@@ -288,7 +305,7 @@ mod tests {
     // ---- bbox shape sanity --------------------------------------------------
 
     #[test]
-    fn tile_bbox_emits_corner_pair_in_box_array() {
+    fn tile_bbox_emits_closed_ccw_ring() {
         let tile = TileSpec {
             tile_bbox: Some(BoundingBox {
                 sw: [-10.0, -5.0],
@@ -297,15 +314,28 @@ mod tests {
             level_index: None,
         };
         let f = compose_filter_with_tile(json!({}), &tile, &TEST_CONFIG);
-        let geo = f.get_document("geolocation.coordinates").unwrap();
+        let geo = f.get_document("geolocation").unwrap();
         let within = geo.get_document("$geoWithin").unwrap();
-        let box_array = within.get_array("$box").unwrap();
-        assert_eq!(box_array.len(), 2);
-        let sw = box_array[0].as_array().unwrap();
-        let ne = box_array[1].as_array().unwrap();
-        assert!((sw[0].as_f64().unwrap() - -10.0).abs() < 1e-9);
-        assert!((sw[1].as_f64().unwrap() - -5.0).abs() < 1e-9);
-        assert!((ne[0].as_f64().unwrap() - 20.0).abs() < 1e-9);
-        assert!((ne[1].as_f64().unwrap() - 15.0).abs() < 1e-9);
+        let geom = within.get_document("$geometry").unwrap();
+        assert_eq!(geom.get_str("type").unwrap(), "Polygon");
+        let rings = geom.get_array("coordinates").unwrap();
+        assert_eq!(rings.len(), 1, "expected a single outer ring");
+        let ring = rings[0].as_array().unwrap();
+        assert_eq!(ring.len(), 5, "ring should be 5 points (closed)");
+
+        // Check the four distinct corners are present in CCW order:
+        // SW, SE, NE, NW.
+        let expected: [[f64; 2]; 5] = [
+            [-10.0, -5.0],
+            [20.0, -5.0],
+            [20.0, 15.0],
+            [-10.0, 15.0],
+            [-10.0, -5.0],
+        ];
+        for (i, exp) in expected.iter().enumerate() {
+            let pt = ring[i].as_array().unwrap();
+            assert!((pt[0].as_f64().unwrap() - exp[0]).abs() < 1e-9);
+            assert!((pt[1].as_f64().unwrap() - exp[1]).abs() < 1e-9);
+        }
     }
 }

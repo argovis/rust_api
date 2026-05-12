@@ -305,7 +305,9 @@ async fn compression_minimal_returns_stub_arrays_across_pages() {
         &[("compression", "minimal"), ("data", "all")],
     )
     .await;
-    assert!(!docs.is_empty());
+    // The 4 seeded docs live in 4 distinct (spatial, level) tiles, so
+    // pagination should yield exactly 4 stubs total.
+    assert_eq!(docs.len(), 4, "expected one stub per seeded doc, got {:?}", docs);
     // Stubs serialize as 5-element arrays: [_id, lon, lat, level, metadata].
     for row in &docs {
         let arr = row.as_array().expect("each stub should be an array");
@@ -319,23 +321,103 @@ async fn compression_minimal_returns_stub_arrays_across_pages() {
 }
 
 #[tokio::test]
+async fn compression_minimal_with_id_returns_single_page_stub() {
+    // id lookup produces a passthrough tile; combining it with minimal
+    // should yield exactly one stub in a single-page response.
+    let body = get_envelope(
+        "/timeseries/bsose",
+        &[
+            ("id", "bsose_doc_001"),
+            ("compression", "minimal"),
+            ("data", "all"),
+        ],
+    )
+    .await;
+    let docs = body["docs"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    let stub = docs[0].as_array().expect("minimal response is a stub array");
+    assert_eq!(stub.len(), 5);
+    assert_eq!(stub[0].as_str().unwrap(), "bsose_doc_001");
+    assert!(body["next_url"].is_null(), "id lookups don't paginate further");
+}
+
+#[tokio::test]
+async fn batchmeta_with_id_returns_single_page_metadata() {
+    // id + batchmeta also passthrough-tiled: one metadata doc, single page.
+    let body = get_envelope(
+        "/timeseries/bsose",
+        &[
+            ("id", "bsose_doc_001"),
+            ("batchmeta", "true"),
+            ("data", "all"),
+        ],
+    )
+    .await;
+    let docs = body["docs"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["_id"], "bsose-profile-meta-2020");
+    assert_eq!(docs[0]["data_type"], "BSOSE-profile");
+    assert!(body["next_url"].is_null());
+}
+
+#[tokio::test]
+async fn batchmeta_takes_precedence_over_minimal() {
+    // The handler dispatches into the batchmeta branch before the
+    // streaming branch consults compression=minimal. With both set,
+    // batchmeta wins and the returned docs are metadata objects, not
+    // 5-element stubs.
+    let body = get_envelope(
+        "/timeseries/bsose",
+        &[
+            ("id", "bsose_doc_001"),
+            ("batchmeta", "true"),
+            ("compression", "minimal"),
+            ("data", "all"),
+        ],
+    )
+    .await;
+    let docs = body["docs"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    // A metadata doc is a JSON object with a data_type field; a stub is
+    // a 5-element array. Verify we got the object form.
+    let first = &docs[0];
+    assert!(
+        first.is_object(),
+        "expected metadata object when batchmeta is set, got {:?}",
+        first
+    );
+    assert_eq!(first["data_type"], "BSOSE-profile");
+}
+
+#[tokio::test]
 async fn batchmeta_returns_metadata_documents_across_pages() {
-    // batchmeta aggregates per-page; across pages, the same metadata id may
-    // appear multiple times (once per non-empty tile referencing it). We
-    // dedupe by `_id` here.
+    // batchmeta aggregates per-page: each non-empty (spatial, level) tile
+    // returns the metadata docs referenced by that tile's bsose docs.
+    // Our 4 seeded docs each live in their own tile and all reference the
+    // same metadata id, so we get 4 page-level metadata responses each
+    // containing that one metadata doc — 4 returned docs, 1 unique id.
     let docs = get_paged(
         "/timeseries/bsose",
         &[("batchmeta", "true"), ("data", "all")],
     )
     .await;
+    assert_eq!(
+        docs.len(),
+        4,
+        "expected one batchmeta response per non-empty tile, got {:?}",
+        docs
+    );
+
     let mut unique_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for d in &docs {
         unique_ids.insert(d["_id"].as_str().unwrap().to_string());
     }
     assert_eq!(unique_ids.len(), 1, "all seeded docs share one metadata id");
     assert!(unique_ids.contains("bsose-profile-meta-2020"));
-    // And the data_type came through on at least one returned copy.
-    assert!(docs.iter().any(|d| d["data_type"] == "BSOSE-profile"));
+    // Every returned doc should be a metadata document, not a bsose doc.
+    for d in &docs {
+        assert_eq!(d["data_type"], "BSOSE-profile");
+    }
 }
 
 // ---------------------------------------------------------------------------

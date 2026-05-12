@@ -17,6 +17,7 @@ use api::helpers::filters;
 use api::helpers::transforms;
 use api::helpers::schema;
 use api::helpers::helpers;
+use api::helpers::dataset_config;
 
 use mongodb::{options::FindOptions, bson::Document, error::Result};
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
@@ -36,6 +37,11 @@ static TIMESERIES: Lazy<Mutex<Option<Vec<DateTime>>>> = Lazy::new(|| Mutex::new(
 #[get("/timeseries/bsose")]
 async fn search_data_schema(query_params: web::Query<serde_json::Value>) -> impl Responder {
     let params = query_params.into_inner();
+
+    // Dataset-specific request-size policy. Step 1 of the pagination work
+    // just binds this; later steps will consume `tile_degrees` (for tile
+    // generation) and `max_radius_meters` (for center+radius caps).
+    let _config = &dataset_config::BSOSE_CONFIG;
 
     // validate query params ////////////////////////////////////////
     match helpers::validate_query_params(&params) {

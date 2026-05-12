@@ -9,3 +9,6 @@ pub use schema::*;
 
 pub mod filters;
 pub use filters::*;
+
+pub mod dataset_config;
+pub use dataset_config::*;

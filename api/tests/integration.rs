@@ -14,11 +14,12 @@
 //   API_URL=http://localhost:8080 MONGODB_URI=mongodb://localhost:27017 \
 //     cargo test --test integration -- --test-threads=1
 //
-// The response shape is the paginated envelope introduced in Step 6:
+// Every response is the paginated envelope:
 //   { "docs": [...], "next_url": "<rel path?…>" | null, "message": "..." }
 // Multi-tile queries (anything spanning multiple grid cells or vertical
 // levels) span multiple pages — use `get_paged` to follow `next_url` and
-// accumulate docs across pages.
+// accumulate docs across pages. See api/PAGINATION.md for the full
+// contract.
 
 mod common;
 

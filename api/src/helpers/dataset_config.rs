@@ -1,13 +1,11 @@
 //! Per-dataset configuration governing request-size limits.
 //!
-//! This module is the seam where pagination decisions hang off the dataset
-//! identity. Future steps will consult `tile_degrees` to generate spatial
-//! pagination tiles, and `max_radius_meters` to reject oversize `center +
-//! radius` queries (which go through MongoDB `$near` / `$geoNear` and aren't
-//! paginated).
-//!
-//! Step 1 (current): introduce the type and a BSOSE-specific instance. No
-//! behaviour change yet — the handler binds the config but does not act on it.
+//! This is the seam where pagination decisions hang off the dataset
+//! identity. `tile_degrees` drives spatial tile generation; `levels`
+//! defines the discrete depth pages within each spatial tile;
+//! `max_radius_meters` caps `center + radius` queries (which go through
+//! MongoDB `$near` and aren't paginated, so the cap is the only thing
+//! preventing a runaway disk-of-most-of-the-globe).
 
 /// Per-dataset request-size policy.
 ///

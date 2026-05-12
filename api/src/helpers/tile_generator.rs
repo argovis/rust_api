@@ -17,14 +17,16 @@
 //! time. This means a 10°×10° tile gives the BSOSE-class upper bound of
 //! ~1600 docs even when the user's query covers only a sliver of it.
 //!
-//! Step 3 scope: this is a pure function. It does not look up the database,
-//! it does not skip empty tiles, and it does not compose with the existing
-//! Mongo filter. Those are Steps 4–6.
+//! This module is a pure function over its inputs. It doesn't touch
+//! MongoDB, doesn't decide which tiles are non-empty, and doesn't compose
+//! its output with the user filter. `filter_composer` does the BSON
+//! composition, and the handler in `main.rs` drives the probe-forward
+//! walk that skips empty tiles.
 //!
 //! Known limitation: polygons that cross the antimeridian produce a naive
-//! bbox that spans most of the globe (min_lon ≈ -180, max_lon ≈ +180). The
-//! existing filter code doesn't handle antimeridian polygons either, so we
-//! match that behaviour for now and leave a proper fix for later.
+//! bbox spanning most of the globe (min_lon ≈ -180, max_lon ≈ +180),
+//! which produces an excessive tile sequence. The existing user-polygon
+//! filter has the same issue, so we match its behaviour for now.
 
 use serde_json::Value;
 
@@ -76,8 +78,8 @@ pub fn generate_tiles(params: &Value, config: &DatasetConfig) -> Vec<TileSpec> {
     }
 
     // center + radius: level-only pagination. The `$near` query is bounded
-    // by `max_radius_meters` (enforced in a later step), so we don't tile
-    // it spatially.
+    // by `max_radius_meters` (enforced in helpers::validate_radius_cap),
+    // so we don't tile it spatially.
     if params.get("center").is_some() {
         return level_only_tiles(config);
     }

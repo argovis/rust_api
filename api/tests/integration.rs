@@ -224,6 +224,11 @@ async fn box_filter_matches_seeded_points_across_pages() {
 #[tokio::test]
 async fn polygon_filter_matches_seeded_points_across_pages() {
     // Polygon around (20, 10) — small square enclosing doc_001 / doc_004.
+    // The polygon's bbox spans four spatial tiles ([10-20, 0-10],
+    // [20-30, 0-10], [10-20, 10-20], [20-30, 10-20]) — multi-tile case.
+    // doc_001 (level 10 → L0) and doc_004 (level 50 → L3) share the same
+    // spatial tile but land in different level pages, so we expect
+    // exactly 2 docs across 2 non-empty pages.
     let docs = get_paged(
         "/timeseries/bsose",
         &[
@@ -233,9 +238,35 @@ async fn polygon_filter_matches_seeded_points_across_pages() {
     )
     .await;
     let ids: Vec<&str> = docs.iter().map(|r| r["_id"].as_str().unwrap()).collect();
+    assert_eq!(docs.len(), 2, "expected exactly 2 docs, got {:?}", ids);
     assert!(ids.contains(&"bsose_doc_001"), "ids: {:?}", ids);
     assert!(ids.contains(&"bsose_doc_004"), "ids: {:?}", ids);
     assert!(!ids.contains(&"bsose_doc_002"));
+}
+
+#[tokio::test]
+async fn box_crossing_dateline_finds_antimeridian_docs() {
+    // Dateline-crossing box: sw_lon (170) > ne_lon (-160), so the box
+    // wraps the antimeridian. Tile generation splits it into an eastern
+    // sub-box (170..180) and a western sub-box (-180..-160). doc_003 at
+    // (-170, 50) lives in the western band; the other seeded docs are
+    // far from this box and should be excluded.
+    let docs = get_paged(
+        "/timeseries/bsose",
+        &[("box", "[[170,40],[-160,60]]"), ("data", "all")],
+    )
+    .await;
+    let ids: Vec<&str> = docs.iter().map(|r| r["_id"].as_str().unwrap()).collect();
+    assert_eq!(
+        docs.len(),
+        1,
+        "expected exactly one doc (doc_003), got {:?}",
+        ids
+    );
+    assert!(ids.contains(&"bsose_doc_003"), "ids: {:?}", ids);
+    assert!(!ids.contains(&"bsose_doc_001"));
+    assert!(!ids.contains(&"bsose_doc_002"));
+    assert!(!ids.contains(&"bsose_doc_004"));
 }
 
 #[tokio::test]
@@ -425,6 +456,29 @@ async fn batchmeta_returns_metadata_documents_across_pages() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn polygon_over_empty_region_returns_empty_envelope() {
+    // Polygon in the Indian Ocean (60-70°E, 5-15°N) — far from any
+    // seeded doc. Probe-forward should walk every candidate tile, find
+    // none non-empty, and return a 200 envelope with an empty docs array
+    // and null next_url instead of 404 or any other error code.
+    let body = get_envelope(
+        "/timeseries/bsose",
+        &[
+            ("polygon", "[[60,5],[70,5],[70,15],[60,15],[60,5]]"),
+            ("data", "all"),
+        ],
+    )
+    .await;
+    let docs = body["docs"].as_array().unwrap();
+    assert!(
+        docs.is_empty(),
+        "expected no docs in empty region, got {:?}",
+        docs
+    );
+    assert!(body["next_url"].is_null());
+}
+
+#[tokio::test]
 async fn tile_index_beyond_end_returns_empty_with_null_next_url() {
     // Tile sequence for a small box is short; an absurdly large tile_index
     // is past the end. The server should return 200 + empty docs +
@@ -462,10 +516,71 @@ async fn negative_tile_index_returns_400() {
     assert_eq!(resp.status(), 400);
 }
 
+/// Pull `tile_index` out of a next_url query string. Panics if absent —
+/// only used in tests where the URL was just emitted by the server, so a
+/// missing index is itself a bug worth surfacing.
+fn tile_index_from(url: &str) -> usize {
+    let query = url.split('?').nth(1).unwrap_or("");
+    for pair in query.split('&') {
+        if let Some(("tile_index", v)) = pair.split_once('=') {
+            return v
+                .parse()
+                .unwrap_or_else(|e| panic!("tile_index in {} failed to parse: {}", url, e));
+        }
+    }
+    panic!("no tile_index in url: {}", url);
+}
+
+#[tokio::test]
+async fn next_url_round_trips_cleanly() {
+    // Issue a multi-page request, GET its next_url directly (not via
+    // get_paged), and verify the server returns a valid envelope and the
+    // tile_index has advanced. Confirms that build_next_url's output
+    // survives the round-trip through the URL parser back into the
+    // handler — catches percent-encoding bugs, param dropping, etc.
+    let body = get_envelope(
+        "/timeseries/bsose",
+        &[("box", "[[15,5],[45,35]]"), ("data", "all")],
+    )
+    .await;
+    let next = body["next_url"]
+        .as_str()
+        .expect("first page of multi-tile request should advertise next_url");
+    let initial_idx = tile_index_from(next);
+
+    let url = format!("{}{}", common::api_url(), next);
+    let resp = client()
+        .get(&url)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("GET {} failed: {}", url, e));
+    assert_eq!(resp.status(), 200, "next_url should yield 200");
+    let next_body: Value = resp.json().await.expect("response should be JSON");
+
+    // Envelope shape preserved.
+    assert!(next_body["docs"].is_array());
+    assert!(next_body["message"].is_string());
+
+    // If there are still more pages after this one, the new next_url
+    // should reference a tile_index strictly greater than the one we just
+    // requested (server probed forward to find a non-empty tile).
+    if let Some(further) = next_body["next_url"].as_str() {
+        let further_idx = tile_index_from(further);
+        assert!(
+            further_idx > initial_idx,
+            "further next_url tile_index ({}) should advance past {}",
+            further_idx,
+            initial_idx
+        );
+    }
+}
+
 #[tokio::test]
 async fn first_page_carries_a_next_url_when_more_pages_remain() {
     // The (20,10)/(40,30) box has docs at multiple level brackets, so the
-    // first page should not be the last.
+    // first page should not be the last. next_url must carry both the
+    // user's params (so the next request hits the same filter) and an
+    // advanced tile_index.
     let body = get_envelope(
         "/timeseries/bsose",
         &[("box", "[[15,5],[45,35]]"), ("data", "all")],
@@ -477,6 +592,8 @@ async fn first_page_carries_a_next_url_when_more_pages_remain() {
     );
     let next = body["next_url"].as_str().unwrap();
     assert!(next.contains("tile_index="), "next_url: {}", next);
+    assert!(next.contains("box="), "next_url should preserve box param: {}", next);
+    assert!(next.contains("data="), "next_url should preserve data param: {}", next);
 }
 
 // ---------------------------------------------------------------------------

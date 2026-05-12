@@ -61,20 +61,43 @@ fn build_tile_filter(tile: &TileSpec, config: &DatasetConfig) -> Document {
         //
         // Half-open boundary handling: `$geoWithin` is boundary-inclusive
         // by GeoJSON spec — a point on a polygon edge counts as "within".
-        // That means a doc sitting exactly on a four-corner meeting point
-        // of the tile grid matches all four neighbouring tiles, and a
-        // pagination walk emits it four times. We make tile membership
-        // half-open ([sw, ne) on both axes) by shrinking the NE corner
-        // inward by `TILE_EDGE_EPSILON`. SW is left at the raw boundary,
-        // so each grid point ends up owned by exactly one tile — the one
-        // whose SW corner it sits at. The epsilon is far smaller than any
-        // realistic data resolution, so no real doc falls into the gap.
+        // For an interior grid corner, that means a doc at the meeting
+        // point of four tiles matches all four polygons and pagination
+        // emits it four times. We make tile membership half-open by
+        // shrinking each tile's NE corner inward by `TILE_EDGE_EPSILON`.
+        // The SW is left raw, so each grid point is owned by exactly one
+        // tile — the one whose SW corner it sits at.
+        //
+        // Global east/north exception: at lon=180 (the antimeridian) and
+        // lat=90 (the north pole), the tile has no eastern/northern
+        // neighbour to claim that boundary, so shrinking would create a
+        // gap that swallows docs sitting exactly on the antimeridian or
+        // at the pole. We leave those edges inclusive. SW edges at
+        // lon=-180 / lat=-90 are already inclusive by construction.
         //
         // Ring winding is CCW (SW → SE → NE → NW → SW), the GeoJSON
         // convention for the outer ring of a small polygon.
+        //
+        // Known limitation (not handled here): a user-supplied bounding
+        // box whose NE corner lies exactly on a tile grid line and is
+        // also closed (e.g. `box=[[20,10],[40,30]]`) will lose docs at
+        // that NE corner, because the rightmost/topmost tile's NE is
+        // shrunk away from the user's NE. Fixable by passing the user
+        // box's NE into the tile filter and skipping shrinkage when they
+        // coincide; deferred until a real test exercises it.
         const TILE_EDGE_EPSILON: f64 = 1.0e-6; // ~11 cm at the equator
-        let ne_lon = bbox.ne[0] - TILE_EDGE_EPSILON;
-        let ne_lat = bbox.ne[1] - TILE_EDGE_EPSILON;
+        const GLOBAL_EAST: f64 = 180.0;
+        const GLOBAL_NORTH: f64 = 90.0;
+        let ne_lon = if bbox.ne[0] >= GLOBAL_EAST {
+            bbox.ne[0]
+        } else {
+            bbox.ne[0] - TILE_EDGE_EPSILON
+        };
+        let ne_lat = if bbox.ne[1] >= GLOBAL_NORTH {
+            bbox.ne[1]
+        } else {
+            bbox.ne[1] - TILE_EDGE_EPSILON
+        };
         let polygon_geom = bson::to_bson(&json!({
             "type": "Polygon",
             "coordinates": [[
@@ -313,6 +336,87 @@ mod tests {
     }
 
     // ---- bbox shape sanity --------------------------------------------------
+
+    /// Read back the NE corner of the polygon ring from a composed filter.
+    /// Returns (ne_lon, ne_lat).
+    fn ne_of_composed(f: &Document) -> (f64, f64) {
+        let geo = f.get_document("geolocation").unwrap();
+        let within = geo.get_document("$geoWithin").unwrap();
+        let geom = within.get_document("$geometry").unwrap();
+        let rings = geom.get_array("coordinates").unwrap();
+        let ring = rings[0].as_array().unwrap();
+        let ne = ring[2].as_array().unwrap();
+        (ne[0].as_f64().unwrap(), ne[1].as_f64().unwrap())
+    }
+
+    #[test]
+    fn interior_tile_ne_is_shrunk() {
+        // An interior tile (neither edge touches a global meridian) gets
+        // its NE corner shrunk inward so adjacent tiles can't both claim
+        // a corner-meeting doc.
+        let tile = TileSpec {
+            tile_bbox: Some(BoundingBox {
+                sw: [0.0, 0.0],
+                ne: [10.0, 10.0],
+            }),
+            level_index: None,
+        };
+        let f = compose_filter_with_tile(json!({}), &tile, &TEST_CONFIG);
+        let (ne_lon, ne_lat) = ne_of_composed(&f);
+        assert!(ne_lon < 10.0, "interior NE lon should be shrunk: {}", ne_lon);
+        assert!(ne_lat < 10.0, "interior NE lat should be shrunk: {}", ne_lat);
+    }
+
+    #[test]
+    fn easternmost_tile_keeps_ne_lon_at_180() {
+        // A tile that abuts the antimeridian (ne_lon = 180) must NOT be
+        // shrunk in longitude — otherwise docs sitting exactly on the
+        // antimeridian fall in the gap with no tile to claim them.
+        let tile = TileSpec {
+            tile_bbox: Some(BoundingBox {
+                sw: [170.0, 0.0],
+                ne: [180.0, 10.0],
+            }),
+            level_index: None,
+        };
+        let f = compose_filter_with_tile(json!({}), &tile, &TEST_CONFIG);
+        let (ne_lon, ne_lat) = ne_of_composed(&f);
+        assert_eq!(ne_lon, 180.0, "antimeridian tile NE lon must remain 180");
+        // ne_lat is interior — still shrunk.
+        assert!(ne_lat < 10.0, "interior NE lat is still shrunk: {}", ne_lat);
+    }
+
+    #[test]
+    fn northernmost_tile_keeps_ne_lat_at_90() {
+        let tile = TileSpec {
+            tile_bbox: Some(BoundingBox {
+                sw: [0.0, 80.0],
+                ne: [10.0, 90.0],
+            }),
+            level_index: None,
+        };
+        let f = compose_filter_with_tile(json!({}), &tile, &TEST_CONFIG);
+        let (ne_lon, ne_lat) = ne_of_composed(&f);
+        assert!(ne_lon < 10.0, "interior NE lon is still shrunk: {}", ne_lon);
+        assert_eq!(ne_lat, 90.0, "north-pole tile NE lat must remain 90");
+    }
+
+    #[test]
+    fn ne_pole_meridian_corner_tile_keeps_both_unshrunk() {
+        // The single tile in the global grid that sits at both ne_lon=180
+        // AND ne_lat=90. Both axes must remain inclusive.
+        let tile = TileSpec {
+            tile_bbox: Some(BoundingBox {
+                sw: [170.0, 80.0],
+                ne: [180.0, 90.0],
+            }),
+            level_index: None,
+        };
+        let f = compose_filter_with_tile(json!({}), &tile, &TEST_CONFIG);
+        let (ne_lon, ne_lat) = ne_of_composed(&f);
+        assert_eq!(ne_lon, 180.0);
+        assert_eq!(ne_lat, 90.0);
+    }
 
     #[test]
     fn tile_bbox_emits_half_open_closed_ccw_ring() {

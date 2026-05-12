@@ -54,87 +54,38 @@ async fn get_envelope(path: &str, params: &[(&str, &str)]) -> Value {
 /// Follow `next_url` across pages, accumulating every doc returned. Stops
 /// once a page returns `next_url: null`. The relative `next_url` is
 /// resolved against `API_URL`.
-///
-/// Currently instrumented with println!s so that when an assertion fails in
-/// CI, the per-page state surfaces in the captured test output. Once
-/// pagination behaviour stabilises these can be removed.
 async fn get_paged(path: &str, params: &[(&str, &str)]) -> Vec<Value> {
     let mut all_docs: Vec<Value> = Vec::new();
     let mut url = url_with_query(path, params);
-    let mut page_count: usize = 0;
 
     loop {
-        page_count += 1;
-        println!("[get_paged] page {} GET {}", page_count, url);
-
         let resp = client()
             .get(&url)
             .send()
             .await
             .unwrap_or_else(|e| panic!("GET {} failed: {}", url, e));
-        let status = resp.status();
-        let body_text = resp
-            .text()
-            .await
-            .expect("response body should be readable");
-        if !status.is_success() {
-            panic!(
-                "[get_paged] non-200 status {} for {}: {}",
-                status, url, body_text
-            );
-        }
-        let body: Value = serde_json::from_str(&body_text).unwrap_or_else(|e| {
-            panic!(
-                "[get_paged] invalid JSON for {}: {} (body: {})",
-                url, e, body_text
-            )
-        });
+        assert_eq!(
+            resp.status(),
+            200,
+            "expected 200, got {} for {}",
+            resp.status(),
+            url
+        );
+        let body: Value = resp.json().await.expect("response should be JSON");
 
         let docs = body["docs"]
             .as_array()
             .expect("response.docs should be an array");
-        let doc_ids: Vec<&str> = docs
-            .iter()
-            .map(|d| d["_id"].as_str().unwrap_or("<no _id>"))
-            .collect();
-        println!(
-            "[get_paged] page {} -> docs.len={} ids={:?} next_url={} message={}",
-            page_count,
-            docs.len(),
-            doc_ids,
-            body["next_url"],
-            body["message"]
-        );
-
         all_docs.extend(docs.iter().cloned());
 
         match body["next_url"].as_str() {
             // `null` next_url means we've reached the end. (`as_str()` returns
             // None for both Value::Null and missing keys; both should
             // terminate.)
-            None => {
-                println!(
-                    "[get_paged] DONE after {} pages, {} total docs",
-                    page_count,
-                    all_docs.len()
-                );
-                break;
-            }
+            None => break,
             Some(rel) => {
                 url = format!("{}{}", common::api_url(), rel);
             }
-        }
-
-        // Runaway-safety: a buggy server that always emits a next_url could
-        // loop forever. Cap at 20 pages so CI fails fast with a useful
-        // trace instead of timing out.
-        if page_count >= 20 {
-            panic!(
-                "[get_paged] aborting after {} pages — pagination likely looping. \
-                 accumulated {} docs so far",
-                page_count,
-                all_docs.len()
-            );
         }
     }
 

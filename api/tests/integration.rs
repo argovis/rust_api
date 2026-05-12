@@ -240,14 +240,17 @@ async fn polygon_filter_matches_seeded_points_across_pages() {
 
 #[tokio::test]
 async fn center_radius_filter_matches_nearby_points_across_pages() {
-    // 5000 km radius around (20, 10). center+radius gets level-only
-    // pagination (no spatial tiling), so we still need to walk pages to
-    // hit each level bracket that contains data.
+    // 100 km radius around (20, 10) — at the BSOSE radius cap.
+    // center+radius gets level-only pagination (no spatial tiling), so
+    // we still need to walk pages to hit each level bracket that
+    // contains data. doc_001 / doc_004 sit exactly at the center so any
+    // positive radius catches them; doc_003 is on the other side of the
+    // planet and is excluded by any sane radius.
     let docs = get_paged(
         "/timeseries/bsose",
         &[
             ("center", "[20.0, 10.0]"),
-            ("radius", "5000000"), // 5000 km in metres
+            ("radius", "100000"), // 100 km — at the cap
             ("data", "all"),
         ],
     )

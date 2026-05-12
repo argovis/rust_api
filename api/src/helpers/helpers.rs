@@ -138,7 +138,10 @@ pub fn validate_radius_cap(
         // than masking it with a different 400.
         None => return Ok(()),
     };
-    let radius: f64 = match radius_str.parse() {
+    // Explicit turbofish: the match guard runs before the let-binding's
+    // type annotation flows back to `parse()`, so type inference can't
+    // resolve `F` otherwise.
+    let radius: f64 = match radius_str.parse::<f64>() {
         Ok(r) if r.is_finite() && r >= 0.0 => r,
         _ => {
             return Err(HttpResponse::BadRequest().json(json!({

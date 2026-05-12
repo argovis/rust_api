@@ -48,13 +48,13 @@ pub const BSOSE_LEVELS: &[f64] = &[
 /// Configuration for the BSOSE timeseries dataset.
 ///
 /// 10° tiles × 4 grid cells/degree = 40 × 40 = 1600 cells per (tile, level).
-/// `max_radius_meters` is set to roughly one major-basin radius. It exists
-/// so a naive caller can't ask for a half-globe disk via `center + radius`
-/// (which goes through Mongo `$near` and isn't spatially tiled). Revisit
-/// when we have operational request-distribution data.
+/// `max_radius_meters` is intentionally tight: BSOSE at 1/4° resolution
+/// produces ~16 docs per 25 km × 25 km cell, so even a small disk pulls
+/// thousands of docs out of `$near` (which isn't spatially tiled). 100 km
+/// is a conservative starting point — easy to bump up if users complain.
 pub const BSOSE_CONFIG: DatasetConfig = DatasetConfig {
     tile_degrees: 10.0,
-    max_radius_meters: 5_000_000.0, // 5000 km — one-basin radius
+    max_radius_meters: 100_000.0, // 100 km — bump if users complain
     levels: BSOSE_LEVELS,
 };
 

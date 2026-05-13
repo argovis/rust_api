@@ -37,11 +37,7 @@ pub struct DatasetConfig {
 /// near-surface dense, deep-ocean coarse, ~5500 m bottom) is representative
 /// of typical Southern Ocean gridded products so the rest of the pagination
 /// machinery sees plausible input.
-pub const BSOSE_LEVELS: &[f64] = &[
-    5.0, 15.0, 25.0, 40.0, 60.0, 85.0, 120.0, 165.0, 220.0, 290.0,
-    380.0, 490.0, 625.0, 790.0, 990.0, 1230.0, 1520.0, 1870.0,
-    2290.0, 2790.0, 3380.0, 4070.0, 4870.0, 5575.0,
-];
+pub const BSOSE_LEVELS: &[f64] = &[2.1, 6.7, 12.15, 18.55, 26.25, 35.25, 45.0, 55.0, 65.0, 75.0, 85.0, 95.0, 105.0, 115.0, 125.0, 135.0, 146.5, 161.5, 180.0, 200.0, 220.0, 240.0, 260.0, 280.0, 301.0, 327.0, 361.0, 402.5, 450.0, 500.0, 551.5, 614.0, 700.0, 800.0, 900.0, 1000.0, 1100.0, 1225.0, 1400.0, 1600.0, 1800.0, 2010.0, 2270.0, 2610.0, 3000.0, 3400.0, 3800.0, 4200.0, 4600.0, 5000.0, 5400.0, 5800.0];
 
 /// Configuration for the BSOSE timeseries dataset.
 ///

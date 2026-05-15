@@ -26,14 +26,29 @@ mod common;
 use common::url_with_query;
 use serde_json::Value;
 
-/// Generous timeout: the naive plod-forward through empty tiles can take a
-/// few seconds on the first page of a whole-globe request, even with the
-/// tiny seeded corpus. We can tighten this once we have a land-mask shortcut.
+/// Generous timeout: the naive plod-forward through empty tiles can take
+/// most of a minute on the first page of a whole-globe request once the
+/// dataset has many depth levels (BSOSE has ~52). We can tighten this
+/// once probe-forward gets smarter than per-tile cursor opens.
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(120))
         .build()
         .expect("reqwest client should build")
+}
+
+/// Render a reqwest error with its full source chain. `reqwest::Error`'s
+/// Display impl drops the cause unless you use `{:#}` (alternate format),
+/// which is easy to forget — without the chain, every transport-level
+/// failure looks like a vague "error sending request for url (...)".
+fn render_error(e: &dyn std::error::Error) -> String {
+    let mut msg = e.to_string();
+    let mut current = e.source();
+    while let Some(src) = current {
+        msg.push_str(&format!("\n  caused by: {}", src));
+        current = src.source();
+    }
+    msg
 }
 
 async fn get(path: &str, params: &[(&str, &str)]) -> reqwest::Response {
@@ -42,7 +57,7 @@ async fn get(path: &str, params: &[(&str, &str)]) -> reqwest::Response {
         .get(&url)
         .send()
         .await
-        .unwrap_or_else(|e| panic!("GET {} failed: {}", url, e))
+        .unwrap_or_else(|e| panic!("GET {} failed:\n  {}", url, render_error(&e)))
 }
 
 /// One paginated response: assert 200, parse as Value, return the body.
@@ -64,7 +79,7 @@ async fn get_paged(path: &str, params: &[(&str, &str)]) -> Vec<Value> {
             .get(&url)
             .send()
             .await
-            .unwrap_or_else(|e| panic!("GET {} failed: {}", url, e));
+            .unwrap_or_else(|e| panic!("GET {} failed:\n  {}", url, render_error(&e)));
         assert_eq!(
             resp.status(),
             200,

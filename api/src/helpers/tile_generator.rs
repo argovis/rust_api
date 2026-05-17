@@ -657,17 +657,23 @@ mod tests {
         // becomes lon=-179, the edge 179→-179 is detected as crossing,
         // and we get a sane east/west split.
         //
-        // 2° wide strip at 5° tile_degrees → one tile each side.
+        // Uses BSOSE_CONFIG so the test reflects the deployment's actual
+        // grid alignment — the bbox assertions below assume the current
+        // tile_degrees (5°) and will fail with a useful "expected this
+        // bbox, got these instead" message if BSOSE_CONFIG changes.
         let tiles = generate_tiles(
             &json!({"polygon": "[[179,-60],[181,-60],[181,-58],[179,-58],[179,-60]]"}),
-            &TEST_CONFIG,
+            &crate::helpers::dataset_config::BSOSE_CONFIG,
         );
 
-        // 2 spatial sub-bboxes × 1 spatial tile each × 2 levels = 4 specs.
-        assert_eq!(tiles.len(), 2 * TEST_CONFIG.levels.len());
+        // 2 spatial sub-bboxes × 1 spatial tile each × N levels.
+        assert_eq!(
+            tiles.len(),
+            2 * crate::helpers::dataset_config::BSOSE_CONFIG.levels.len()
+        );
 
         let bboxes: Vec<_> = tiles.iter().map(|t| t.tile_bbox.clone()).collect();
-        // East tile catches the 179..180 sliver.
+        // East tile catches the 179..180 sliver (5° grid cell [175,180]).
         assert!(
             bboxes.contains(&Some(BoundingBox {
                 sw: [175.0, -60.0],
@@ -676,8 +682,9 @@ mod tests {
             "expected east tile [175,-60]→[180,-55] in {:?}",
             bboxes
         );
-        // West tile catches the -180..-179 sliver. No tile should have
-        // lon outside [-180, 180] — that was the symptom.
+        // West tile catches the -180..-179 sliver (5° cell [-180,-175]).
+        // No tile should have lon outside [-180, 180] — that was the
+        // pre-fix symptom.
         assert!(
             bboxes.contains(&Some(BoundingBox {
                 sw: [-180.0, -60.0],
@@ -707,9 +714,12 @@ mod tests {
         // dateline split fires.
         let tiles = generate_tiles(
             &json!({"box": "[[179,-60],[181,-58]]"}),
-            &TEST_CONFIG,
+            &crate::helpers::dataset_config::BSOSE_CONFIG,
         );
-        assert_eq!(tiles.len(), 2 * TEST_CONFIG.levels.len());
+        assert_eq!(
+            tiles.len(),
+            2 * crate::helpers::dataset_config::BSOSE_CONFIG.levels.len()
+        );
 
         let bboxes: Vec<_> = tiles.iter().map(|t| t.tile_bbox.clone()).collect();
         assert!(bboxes.contains(&Some(BoundingBox {

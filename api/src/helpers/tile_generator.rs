@@ -33,6 +33,7 @@
 use serde_json::Value;
 
 use super::dataset_config::DatasetConfig;
+use super::helpers::validlonlat;
 
 /// A longitude/latitude bounding box. `sw` is the south-west corner
 /// (min lon, min lat); `ne` is the north-east corner (max lon, max lat).
@@ -133,6 +134,11 @@ fn box_tiles(boxregion: &str, config: &DatasetConfig) -> Vec<TileSpec> {
     if parsed.len() != 2 || parsed[0].len() != 2 || parsed[1].len() != 2 {
         return Vec::new();
     }
+    // Normalize coords into [-180, 180] / [-90, 90] so they match what
+    // filters::box_filter sends to Mongo. Without this, out-of-range
+    // inputs like lon=181 stay raw here and produce tile bboxes outside
+    // the valid coordinate range, which Mongo then rejects.
+    let parsed = validlonlat(parsed);
     let sw = [parsed[0][0], parsed[0][1]];
     let ne = [parsed[1][0], parsed[1][1]];
 
@@ -167,6 +173,12 @@ fn polygon_tiles(polygon: &str, config: &DatasetConfig) -> Vec<TileSpec> {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
+    // Same normalization filters::polygon_filter applies — keeps our tile
+    // bboxes aligned with the user filter Mongo actually evaluates, and
+    // ensures the antimeridian-detection edges below see wrapped values
+    // (e.g. lon=181 becomes -179, so an edge that straddles the dateline
+    // genuinely has |lon_diff| > 180°).
+    let coords = validlonlat(coords);
 
     let mut spatial = Vec::new();
     for bbox in polygon_bboxes(&coords) {
@@ -633,6 +645,90 @@ mod tests {
                 ne: [-10.0, 10.0],
             })
         );
+    }
+
+    #[test]
+    fn polygon_with_out_of_range_longitude_gets_normalized_and_split() {
+        // The user's exact failure shape: a thin strip straddling the
+        // antimeridian, expressed with lon=181 instead of lon=-179. Before
+        // the validlonlat call, this looked like a non-crossing polygon
+        // with bbox [179, -60]→[181, -58], and tile generation walked off
+        // the right edge of the world. After normalization, lon=181
+        // becomes lon=-179, the edge 179→-179 is detected as crossing,
+        // and we get a sane east/west split.
+        //
+        // 2° wide strip at 5° tile_degrees → one tile each side.
+        let tiles = generate_tiles(
+            &json!({"polygon": "[[179,-60],[181,-60],[181,-58],[179,-58],[179,-60]]"}),
+            &TEST_CONFIG,
+        );
+
+        // 2 spatial sub-bboxes × 1 spatial tile each × 2 levels = 4 specs.
+        assert_eq!(tiles.len(), 2 * TEST_CONFIG.levels.len());
+
+        let bboxes: Vec<_> = tiles.iter().map(|t| t.tile_bbox.clone()).collect();
+        // East tile catches the 179..180 sliver.
+        assert!(
+            bboxes.contains(&Some(BoundingBox {
+                sw: [175.0, -60.0],
+                ne: [180.0, -55.0],
+            })),
+            "expected east tile [175,-60]→[180,-55] in {:?}",
+            bboxes
+        );
+        // West tile catches the -180..-179 sliver. No tile should have
+        // lon outside [-180, 180] — that was the symptom.
+        assert!(
+            bboxes.contains(&Some(BoundingBox {
+                sw: [-180.0, -60.0],
+                ne: [-175.0, -55.0],
+            })),
+            "expected west tile [-180,-60]→[-175,-55] in {:?}",
+            bboxes
+        );
+        // And nothing pathological in either direction.
+        for b in &bboxes {
+            if let Some(bb) = b {
+                assert!(
+                    bb.sw[0] >= -180.0 && bb.ne[0] <= 180.0,
+                    "tile bbox out of range: {:?}",
+                    bb
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn box_with_out_of_range_longitude_gets_normalized_and_split() {
+        // Same diagnosis for the box mode: a 2° wide strip across the
+        // antimeridian, expressed with lon=181. Before normalization,
+        // sw_lon=179 < ne_lon=181 looks like an ordinary non-crossing
+        // box. After normalization, lon=181 → -179, sw_lon=179 > -179,
+        // dateline split fires.
+        let tiles = generate_tiles(
+            &json!({"box": "[[179,-60],[181,-58]]"}),
+            &TEST_CONFIG,
+        );
+        assert_eq!(tiles.len(), 2 * TEST_CONFIG.levels.len());
+
+        let bboxes: Vec<_> = tiles.iter().map(|t| t.tile_bbox.clone()).collect();
+        assert!(bboxes.contains(&Some(BoundingBox {
+            sw: [175.0, -60.0],
+            ne: [180.0, -55.0],
+        })));
+        assert!(bboxes.contains(&Some(BoundingBox {
+            sw: [-180.0, -60.0],
+            ne: [-175.0, -55.0],
+        })));
+        for b in &bboxes {
+            if let Some(bb) = b {
+                assert!(
+                    bb.sw[0] >= -180.0 && bb.ne[0] <= 180.0,
+                    "tile bbox out of range: {:?}",
+                    bb
+                );
+            }
+        }
     }
 
     #[test]

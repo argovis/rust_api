@@ -47,7 +47,7 @@ pub const BSOSE_LEVELS: &[f64] = &[2.1, 6.7, 12.15, 18.55, 26.25, 35.25, 45.0, 5
 /// thousands of docs out of `$near` (which isn't spatially tiled). 100 km
 /// is a conservative starting point — easy to bump up if users complain.
 pub const BSOSE_CONFIG: DatasetConfig = DatasetConfig {
-    tile_degrees: 10.0,
+    tile_degrees: 5.0,
     max_radius_meters: 100_000.0, // 100 km — bump if users complain
     levels: BSOSE_LEVELS,
 };

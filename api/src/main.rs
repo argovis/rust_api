@@ -38,25 +38,48 @@ use dataset_config::{DatasetConfig, DatasetSource};
 
 static CLIENT: Lazy<Mutex<Option<mongodb::Client>>> = Lazy::new(|| Mutex::new(None));
 
+// Per-dataset source-of-truth: identity strings + values loaded from the
+// dataset's meta doc at startup. Same pattern as CLIENT above — the
+// `Lazy<Mutex<Option<T>>>` is what lets us declare a static that's
+// initialized once, after main() reads the value out of Mongo. Handlers
+// clone the inner DatasetSource out of the lock at the top of each
+// request and use it locally, so the mutex is never held across `.await`.
+//
+// One static per dataset. Adding a new dataset is one more static here
+// plus one more load_dataset_source/ load-and-set block in main().
+static BSOSE_SOURCE: Lazy<Mutex<Option<DatasetSource>>> = Lazy::new(|| Mutex::new(None));
+
 // ---- route handlers --------------------------------------------------------
 //
 // Each dataset gets its own one-route handler that resolves the dataset
 // generic and hands off to `serve_timeseries`. Keeps Actix's `#[get(...)]`
 // attribute discoverable per-dataset and lets the routing table grow
 // without touching the generic core. Adding a new dataset is: define its
-// `*_CONFIG` + `*_SOURCE` in `dataset_config.rs`, define its schema +
-// meta in `schema.rs`, then add a 4-line handler here.
+// `*_CONFIG` in `dataset_config.rs`, define its schema + meta in
+// `schema.rs`, add a `*_SOURCE` static + a `load_dataset_source` call
+// in `main()`, and add a 4-line handler here.
 
 #[get("/timeseries/bsose")]
 async fn bsose_handler(
     req: HttpRequest,
     query_params: web::Query<serde_json::Value>,
 ) -> impl Responder {
+    // Snapshot the source out of the lock before any `.await`. Holding
+    // the mutex guard across an await would let other tasks on the same
+    // worker deadlock on it, so the idiom is "lock, clone, unlock, then
+    // do async work with the local copy."
+    let source = BSOSE_SOURCE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("BSOSE_SOURCE not initialized at startup")
+        .clone();
+
     serve_timeseries::<schema::BsoseSchema>(
         req,
         query_params.into_inner(),
         &dataset_config::BSOSE_CONFIG,
-        &dataset_config::BSOSE_SOURCE,
+        &source,
     )
     .await
 }
@@ -79,7 +102,7 @@ async fn serve_timeseries<S>(
     req: HttpRequest,
     params: serde_json::Value,
     config: &DatasetConfig,
-    source: &'static DatasetSource,
+    source: &DatasetSource,
 ) -> HttpResponse
 where
     S: schema::IsTimeseries
@@ -107,22 +130,16 @@ where
         Err(e) => return HttpResponse::BadRequest().json(json!({"error": e})),
     };
 
-    // ---- tile sequence + cached startup data --------------------------
+    // ---- tile sequence + startup-loaded data --------------------------
     let tiles = tile_generator::generate_tiles(&params, config);
 
-    // Both caches are populated at startup by `populate_dataset_cache`
-    // before the server begins accepting connections. A handler hit
-    // before startup finished is a server bug, so we surface it.
-    let timeseries = source
-        .timeseries
-        .get()
-        .expect("dataset timeseries cache should be populated at startup")
-        .clone();
-    let cached_data_info = source
-        .data_info
-        .get()
-        .expect("dataset data_info cache should be populated at startup")
-        .clone();
+    // Clone the cached values out of `source` locally so the streaming
+    // branch can move owned copies into its async generator without
+    // juggling lifetimes — both are small (timeseries is a few KB of
+    // dates; data_info is a few strings), so cloning per request is
+    // cheap relative to the actual query work.
+    let timeseries = source.timeseries.clone();
+    let cached_data_info = source.data_info.clone();
 
     let compression: Option<String> = params
         .get("compression")
@@ -352,57 +369,52 @@ fn next_url_value(
     }
 }
 
-/// Populate the startup caches on a `DatasetSource` from its meta doc.
+/// Build a `DatasetSource` by reading the dataset's meta doc out of Mongo.
 ///
-/// Reads the one meta doc selected by `{data_type: source.meta_data_type}`
-/// from `{db_name}.{meta_collection}`, then sets the source's
-/// `timeseries` and `data_info` OnceCells from it. A dataset whose meta
-/// doc has no `data_info` field will land an empty tuple in the cache
-/// (via `#[serde(default)]` on the meta struct) — the precedence rule in
-/// `transform_timeseries` makes that the right default-suppressing value
-/// for datasets that carry `data_info` per data doc.
+/// Called once per dataset at server startup. The four `'static str`
+/// arguments are the dataset's Mongo identity; the resulting struct
+/// bundles those identity strings with the values we read out of the
+/// meta doc (`timeseries`, `data_info`). `main()` then stashes the
+/// returned struct into the dataset's `*_SOURCE` static for handlers
+/// to read on each request.
 ///
-/// Panics if the meta doc can't be found or the OnceCell is already set.
-/// Both indicate startup misconfiguration that should fail loudly rather
+/// Panics if the meta doc can't be found or the cursor errors. Both
+/// indicate startup misconfiguration that should fail loudly rather
 /// than serve stale or partial data.
-async fn populate_dataset_cache<M>(source: &DatasetSource) -> Result<()>
+async fn load_dataset_source<M>(
+    db_name: &'static str,
+    collection: &'static str,
+    meta_collection: &'static str,
+    meta_data_type: &'static str,
+) -> Result<DatasetSource>
 where
     M: schema::IsTimeseriesMeta + DeserializeOwned + Unpin + Send + Sync,
 {
-    let filter = mongodb::bson::doc! {"data_type": source.meta_data_type};
+    let filter = mongodb::bson::doc! {"data_type": meta_data_type};
     let options = FindOptions::builder().limit(1).build();
-    let mut cursor = generate_cursor::<M>(
-        source.db_name,
-        source.meta_collection,
-        filter,
-        Some(options),
-    )
-    .await?;
+    let mut cursor =
+        generate_cursor::<M>(db_name, meta_collection, filter, Some(options)).await?;
 
     let meta = match cursor.next().await {
         Some(Ok(m)) => m,
-        Some(Err(e)) => {
-            panic!(
-                "Error reading meta doc for {}.{} (data_type={}): {}",
-                source.db_name, source.meta_collection, source.meta_data_type, e
-            );
-        }
+        Some(Err(e)) => panic!(
+            "Error reading meta doc for {}.{} (data_type={}): {}",
+            db_name, meta_collection, meta_data_type, e
+        ),
         None => panic!(
             "No meta doc found in {}.{} matching data_type={}",
-            source.db_name, source.meta_collection, source.meta_data_type
+            db_name, meta_collection, meta_data_type
         ),
     };
 
-    source
-        .timeseries
-        .set(meta.timeseries())
-        .unwrap_or_else(|_| panic!("timeseries cache for data_type={} already set", source.meta_data_type));
-    source
-        .data_info
-        .set(meta.data_info())
-        .unwrap_or_else(|_| panic!("data_info cache for data_type={} already set", source.meta_data_type));
-
-    Ok(())
+    Ok(DatasetSource {
+        db_name,
+        collection,
+        meta_collection,
+        meta_data_type,
+        timeseries: meta.timeseries(),
+        data_info: meta.data_info(),
+    })
 }
 
 #[actix_web::main]
@@ -413,13 +425,20 @@ async fn main() -> std::io::Result<()> {
     let client = mongodb::Client::with_options(client_options).unwrap();
     *CLIENT.lock().unwrap() = Some(client);
 
-    // Populate per-dataset startup caches. Each dataset's meta-doc-read
-    // happens here, before the server starts accepting connections.
-    // Adding a new dataset is a one-line addition: a call to
-    // populate_dataset_cache::<NewMeta>(&NEW_SOURCE).
-    populate_dataset_cache::<schema::BsoseMeta>(&dataset_config::BSOSE_SOURCE)
-        .await
-        .expect("failed to populate BSOSE dataset cache at startup");
+    // Load each dataset's source-of-truth and stash it in the static for
+    // handlers to read. The Mongo identity strings live here at the call
+    // site — one place per dataset — and the returned struct bundles
+    // them with the values read from the meta doc. Adding a new dataset
+    // is one more load-and-set block here.
+    let bsose = load_dataset_source::<schema::BsoseMeta>(
+        "argo",
+        "bsose",
+        "timeseriesMeta",
+        "BSOSE-profile",
+    )
+    .await
+    .expect("failed to load BSOSE dataset source at startup");
+    *BSOSE_SOURCE.lock().unwrap() = Some(bsose);
 
     HttpServer::new(|| {
         App::new()

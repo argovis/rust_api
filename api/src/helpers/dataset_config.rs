@@ -11,13 +11,16 @@
 //!
 //! `DatasetSource` is the sibling struct that names *where* each dataset
 //! lives in Mongo (db, collection, meta collection, meta discriminator)
-//! and caches startup-loaded metadata (the timeseries axis, the meta
-//! default `data_info`). One static `*_SOURCE` per dataset; the
-//! generic handler in `main.rs` consumes `(&DatasetConfig, &DatasetSource)`
-//! plus the dataset's schema generic to serve a request.
+//! and carries the startup-loaded metadata (the timeseries axis, the
+//! meta default `data_info`). It can't be `const`/`static` directly
+//! because the metadata fields are loaded from Mongo at runtime; it's
+//! built once in `main()` via `load_dataset_source` and stashed in a
+//! top-level `Lazy<Mutex<Option<DatasetSource>>>` (the same pattern the
+//! existing Mongo `CLIENT` static uses, so we don't drag in new
+//! initialization vocabulary). Handlers clone it out of the lock at the
+//! top of each request, then read its fields as plain owned data.
 
 use mongodb::bson::DateTime as BsonDateTime;
-use once_cell::sync::OnceCell;
 
 use super::geometry::BoundingBox;
 use super::schema::DataInfo;
@@ -52,46 +55,40 @@ pub struct DatasetConfig {
     pub coverage_bbox: Option<BoundingBox>,
 }
 
-/// Per-dataset *identity*: where the dataset lives in Mongo, and a place
-/// to stash the values we read once at startup so requests don't have to.
+/// Per-dataset identity + startup-loaded metadata, built once in `main()`.
 ///
-/// `db_name` / `collection` name the data collection the handler queries.
-/// `meta_collection` is the per-dataset (or shared) metadata collection;
-/// `meta_data_type` is the value of the `data_type` discriminator that
-/// picks this dataset's meta doc out of the meta collection.
+/// The first four fields are the dataset's Mongo identity:
+///   - `db_name` / `collection`: where the data docs live.
+///   - `meta_collection`: where the metadata doc lives. May or may not be
+///     shared across datasets; today everything is in `timeseriesMeta`,
+///     disambiguated by `meta_data_type`.
+///   - `meta_data_type`: the `data_type` discriminator that selects this
+///     dataset's meta doc out of `meta_collection`.
 ///
-/// `timeseries` and `data_info` are populated once at server startup by
-/// the generic loader in `main.rs` and read on every request. They're
-/// behind `OnceCell` rather than `Mutex<Option<_>>` because they're
-/// write-once: the loader fills them in `main()` and nothing else ever
-/// writes again, so handlers can read without locking.
+/// The remaining two fields are values we load *once* at startup from the
+/// meta doc and read on every request. Plain owned types — no cells.
+///
+/// `Clone` is derived so handlers can copy a `DatasetSource` out of the
+/// `Lazy<Mutex<Option<_>>>` static and use it locally without holding
+/// the mutex across `.await` points. The clone is small (a few KB of
+/// dates plus a few short strings).
 ///
 /// `data_info` is the *meta-level default* for the dataset. Per the
 /// precedence rule documented on `transforms::transform_timeseries`, a
 /// data doc that carries its own `data_info` wins over this default; if
-/// the doc's `data_info` is empty, the cached default is stamped on
-/// before column filtering runs. Datasets that put `data_info` on every
-/// data doc (e.g. BSOSE today) leave this cache as the empty tuple — it
-/// gets populated but never consulted.
+/// the doc's `data_info` is empty, the meta-level value is stamped onto
+/// the doc before column filtering runs. Datasets that put `data_info`
+/// on every data doc (e.g. BSOSE today) leave this as the empty tuple —
+/// it's still populated, just never consulted.
+#[derive(Clone)]
 pub struct DatasetSource {
     pub db_name: &'static str,
     pub collection: &'static str,
     pub meta_collection: &'static str,
     pub meta_data_type: &'static str,
-    pub timeseries: OnceCell<Vec<BsonDateTime>>,
-    pub data_info: OnceCell<DataInfo>,
+    pub timeseries: Vec<BsonDateTime>,
+    pub data_info: DataInfo,
 }
-
-/// Mongo identity for the BSOSE timeseries dataset. The OnceCells are
-/// filled at startup by `main.rs::populate_dataset_caches`.
-pub static BSOSE_SOURCE: DatasetSource = DatasetSource {
-    db_name: "argo",
-    collection: "bsose",
-    meta_collection: "timeseriesMeta",
-    meta_data_type: "BSOSE-profile",
-    timeseries: OnceCell::new(),
-    data_info: OnceCell::new(),
-};
 
 /// BSOSE's 52 vertical levels, in metres (positive-downward), shallowest
 /// first. From the dataset's published grid; should be updated if BSOSE

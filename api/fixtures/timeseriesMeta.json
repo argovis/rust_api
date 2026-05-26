@@ -17,5 +17,35 @@
     "depth_r0_to_bottom": 4000.0,
     "interior_2d_mask": true,
     "depth_r0_to_ref_surface": 100.0
+  },
+  {
+    "_id": "noaa-oi-sst-v2-high-res",
+    "data_type": "noaa-oi-sst-v2-high-res",
+    "data_info": [
+      ["sst"],
+      ["units", "long_name"],
+      [["degC", "Weekly Mean of Sea Surface Temperature"]]
+    ],
+    "date_updated_argovis": "2026-05-26T20:48:56Z",
+    "timeseries": [
+      "2020-01-15T00:00:00Z",
+      "2020-04-15T00:00:00Z",
+      "2020-07-15T00:00:00Z",
+      "2020-10-15T00:00:00Z"
+    ],
+    "source": [
+      {
+        "source": ["NOAA Optimum Interpolation SST V2 High Resolution"],
+        "url": "https://psl.noaa.gov/data/gridded/data.noaa.oisst.v2.highres.html"
+      }
+    ],
+    "lattice": {
+      "center": [0.125, 0.125],
+      "spacing": [0.25, 0.25],
+      "minLat": -89.875,
+      "minLon": -179.875,
+      "maxLat": 89.875,
+      "maxLon": 179.875
+    }
   }
 ]

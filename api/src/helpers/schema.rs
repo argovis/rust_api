@@ -165,6 +165,143 @@ impl IsTimeseriesMeta for BsoseMeta {
     }
 }
 
+// oi sst /////////////////////////////////////////////////////////////////////
+
+/// `source` substructure for the OI SST metadata doc. Differs from
+/// `SourceMeta` (used by BSOSE) — OI SST uses `url` where BSOSE uses
+/// `iter`. Neither field is read by the handler today; modeled here so
+/// deserialization of the meta doc succeeds.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OisstSourceMeta {
+    pub(crate) source: Vec<String>,
+    pub(crate) url: String,
+}
+
+/// Grid descriptor on the OI SST metadata doc. Captures the regular
+/// lat/lon lattice the dataset is sampled on. Not consulted by the
+/// handler today (the equivalent information lives in `OISST_CONFIG`),
+/// but modeled here so deserialization succeeds. A future cleanup could
+/// derive the dataset's `DatasetConfig.coverage_bbox` / `tile_degrees`
+/// from this struct instead of duplicating the values in code.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Lattice {
+    pub center: [f64; 2],
+    pub spacing: [f64; 2],
+    pub min_lat: f64,
+    pub min_lon: f64,
+    pub max_lat: f64,
+    pub max_lon: f64,
+}
+
+/// One spatial cell of the NOAA OI SST v2 high-res grid. Surface-only
+/// (no vertical dimension; `level` is always `0.0`). `data` holds the
+/// timeseries per variable — there's exactly one variable (SST), so the
+/// outer Vec always has length one.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OisstSchema {
+    pub(crate) _id: String,
+    // Reachable from main.rs (batchmeta branch reads `metadata()`), so
+    // `pub` for symmetry with BsoseSchema.
+    pub metadata: Vec<String>,
+    pub(crate) basin: f64,
+    pub(crate) geolocation: GeoJSONPoint,
+    pub(crate) level: f64,
+    pub(crate) data: Vec<Vec<f64>>,
+    // OI SST data docs don't carry `timeseries` or `data_info` of their
+    // own — both are populated at request time. `timeseries` is filled
+    // by `slice_timerange`; `data_info` is stamped from the per-dataset
+    // cached default by `transform_timeseries` (the meta doc holds the
+    // dataset-wide variable info, single-variable for OI SST). Both
+    // default at deserialization so an absent field in the source doc
+    // produces an empty/None value rather than a parse error.
+    #[serde(default)]
+    pub(crate) timeseries: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) data_info: DataInfo,
+}
+
+impl IsTimeseries for OisstSchema {
+    fn get_timeseries(&self) -> bool {
+        return true;
+    }
+
+    fn data(&mut self) -> &mut Vec<Vec<f64>> {
+        &mut self.data
+    }
+
+    fn set_data(&mut self, data: Vec<Vec<f64>>) {
+        self.data = data;
+    }
+
+    fn timeseries(&mut self) -> Option<&mut Vec<String>> {
+        self.timeseries.as_mut()
+    }
+
+    fn set_timeseries(&mut self, timeseries: Vec<String>) {
+        self.timeseries = Some(timeseries);
+    }
+
+    fn data_info(&mut self) -> DataInfo {
+        self.data_info.clone()
+    }
+
+    fn set_data_info(&mut self, data_info: DataInfo) {
+        self.data_info = data_info;
+    }
+
+    fn _id(&self) -> String {
+        self._id.clone()
+    }
+
+    fn longitude(&self) -> f64 {
+        self.geolocation.coordinates[0]
+    }
+
+    fn latitude(&self) -> f64 {
+        self.geolocation.coordinates[1]
+    }
+
+    fn level(&self) -> f64 {
+        self.level
+    }
+
+    fn metadata(&self) -> Vec<String> {
+        self.metadata.clone()
+    }
+}
+
+/// Metadata doc for the OI SST dataset. Crucially, `data_info` lives
+/// here (per-dataset default) rather than on every data doc — the
+/// generic transform layer reads it from the cache and stamps it onto
+/// each data doc before column filtering.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OisstMeta {
+    pub(crate) _id: String,
+    pub(crate) data_type: String,
+    pub data_info: DataInfo,
+    pub(crate) date_updated_argovis: BsonDateTime,
+    pub timeseries: Vec<BsonDateTime>,
+    pub(crate) source: Vec<OisstSourceMeta>,
+    pub(crate) lattice: Lattice,
+}
+
+impl IsTimeseriesMeta for OisstMeta {
+    fn get_timeseries_meta(&self) -> bool {
+        return true;
+    }
+
+    fn timeseries(&self) -> Vec<BsonDateTime> {
+        self.timeseries.clone()
+    }
+
+    fn data_info(&self) -> DataInfo {
+        self.data_info.clone()
+    }
+}
+
+// ///////////////////////////////////////////////////////////////////////////
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct TimeseriesStub {
     pub _id: String,

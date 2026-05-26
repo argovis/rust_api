@@ -131,11 +131,56 @@ antimeridian / north-pole docs aren't lost.
 
 ## Per-dataset configuration
 
-`api/src/helpers/dataset_config.rs` defines a `DatasetConfig` struct
-with the dataset's `tile_degrees`, `max_radius_meters`, the discrete
-`levels` array, and an optional `coverage_bbox`. The BSOSE handler
-binds `BSOSE_CONFIG` directly; adding a new dataset means defining its
-config there and wiring its handler through the same `tile_generator` /
-`filter_composer` machinery. `coverage_bbox: None` for a new dataset
-gives global-walk semantics; setting it to a bounding rectangle tells
-the tile generator to skip everything outside the rectangle.
+Two per-dataset structs sit side by side in `api/src/helpers/dataset_config.rs`:
+
+- **`DatasetConfig`** — *request-size policy*. `tile_degrees` (spatial
+  page size), `max_radius_meters` (cap for `center + radius` queries),
+  `levels` (discrete vertical pages — single-element `&[0.0]` for
+  surface-only datasets like OI SST), and an optional `coverage_bbox`
+  (rectangle the dataset's data lives inside; `None` means walk the
+  whole globe). Declared as a `pub const` per dataset.
+
+- **`DatasetSource`** — *Mongo identity* (`db_name`, `collection`,
+  `meta_collection`, `meta_data_type`) plus the values read once at
+  startup from the meta doc (`timeseries` axis, `data_info` default).
+  Built at runtime by `main()` via `load_dataset_source::<MetaSchema>`
+  and stashed in a `Lazy<Mutex<Option<DatasetSource>>>` static (same
+  pattern as the Mongo `CLIENT` static).
+
+The generic handler `serve_timeseries::<S>` in `main.rs` consumes
+`(&DatasetConfig, &DatasetSource)` plus a schema generic `S` that
+implements `IsTimeseries`.
+
+### Recipe for adding a new dataset
+
+1. Define the data-doc schema (`S`) and meta-doc schema (`M`) in
+   `api/src/helpers/schema.rs`. `S` implements `IsTimeseries`; `M`
+   implements `IsTimeseriesMeta`.
+2. Define `<NAME>_CONFIG: DatasetConfig` (and `<NAME>_LEVELS` if depth
+   discretisation is non-trivial) in `dataset_config.rs`.
+3. Add `<NAME>_SOURCE: Lazy<Mutex<Option<DatasetSource>>>` in
+   `main.rs`, next to the existing dataset statics.
+4. In `main()`, load the source: `let x = load_dataset_source::<M>(...)
+   .await?; *<NAME>_SOURCE.lock().unwrap() = Some(x);`.
+5. Add a 4-line route handler annotated with `#[get("/timeseries/<name>")]`
+   that clones the source out of the lock and forwards to
+   `serve_timeseries::<S>`.
+6. Register the handler with `.service(<name>_handler)` on the `App`.
+
+### `data_info` precedence rule
+
+`data_info` (variable names, units, per-variable descriptors) may
+appear on either the data doc, the meta doc, or both:
+
+- **Doc-level wins.** If a data doc carries its own non-empty
+  `data_info` (BSOSE today), that's what `slice_data` filters
+  against. The cached meta-level default is ignored.
+- **Cache fallback.** If the data doc has no `data_info` (OI SST: the
+  field lives only on the meta doc), the per-dataset cached default —
+  loaded from the meta doc at startup — is stamped onto the doc
+  before column filtering runs.
+
+The cache for a dataset whose meta doc has no `data_info` is the empty
+tuple, and `transform_timeseries` treats empty as "no default to
+apply". So a dataset can store `data_info` per data doc, per meta doc,
+or per both — the response carries the right thing in each case.

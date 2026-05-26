@@ -48,6 +48,7 @@ static CLIENT: Lazy<Mutex<Option<mongodb::Client>>> = Lazy::new(|| Mutex::new(No
 // One static per dataset. Adding a new dataset is one more static here
 // plus one more load_dataset_source/ load-and-set block in main().
 static BSOSE_SOURCE: Lazy<Mutex<Option<DatasetSource>>> = Lazy::new(|| Mutex::new(None));
+static OISST_SOURCE: Lazy<Mutex<Option<DatasetSource>>> = Lazy::new(|| Mutex::new(None));
 
 // ---- route handlers --------------------------------------------------------
 //
@@ -79,6 +80,27 @@ async fn bsose_handler(
         req,
         query_params.into_inner(),
         &dataset_config::BSOSE_CONFIG,
+        &source,
+    )
+    .await
+}
+
+#[get("/timeseries/noaaoisst")]
+async fn oisst_handler(
+    req: HttpRequest,
+    query_params: web::Query<serde_json::Value>,
+) -> impl Responder {
+    let source = OISST_SOURCE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("OISST_SOURCE not initialized at startup")
+        .clone();
+
+    serve_timeseries::<schema::OisstSchema>(
+        req,
+        query_params.into_inner(),
+        &dataset_config::OISST_CONFIG,
         &source,
     )
     .await
@@ -440,9 +462,20 @@ async fn main() -> std::io::Result<()> {
     .expect("failed to load BSOSE dataset source at startup");
     *BSOSE_SOURCE.lock().unwrap() = Some(bsose);
 
+    let oisst = load_dataset_source::<schema::OisstMeta>(
+        "argo",
+        "noaaOIsst",
+        "timeseriesMeta",
+        "noaa-oi-sst-v2-high-res",
+    )
+    .await
+    .expect("failed to load OI SST dataset source at startup");
+    *OISST_SOURCE.lock().unwrap() = Some(oisst);
+
     HttpServer::new(|| {
         App::new()
             .service(bsose_handler)
+            .service(oisst_handler)
     })
     .bind(("0.0.0.0", 8080))?
     .run()

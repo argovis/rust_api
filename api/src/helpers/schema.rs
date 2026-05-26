@@ -17,6 +17,15 @@ pub struct SourceMeta {
     pub(crate) iter: String,
 }
 
+// type aliases ///////////////////////////////////////////////////////////////
+
+/// Per-variable descriptor carried alongside a timeseries doc:
+/// `(variable_names, info_fields, per_variable_info)`. The shape is
+/// preserved as a tuple for backward-compatible JSON serialization (the
+/// public response format encodes it as a 3-tuple), but giving it a name
+/// makes function signatures and the per-dataset cache easier to read.
+pub type DataInfo = (Vec<String>, Vec<String>, Vec<Vec<String>>);
+
 // categroical traits /////////////////////////////////////////////////////////
 
 pub trait IsTimeseries {
@@ -25,8 +34,8 @@ pub trait IsTimeseries {
     fn set_data(&mut self, data: Vec<Vec<f64>>);
     fn timeseries(&mut self) -> Option<&mut Vec<String>>;
     fn set_timeseries(&mut self, timeseries: Vec<String>);
-    fn data_info(&mut self) -> (Vec<String>, Vec<String>, Vec<Vec<String>>);
-    fn set_data_info(&mut self, data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>));
+    fn data_info(&mut self) -> DataInfo;
+    fn set_data_info(&mut self, data_info: DataInfo);
     fn _id(&self) -> String;
     fn longitude(&self) -> f64;
     fn latitude(&self) -> f64;
@@ -36,6 +45,16 @@ pub trait IsTimeseries {
 
 pub trait IsTimeseriesMeta {
     fn get_timeseries_meta(&self) -> bool;
+    /// Snapshot of the dataset's timestamp axis. Read once at startup and
+    /// cached on `DatasetSource::timeseries` so request handling doesn't
+    /// re-fetch it per request.
+    fn timeseries(&self) -> Vec<BsonDateTime>;
+    /// Per-dataset `data_info` default. Stamped onto a data doc by
+    /// `transform_timeseries` only when that doc carries no `data_info` of
+    /// its own (the precedence rule: doc-level wins over meta-level). May
+    /// be the empty tuple — datasets that store `data_info` on every data
+    /// doc (e.g. BSOSE today) leave the meta-level value blank.
+    fn data_info(&self) -> DataInfo;
 }
 
 // bsose //////////////////////////////////////////////////////////////////////
@@ -56,7 +75,7 @@ pub struct BsoseSchema {
     pub(crate) data: Vec<Vec<f64>>,
     // Not present in the source collection — gets populated by transforms.
     pub(crate) timeseries: Option<Vec<String>>,
-    pub(crate) data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>),
+    pub(crate) data_info: DataInfo,
 }
 
 impl IsTimeseries for BsoseSchema {
@@ -80,11 +99,11 @@ impl IsTimeseries for BsoseSchema {
         self.timeseries = Some(timeseries);
     }
 
-    fn data_info(&mut self) -> (Vec<String>, Vec<String>, Vec<Vec<String>>) {
+    fn data_info(&mut self) -> DataInfo {
         self.data_info.clone()
     }
 
-    fn set_data_info(&mut self, data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>)) {
+    fn set_data_info(&mut self, data_info: DataInfo) {
         self.data_info = data_info;
     }
 
@@ -114,8 +133,8 @@ pub struct BsoseMeta {
     pub(crate) _id: String,
     pub(crate) data_type: String,
     pub(crate) date_updated_argovis: BsonDateTime,
-    // `timeseries` is read from main.rs at startup to populate the cached
-    // TIMESERIES global, so it stays fully `pub`.
+    // `timeseries` and `data_info` are read at startup to populate the
+    // per-dataset cache on `DatasetSource`, so both stay fully `pub`.
     pub timeseries: Vec<BsonDateTime>,
     pub(crate) source: Vec<SourceMeta>,
     pub(crate) cell_area: f64,
@@ -123,11 +142,26 @@ pub struct BsoseMeta {
     pub(crate) depth_r0_to_bottom: f64,
     pub(crate) interior_2d_mask: bool,
     pub(crate) depth_r0_to_ref_surface: f64,
+    // `data_info` may or may not be present on the BSOSE meta doc (today
+    // it lives only on the data docs themselves). `#[serde(default)]`
+    // makes deserialization tolerate either case: when absent the cache
+    // becomes the empty sentinel and per-doc values keep taking
+    // precedence, exactly the current behaviour.
+    #[serde(default)]
+    pub data_info: DataInfo,
 }
 
 impl IsTimeseriesMeta for BsoseMeta {
     fn get_timeseries_meta(&self) -> bool {
         return true;
+    }
+
+    fn timeseries(&self) -> Vec<BsonDateTime> {
+        self.timeseries.clone()
+    }
+
+    fn data_info(&self) -> DataInfo {
+        self.data_info.clone()
     }
 }
 

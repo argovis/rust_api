@@ -5,9 +5,27 @@ use mongodb::bson::DateTime as BsonDateTime;
 /// Apply the user's `startDate` / `endDate` / `data` parameters to a single
 /// timeseries document. Returns `None` if the document was filtered out
 /// entirely (e.g. `data=somefield` produced no matching columns).
+///
+/// `cached_data_info` is the *meta-level default* `data_info` for this
+/// dataset — read once at startup from the meta doc and stashed on the
+/// dataset's `DatasetSource`. Precedence rule for `data_info`:
+///
+///   - If the data doc carries its own non-empty `data_info` (the BSOSE
+///     case today), it wins; the cached default is ignored.
+///   - If the data doc has no `data_info` (the OI SST case — single
+///     variable, info kept on the meta doc), the cached default is
+///     stamped onto the doc before `slice_data` runs.
+///   - If both are empty, `slice_data` will return `None` for any
+///     specific-variable request (no columns to match) and an
+///     empty-data passthrough for `data=` / `data=all` — same as today.
+///
+/// The cache passes through as `&DataInfo` rather than `Option`: an empty
+/// tuple is its own "no default" sentinel, matching the convention
+/// `slice_data` already uses for "no fields".
 pub fn transform_timeseries<T: schema::IsTimeseries>(
     params: &serde_json::Value,
     ts: &[BsonDateTime],
+    cached_data_info: &schema::DataInfo,
     mut doc: T,
 ) -> Option<T> {
     let start_date = params.get("startDate")
@@ -26,6 +44,15 @@ pub fn transform_timeseries<T: schema::IsTimeseries>(
     if start_date.is_some() || end_date.is_some() {
         slice_timerange(start_date, end_date, ts, &mut doc);
     }
+
+    // Doc-level data_info takes precedence; only fall back to the cached
+    // meta-level default when the doc itself carries no variable names.
+    // `data_info.0` is the variable-names vector, so its emptiness is the
+    // canonical "no data_info" check.
+    if doc.data_info().0.is_empty() && !cached_data_info.0.is_empty() {
+        doc.set_data_info(cached_data_info.clone());
+    }
+
     slice_data(&data, doc)
 }
 
@@ -293,8 +320,74 @@ mod tests {
             "data":      "salinity",
         });
 
-        let mut out = transform_timeseries(&params, &timeseries, doc).unwrap();
+        // Empty cached_data_info — this doc already carries its own
+        // data_info, so the precedence rule means the cache is never
+        // consulted regardless.
+        let empty_cache: schema::DataInfo = (vec![], vec![], vec![]);
+        let mut out = transform_timeseries(&params, &timeseries, &empty_cache, doc).unwrap();
         assert_eq!(*out.data(), vec![vec![20.0, 30.0]]);
+    }
+
+    // ---- transform_timeseries: data_info precedence -------------------------
+
+    #[test]
+    fn transform_uses_cached_data_info_when_doc_has_none() {
+        // OI SST-style: the data doc carries no data_info; the meta-level
+        // cache supplies the variable names so slice_data can resolve
+        // `data=sst`.
+        let timeseries = ts(&[1, 2]);
+        let mut doc = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0]],
+            &["sst"], // gets cleared below to simulate a docless data_info
+        );
+        // Clear the doc's data_info so the cache fallback kicks in.
+        doc.data_info = (vec![], vec![], vec![]);
+
+        let cache: schema::DataInfo = (
+            vec!["sst".to_string()],
+            vec!["units".to_string(), "long_name".to_string()],
+            vec![vec!["degC".to_string(), "SST".to_string()]],
+        );
+
+        let params = json!({"data": "sst"});
+        let mut out =
+            transform_timeseries(&params, &timeseries, &cache, doc).expect("should resolve");
+        // sst column survives.
+        assert_eq!(*out.data(), vec![vec![1.0, 2.0]]);
+        // data_info has been stamped from the cache, then column-filtered
+        // by slice_data — should still list sst.
+        let info = out.data_info();
+        assert_eq!(info.0, vec!["sst".to_string()]);
+    }
+
+    #[test]
+    fn transform_doc_data_info_wins_over_cache() {
+        // BSOSE-style: the doc has data_info and the cache also has
+        // something (hypothetically). The doc's value should take
+        // precedence — the cache should not overwrite it.
+        let timeseries = ts(&[1, 2]);
+        let doc = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            &["temp", "salinity"],
+        );
+
+        // Cache says "sst" — but doc has temp/salinity. Doc wins; the
+        // request for `data=temp` should resolve against the doc, not
+        // get clobbered by the cache.
+        let cache: schema::DataInfo = (
+            vec!["sst".to_string()],
+            vec!["units".to_string()],
+            vec![vec!["degC".to_string()]],
+        );
+
+        let params = json!({"data": "temp"});
+        let mut out =
+            transform_timeseries(&params, &timeseries, &cache, doc).expect("should resolve");
+        assert_eq!(*out.data(), vec![vec![1.0, 2.0]]);
+        let info = out.data_info();
+        assert_eq!(info.0, vec!["temp".to_string()]);
     }
 
     // ---- timeseries_stub -----------------------------------------------------

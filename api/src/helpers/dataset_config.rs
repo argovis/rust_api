@@ -8,8 +8,19 @@
 //! preventing a runaway disk-of-most-of-the-globe); `coverage_bbox`
 //! tells the tile generator the lat/lon rectangle the dataset's data
 //! actually lives inside, so we skip probing tiles outside it.
+//!
+//! `DatasetSource` is the sibling struct that names *where* each dataset
+//! lives in Mongo (db, collection, meta collection, meta discriminator)
+//! and caches startup-loaded metadata (the timeseries axis, the meta
+//! default `data_info`). One static `*_SOURCE` per dataset; the
+//! generic handler in `main.rs` consumes `(&DatasetConfig, &DatasetSource)`
+//! plus the dataset's schema generic to serve a request.
+
+use mongodb::bson::DateTime as BsonDateTime;
+use once_cell::sync::OnceCell;
 
 use super::geometry::BoundingBox;
+use super::schema::DataInfo;
 
 /// Per-dataset request-size policy.
 ///
@@ -40,6 +51,47 @@ pub struct DatasetConfig {
     pub levels: &'static [f64],
     pub coverage_bbox: Option<BoundingBox>,
 }
+
+/// Per-dataset *identity*: where the dataset lives in Mongo, and a place
+/// to stash the values we read once at startup so requests don't have to.
+///
+/// `db_name` / `collection` name the data collection the handler queries.
+/// `meta_collection` is the per-dataset (or shared) metadata collection;
+/// `meta_data_type` is the value of the `data_type` discriminator that
+/// picks this dataset's meta doc out of the meta collection.
+///
+/// `timeseries` and `data_info` are populated once at server startup by
+/// the generic loader in `main.rs` and read on every request. They're
+/// behind `OnceCell` rather than `Mutex<Option<_>>` because they're
+/// write-once: the loader fills them in `main()` and nothing else ever
+/// writes again, so handlers can read without locking.
+///
+/// `data_info` is the *meta-level default* for the dataset. Per the
+/// precedence rule documented on `transforms::transform_timeseries`, a
+/// data doc that carries its own `data_info` wins over this default; if
+/// the doc's `data_info` is empty, the cached default is stamped on
+/// before column filtering runs. Datasets that put `data_info` on every
+/// data doc (e.g. BSOSE today) leave this cache as the empty tuple — it
+/// gets populated but never consulted.
+pub struct DatasetSource {
+    pub db_name: &'static str,
+    pub collection: &'static str,
+    pub meta_collection: &'static str,
+    pub meta_data_type: &'static str,
+    pub timeseries: OnceCell<Vec<BsonDateTime>>,
+    pub data_info: OnceCell<DataInfo>,
+}
+
+/// Mongo identity for the BSOSE timeseries dataset. The OnceCells are
+/// filled at startup by `main.rs::populate_dataset_caches`.
+pub static BSOSE_SOURCE: DatasetSource = DatasetSource {
+    db_name: "argo",
+    collection: "bsose",
+    meta_collection: "timeseriesMeta",
+    meta_data_type: "BSOSE-profile",
+    timeseries: OnceCell::new(),
+    data_info: OnceCell::new(),
+};
 
 /// BSOSE's 52 vertical levels, in metres (positive-downward), shallowest
 /// first. From the dataset's published grid; should be updated if BSOSE

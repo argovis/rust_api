@@ -5,51 +5,63 @@
 //! defines the discrete depth pages within each spatial tile;
 //! `max_radius_meters` caps `center + radius` queries (which go through
 //! MongoDB `$near` and aren't paginated, so the cap is the only thing
-//! preventing a runaway disk-of-most-of-the-globe).
+//! preventing a runaway disk-of-most-of-the-globe); `coverage_bbox`
+//! tells the tile generator the lat/lon rectangle the dataset's data
+//! actually lives inside, so we skip probing tiles outside it.
+
+use super::geometry::BoundingBox;
 
 /// Per-dataset request-size policy.
 ///
 /// `tile_degrees`: edge length (degrees of longitude and latitude) of one
-/// spatial pagination tile. For grid-uniform datasets, choose this so that
-/// one (tile × single level) page contains at most ~1600 documents. For
-/// BSOSE (1/4° grid) that means 10° tiles.
+/// spatial pagination tile.
 ///
-/// `max_radius_meters`: hard upper bound on the `radius` query parameter for
-/// `center + radius` requests. These bypass tile pagination because Mongo's
-/// `$near` enforces its own bound; we cap the bound so a malicious or naive
-/// caller can't ask for a half-globe disk.
+/// `max_radius_meters`: hard upper bound on the `radius` query parameter
+/// for `center + radius` requests. These bypass tile pagination because
+/// Mongo's `$near` enforces its own bound; we cap the bound so a
+/// malicious or naive caller can't ask for a half-globe disk.
 ///
 /// `levels`: the discrete vertical levels the dataset is sampled at, in
 /// strictly increasing order (shallowest first). Pagination treats each
 /// level as a separate page within a spatial tile. Datasets without a
-/// vertical dimension can pass a single-element slice (effectively a single
-/// "level" per tile).
+/// vertical dimension can pass a single-element slice (effectively a
+/// single "level" per tile).
+///
+/// `coverage_bbox`: optional rectangle the dataset's data is known to
+/// live inside. The tile generator drops any spatial tile that doesn't
+/// overlap this rectangle, so probe-forward never has to walk through
+/// regions that *can't* contain data. `None` means "no a-priori bound"
+/// — tile generation falls back to walking the whole globe. The
+/// rectangle is treated as inclusive on its edges; a doc lying exactly
+/// on the coverage boundary is preserved.
 pub struct DatasetConfig {
     pub tile_degrees: f64,
     pub max_radius_meters: f64,
     pub levels: &'static [f64],
+    pub coverage_bbox: Option<BoundingBox>,
 }
 
-/// Placeholder BSOSE level spectrum.
-///
-/// These are *not* the real BSOSE levels — Katie will overwrite them with
-/// the actual depths once we have them in hand. The shape (roughly:
-/// near-surface dense, deep-ocean coarse, ~5500 m bottom) is representative
-/// of typical Southern Ocean gridded products so the rest of the pagination
-/// machinery sees plausible input.
+/// BSOSE's 52 vertical levels, in metres (positive-downward), shallowest
+/// first. From the dataset's published grid; should be updated if BSOSE
+/// re-releases with a different vertical discretisation.
 pub const BSOSE_LEVELS: &[f64] = &[2.1, 6.7, 12.15, 18.55, 26.25, 35.25, 45.0, 55.0, 65.0, 75.0, 85.0, 95.0, 105.0, 115.0, 125.0, 135.0, 146.5, 161.5, 180.0, 200.0, 220.0, 240.0, 260.0, 280.0, 301.0, 327.0, 361.0, 402.5, 450.0, 500.0, 551.5, 614.0, 700.0, 800.0, 900.0, 1000.0, 1100.0, 1225.0, 1400.0, 1600.0, 1800.0, 2010.0, 2270.0, 2610.0, 3000.0, 3400.0, 3800.0, 4200.0, 4600.0, 5000.0, 5400.0, 5800.0];
 
 /// Configuration for the BSOSE timeseries dataset.
 ///
-/// 10° tiles × 4 grid cells/degree = 40 × 40 = 1600 cells per (tile, level).
-/// `max_radius_meters` is intentionally tight: BSOSE at 1/4° resolution
-/// produces ~16 docs per 25 km × 25 km cell, so even a small disk pulls
-/// thousands of docs out of `$near` (which isn't spatially tiled). 100 km
-/// is a conservative starting point — easy to bump up if users complain.
+/// 5° tiles × 12 grid cells/degree = 60 × 60 = 3600 cells per (tile,
+/// level), most less due to land/coastlines. `max_radius_meters` is
+/// intentionally tight: BSOSE produces many docs even in a small disk
+/// since `$near` isn't spatially tiled. `coverage_bbox` reflects that
+/// BSOSE only has data south of 30°S — no point in probing northern
+/// tiles that will never contain anything.
 pub const BSOSE_CONFIG: DatasetConfig = DatasetConfig {
     tile_degrees: 5.0,
     max_radius_meters: 100_000.0, // 100 km — bump if users complain
     levels: BSOSE_LEVELS,
+    coverage_bbox: Some(BoundingBox {
+        sw: [-180.0, -90.0],
+        ne: [180.0, -30.0],
+    }),
 };
 
 #[cfg(test)]

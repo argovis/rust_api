@@ -160,7 +160,7 @@ fn combine_user_and_tile(user: Document, tile: Document) -> Document {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::helpers::tile_generator::BoundingBox;
+    use crate::helpers::geometry::BoundingBox;
     use serde_json::json;
 
     /// Two-level dataset config: keeps test math simple and exercises both
@@ -169,6 +169,7 @@ mod tests {
         tile_degrees: 10.0,
         max_radius_meters: 1.0e6,
         levels: &[100.0, 500.0],
+        coverage_bbox: None,
     };
 
     fn null_tile() -> TileSpec {

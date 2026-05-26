@@ -221,13 +221,13 @@ async fn vertical_range_filters_by_level_across_pages() {
 
 #[tokio::test]
 async fn box_filter_matches_seeded_points_across_pages() {
-    // Box covers (lon 15..45, lat 5..35) — should hit docs at (20,10) and
-    // (40,30), which is doc_001, doc_002, doc_004 (doc_001 and doc_004
-    // share coords but different levels — they land in different
+    // Box covers (lon 15..45, lat -55..-35) — should hit docs at (20,-50)
+    // and (40,-40), which is doc_001, doc_002, doc_004 (doc_001 and
+    // doc_004 share coords but different levels — they land in different
     // level-brackets, so they show up on different pages).
     let docs = get_paged(
         "/timeseries/bsose",
-        &[("box", "[[15,5],[45,35]]"), ("data", "all")],
+        &[("box", "[[15,-55],[45,-35]]"), ("data", "all")],
     )
     .await;
     let ids: Vec<&str> = docs.iter().map(|r| r["_id"].as_str().unwrap()).collect();
@@ -239,16 +239,15 @@ async fn box_filter_matches_seeded_points_across_pages() {
 
 #[tokio::test]
 async fn polygon_filter_matches_seeded_points_across_pages() {
-    // Polygon around (20, 10) — small square enclosing doc_001 / doc_004.
-    // The polygon's bbox spans four spatial tiles ([10-20, 0-10],
-    // [20-30, 0-10], [10-20, 10-20], [20-30, 10-20]) — multi-tile case.
-    // doc_001 (level 10 → L0) and doc_004 (level 50 → L3) share the same
-    // spatial tile but land in different level pages, so we expect
-    // exactly 2 docs across 2 non-empty pages.
+    // Polygon around (20, -50) — small square enclosing doc_001 / doc_004.
+    // The polygon's bbox spans multiple spatial tiles (multi-tile case).
+    // doc_001 (level 10) and doc_004 (level 50) share the same spatial
+    // tile but land in different level pages, so we expect exactly 2 docs
+    // across 2 non-empty pages.
     let docs = get_paged(
         "/timeseries/bsose",
         &[
-            ("polygon", "[[15,5],[25,5],[25,15],[15,15],[15,5]]"),
+            ("polygon", "[[15,-55],[25,-55],[25,-45],[15,-45],[15,-55]]"),
             ("data", "all"),
         ],
     )
@@ -265,11 +264,11 @@ async fn box_crossing_dateline_finds_antimeridian_docs() {
     // Dateline-crossing box: sw_lon (170) > ne_lon (-160), so the box
     // wraps the antimeridian. Tile generation splits it into an eastern
     // sub-box (170..180) and a western sub-box (-180..-160). doc_003 at
-    // (-170, 50) lives in the western band; the other seeded docs are
+    // (-170, -55) lives in the western band; the other seeded docs are
     // far from this box and should be excluded.
     let docs = get_paged(
         "/timeseries/bsose",
-        &[("box", "[[170,40],[-160,60]]"), ("data", "all")],
+        &[("box", "[[170,-60],[-160,-40]]"), ("data", "all")],
     )
     .await;
     let ids: Vec<&str> = docs.iter().map(|r| r["_id"].as_str().unwrap()).collect();
@@ -287,17 +286,17 @@ async fn box_crossing_dateline_finds_antimeridian_docs() {
 
 #[tokio::test]
 async fn polygon_crossing_antimeridian_finds_seeded_doc() {
-    // Polygon straddles the dateline: vertices at (170, 45), (-160, 45),
-    // (-160, 55), (170, 55). The tile generator should detect the
+    // Polygon straddles the dateline: vertices at (170, -60), (-160, -60),
+    // (-160, -50), (170, -50). The tile generator should detect the
     // antimeridian crossing and emit east + west sub-bboxes covering the
     // narrow band rather than the naive 330°-wide bbox.
     //
-    // doc_003 at (-170, 50) sits inside the western piece. The other
+    // doc_003 at (-170, -55) sits inside the western piece. The other
     // seeded docs are far from this band and should be excluded.
     let docs = get_paged(
         "/timeseries/bsose",
         &[
-            ("polygon", "[[170,45],[-160,45],[-160,55],[170,55],[170,45]]"),
+            ("polygon", "[[170,-60],[-160,-60],[-160,-50],[170,-50],[170,-60]]"),
             ("data", "all"),
         ],
     )
@@ -314,7 +313,7 @@ async fn polygon_crossing_antimeridian_finds_seeded_doc() {
 
 #[tokio::test]
 async fn center_radius_filter_matches_nearby_points_across_pages() {
-    // 100 km radius around (20, 10) — at the BSOSE radius cap.
+    // 100 km radius around (20, -50) — at the BSOSE radius cap.
     // center+radius gets level-only pagination (no spatial tiling), so
     // we still need to walk pages to hit each level bracket that
     // contains data. doc_001 / doc_004 sit exactly at the center so any
@@ -323,7 +322,7 @@ async fn center_radius_filter_matches_nearby_points_across_pages() {
     let docs = get_paged(
         "/timeseries/bsose",
         &[
-            ("center", "[20.0, 10.0]"),
+            ("center", "[20.0, -50.0]"),
             ("radius", "100000"), // 100 km — at the cap
             ("data", "all"),
         ],
@@ -500,14 +499,14 @@ async fn batchmeta_returns_metadata_documents_across_pages() {
 
 #[tokio::test]
 async fn polygon_over_empty_region_returns_empty_envelope() {
-    // Polygon in the Indian Ocean (60-70°E, 5-15°N) — far from any
-    // seeded doc. Probe-forward should walk every candidate tile, find
-    // none non-empty, and return a 200 envelope with an empty docs array
-    // and null next_url instead of 404 or any other error code.
+    // Polygon in the south Indian Ocean (80-90°E, -55..-45°) — inside
+    // BSOSE's coverage region but far from any seeded doc. Probe-forward
+    // walks the candidate tiles, finds none non-empty, and returns a
+    // 200 envelope with empty docs and null next_url instead of 404.
     let body = get_envelope(
         "/timeseries/bsose",
         &[
-            ("polygon", "[[60,5],[70,5],[70,15],[60,15],[60,5]]"),
+            ("polygon", "[[80,-55],[90,-55],[90,-45],[80,-45],[80,-55]]"),
             ("data", "all"),
         ],
     )
@@ -523,13 +522,13 @@ async fn polygon_over_empty_region_returns_empty_envelope() {
 
 #[tokio::test]
 async fn tile_index_beyond_end_returns_empty_with_null_next_url() {
-    // Tile sequence for a small box is short; an absurdly large tile_index
-    // is past the end. The server should return 200 + empty docs +
-    // null next_url, not an error.
+    // Tile sequence for a small box inside BSOSE coverage is short; an
+    // absurdly large tile_index is past the end. The server should
+    // return 200 + empty docs + null next_url, not an error.
     let body = get_envelope(
         "/timeseries/bsose",
         &[
-            ("box", "[[0,0],[10,10]]"),
+            ("box", "[[0,-40],[10,-30]]"),
             ("tile_index", "9999999"),
         ],
     )
@@ -543,7 +542,7 @@ async fn tile_index_beyond_end_returns_empty_with_null_next_url() {
 async fn invalid_tile_index_returns_400() {
     let resp = get(
         "/timeseries/bsose",
-        &[("box", "[[0,0],[10,10]]"), ("tile_index", "not-a-number")],
+        &[("box", "[[0,-40],[10,-30]]"), ("tile_index", "not-a-number")],
     )
     .await;
     assert_eq!(resp.status(), 400);
@@ -553,7 +552,7 @@ async fn invalid_tile_index_returns_400() {
 async fn negative_tile_index_returns_400() {
     let resp = get(
         "/timeseries/bsose",
-        &[("box", "[[0,0],[10,10]]"), ("tile_index", "-1")],
+        &[("box", "[[0,-40],[10,-30]]"), ("tile_index", "-1")],
     )
     .await;
     assert_eq!(resp.status(), 400);
@@ -583,7 +582,7 @@ async fn next_url_round_trips_cleanly() {
     // handler — catches percent-encoding bugs, param dropping, etc.
     let body = get_envelope(
         "/timeseries/bsose",
-        &[("box", "[[15,5],[45,35]]"), ("data", "all")],
+        &[("box", "[[15,-55],[45,-35]]"), ("data", "all")],
     )
     .await;
     let next = body["next_url"]
@@ -620,13 +619,13 @@ async fn next_url_round_trips_cleanly() {
 
 #[tokio::test]
 async fn first_page_carries_a_next_url_when_more_pages_remain() {
-    // The (20,10)/(40,30) box has docs at multiple level brackets, so the
-    // first page should not be the last. next_url must carry both the
-    // user's params (so the next request hits the same filter) and an
-    // advanced tile_index.
+    // The (20,-50)/(40,-40) box has docs at multiple level brackets, so
+    // the first page should not be the last. next_url must carry both
+    // the user's params (so the next request hits the same filter) and
+    // an advanced tile_index.
     let body = get_envelope(
         "/timeseries/bsose",
-        &[("box", "[[15,5],[45,35]]"), ("data", "all")],
+        &[("box", "[[15,-55],[45,-35]]"), ("data", "all")],
     )
     .await;
     assert!(

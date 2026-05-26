@@ -347,6 +347,7 @@ mod tests {
         tile_degrees: 10.0,
         max_radius_meters: 1_000_000.0, // 1000 km
         levels: &[0.0],
+        coverage_bbox: None,
     };
 
     #[test]

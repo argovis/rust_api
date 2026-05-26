@@ -10,6 +10,9 @@ pub use schema::*;
 pub mod filters;
 pub use filters::*;
 
+pub mod geometry;
+pub use geometry::*;
+
 pub mod dataset_config;
 pub use dataset_config::*;
 

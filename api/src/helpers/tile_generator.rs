@@ -33,20 +33,8 @@
 use serde_json::Value;
 
 use super::dataset_config::DatasetConfig;
+use super::geometry::BoundingBox;
 use super::helpers::validlonlat;
-
-/// A longitude/latitude bounding box. `sw` is the south-west corner
-/// (min lon, min lat); `ne` is the north-east corner (max lon, max lat).
-/// The box is *half-open* in both dimensions: `[sw_lon, ne_lon) × [sw_lat,
-/// ne_lat)`. Documents on the south or west edge belong to the tile;
-/// documents on the north or east edge belong to the next tile over. This
-/// matters at tile boundaries for grid-aligned datasets like BSOSE — see
-/// the box construction in `grid_aligned_tiles`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct BoundingBox {
-    pub sw: [f64; 2],
-    pub ne: [f64; 2],
-}
 
 /// One unit of pagination. Both fields are `Option` because some query
 /// shapes naturally suppress one or the other:
@@ -114,16 +102,14 @@ fn level_only_tiles(config: &DatasetConfig) -> Vec<TileSpec> {
 }
 
 fn whole_globe_tiles(config: &DatasetConfig) -> Vec<TileSpec> {
-    cross_levels(
-        grid_aligned_tiles(
-            BoundingBox {
-                sw: [-180.0, -90.0],
-                ne: [180.0, 90.0],
-            },
-            config.tile_degrees,
-        ),
-        config,
-    )
+    let spatial = grid_aligned_tiles(
+        BoundingBox {
+            sw: [-180.0, -90.0],
+            ne: [180.0, 90.0],
+        },
+        config.tile_degrees,
+    );
+    cross_levels(apply_coverage(spatial, config), config)
 }
 
 fn box_tiles(boxregion: &str, config: &DatasetConfig) -> Vec<TileSpec> {
@@ -165,7 +151,7 @@ fn box_tiles(boxregion: &str, config: &DatasetConfig) -> Vec<TileSpec> {
     for bbox in sub_boxes {
         tiles.extend(grid_aligned_tiles(bbox, config.tile_degrees));
     }
-    cross_levels(tiles, config)
+    cross_levels(apply_coverage(tiles, config), config)
 }
 
 fn polygon_tiles(polygon: &str, config: &DatasetConfig) -> Vec<TileSpec> {
@@ -184,7 +170,20 @@ fn polygon_tiles(polygon: &str, config: &DatasetConfig) -> Vec<TileSpec> {
     for bbox in polygon_bboxes(&coords) {
         spatial.extend(grid_aligned_tiles(bbox, config.tile_degrees));
     }
-    cross_levels(spatial, config)
+    cross_levels(apply_coverage(spatial, config), config)
+}
+
+/// Drop tiles that don't overlap the dataset's known coverage region.
+/// `config.coverage_bbox = None` means "no a-priori bound" — every tile
+/// passes through. With a coverage set, this is where pagination saves
+/// the most work: we never even probe regions that *can't* contain data
+/// (latitudes north of BSOSE's domain, far-from-the-mooring tiles for
+/// some hypothetical regional dataset, etc.).
+fn apply_coverage(spatial: Vec<BoundingBox>, config: &DatasetConfig) -> Vec<BoundingBox> {
+    match &config.coverage_bbox {
+        None => spatial,
+        Some(coverage) => spatial.into_iter().filter(|t| t.overlaps(coverage)).collect(),
+    }
 }
 
 /// Compute the bounding box(es) covering a polygon's vertices, handling
@@ -368,6 +367,7 @@ mod tests {
         tile_degrees: 10.0,
         max_radius_meters: 1.0e6,
         levels: &[0.0, 100.0],
+        coverage_bbox: None,
     };
 
     // ---- top-level dispatch --------------------------------------------------
@@ -647,6 +647,102 @@ mod tests {
         );
     }
 
+    // ---- coverage_bbox filtering --------------------------------------------
+
+    /// Test config restricted to a southern band, matching BSOSE's shape.
+    const COVERAGE_TEST_CONFIG: DatasetConfig = DatasetConfig {
+        tile_degrees: 10.0,
+        max_radius_meters: 1.0e6,
+        levels: &[0.0, 100.0],
+        coverage_bbox: Some(BoundingBox {
+            sw: [-180.0, -90.0],
+            ne: [180.0, -30.0],
+        }),
+    };
+
+    #[test]
+    fn coverage_bbox_drops_tiles_entirely_outside() {
+        // Whole-globe walk against a southern-band coverage. Every emitted
+        // tile must overlap the coverage region — no tiles north of -30°.
+        let tiles = generate_tiles(&json!({}), &COVERAGE_TEST_CONFIG);
+        assert!(!tiles.is_empty(), "coverage band should still produce tiles");
+        for t in &tiles {
+            let bb = t.tile_bbox.as_ref().expect("whole-globe → bbox tiles");
+            // Tile must have at least some range at lat ≤ -30°.
+            assert!(
+                bb.sw[1] <= -30.0,
+                "tile {:?} should be entirely south of -30° (sw_lat <= -30)",
+                bb
+            );
+        }
+        // 6 lat rows × 36 lon cols × 2 levels = 432 specs. The 6 rows are
+        // those whose sw_lat is one of -90,-80,-70,-60,-50,-40 (each
+        // overlaps the coverage [-90,-30]). Row sw_lat=-30 is also kept
+        // by the permissive overlap test (sw_lat=-30 == ne_lat of cov).
+        // So 7 rows × 36 cols × 2 levels = 504.
+        assert_eq!(tiles.len(), 7 * 36 * COVERAGE_TEST_CONFIG.levels.len());
+    }
+
+    #[test]
+    fn coverage_bbox_keeps_tile_at_coverage_boundary() {
+        // The southernmost "non-covered" tile is the one whose sw_lat
+        // equals the coverage's ne_lat. Our permissive overlap test keeps
+        // it so that data sitting exactly on the boundary lat doesn't
+        // fall in a gap.
+        let tiles = generate_tiles(&json!({}), &COVERAGE_TEST_CONFIG);
+        let bboxes: Vec<_> = tiles.iter().filter_map(|t| t.tile_bbox.clone()).collect();
+        // Boundary tile starts at lat=-30, runs to lat=-20. Should be
+        // present in the sequence.
+        let boundary_present = bboxes.iter().any(|b| b.sw[1] == -30.0);
+        assert!(
+            boundary_present,
+            "tile whose SW touches the coverage NE should be kept; got {:?}",
+            bboxes
+        );
+    }
+
+    #[test]
+    fn coverage_bbox_none_preserves_global_walk() {
+        // Sanity: the TEST_CONFIG (coverage_bbox: None) still produces
+        // the full 648-tile whole-globe sequence we asserted elsewhere.
+        let tiles = generate_tiles(&json!({}), &TEST_CONFIG);
+        assert_eq!(tiles.len(), 18 * 36 * TEST_CONFIG.levels.len());
+    }
+
+    #[test]
+    fn polygon_entirely_outside_coverage_produces_zero_tiles() {
+        // Polygon over the Sahara — well north of BSOSE's coverage.
+        // Every candidate spatial tile is dropped by the coverage filter,
+        // so generate_tiles returns an empty sequence. The handler will
+        // fall through to its empty-response path.
+        let tiles = generate_tiles(
+            &json!({"polygon": "[[0,15],[20,15],[20,25],[0,25],[0,15]]"}),
+            &COVERAGE_TEST_CONFIG,
+        );
+        assert!(
+            tiles.is_empty(),
+            "polygon outside coverage should produce no tiles, got {:?}",
+            tiles
+        );
+    }
+
+    #[test]
+    fn box_partially_outside_coverage_keeps_only_overlapping_tiles() {
+        // Box straddling the coverage boundary: lat range [-40, -20].
+        // The southern half (lat in [-40,-30]) is inside coverage; the
+        // northern half (lat in [-30,-20]) is outside. Only southern
+        // tiles should survive.
+        let tiles = generate_tiles(
+            &json!({"box": "[[10,-40],[20,-20]]"}),
+            &COVERAGE_TEST_CONFIG,
+        );
+        assert!(!tiles.is_empty());
+        for t in &tiles {
+            let bb = t.tile_bbox.as_ref().unwrap();
+            assert!(bb.sw[1] <= -30.0, "tile {:?} should be at or south of -30°", bb);
+        }
+    }
+
     #[test]
     fn polygon_with_out_of_range_longitude_gets_normalized_and_split() {
         // The user's exact failure shape: a thin strip straddling the
@@ -784,6 +880,7 @@ mod tests {
             tile_degrees: 10.0,
             max_radius_meters: 1.0e6,
             levels: &[],
+            coverage_bbox: None,
         };
         let tiles = generate_tiles(
             &json!({"box": "[[0,0],[10,10]]"}),

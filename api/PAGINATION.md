@@ -27,13 +27,15 @@ Server-side, each request's spatial parameters define a sequence of
 depth level. Tiles are ordered *spatial outer, level inner*: all levels
 for one (lon, lat) cell come out before moving to the next cell.
 
-Tile size is per-dataset:
+Tile size and extent are per-dataset:
 
-- Spatial extent is `DatasetConfig::tile_degrees` (10° for BSOSE).
-- Depth pages are the dataset's discrete `levels` (24 brackets for BSOSE).
-
-For BSOSE that's up to 1600 docs per (tile × level) page, with the actual
-count clipped by land, the user's filter, and the dataset's coverage.
+- Spatial extent is `DatasetConfig::tile_degrees` (5° for BSOSE).
+- Depth pages are the dataset's discrete `levels` (52 brackets for BSOSE).
+- The tile sequence is clipped to `DatasetConfig::coverage_bbox`, an
+  optional rectangle that tells the generator where the dataset has
+  data. For BSOSE that's `[-180,-90]→[180,-30]` (south of 30°S); for
+  datasets without an a-priori coverage bound, it can be `None` and
+  the generator walks the whole globe.
 
 Each HTTP request serves at most **one** non-empty tile. The server
 **probes forward** from the requested `tile_index`, opening a small
@@ -43,10 +45,14 @@ that yields output (or runs out of tiles). `next_url` carries
 the one we just emitted. When the server runs out of tiles, `next_url`
 is `null`.
 
-This is naive plod-forward — there's no land-mask shortcut yet, so
-whole-globe requests do walk a lot of empty tiles server-side. Clients
-don't see that work; they only get one HTTP response per non-empty
-tile.
+The coverage bbox is the cheap way to keep probe-forward sane: tiles
+that fall entirely outside the coverage are never probed at all, so
+e.g. a BSOSE whole-globe walk doesn't have to confirm that the entire
+Northern Hemisphere is empty before terminating. Probe-forward is still
+linear in the number of *candidate* tiles after coverage filtering, so
+sparse datasets within their coverage area can still incur empty
+probes — a denser secondary mask (e.g. land/ocean per cell) would help
+here but isn't implemented.
 
 ## Tile membership
 
@@ -126,7 +132,10 @@ antimeridian / north-pole docs aren't lost.
 ## Per-dataset configuration
 
 `api/src/helpers/dataset_config.rs` defines a `DatasetConfig` struct
-with the dataset's `tile_degrees`, `max_radius_meters`, and the discrete
-`levels` array. The BSOSE handler binds `BSOSE_CONFIG` directly; adding
-a new dataset means defining its config there and wiring its handler
-through the same `tile_generator` / `filter_composer` machinery.
+with the dataset's `tile_degrees`, `max_radius_meters`, the discrete
+`levels` array, and an optional `coverage_bbox`. The BSOSE handler
+binds `BSOSE_CONFIG` directly; adding a new dataset means defining its
+config there and wiring its handler through the same `tile_generator` /
+`filter_composer` machinery. `coverage_bbox: None` for a new dataset
+gives global-walk semantics; setting it to a bounding rectangle tells
+the tile generator to skip everything outside the rectangle.

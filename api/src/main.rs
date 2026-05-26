@@ -13,13 +13,16 @@ nice to have someday
 transform logic as traits?
 */
 
-use api::helpers::filters;
 use api::helpers::transforms;
 use api::helpers::schema;
 use api::helpers::helpers;
+use api::helpers::dataset_config;
+use api::helpers::tile_generator;
+use api::helpers::filter_composer;
+use api::helpers::pagination;
 
 use mongodb::{options::FindOptions, bson::Document, error::Result};
-use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{get, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use futures::stream::StreamExt;
@@ -29,164 +32,255 @@ use serde::de::DeserializeOwned;
 use mongodb::bson::DateTime;
 use std::collections::HashSet;
 use async_stream::stream;
+use serde_json::{json, Value};
 
 static CLIENT: Lazy<Mutex<Option<mongodb::Client>>> = Lazy::new(|| Mutex::new(None));
 static TIMESERIES: Lazy<Mutex<Option<Vec<DateTime>>>> = Lazy::new(|| Mutex::new(None));
 
 #[get("/timeseries/bsose")]
-async fn search_data_schema(query_params: web::Query<serde_json::Value>) -> impl Responder {
+async fn search_data_schema(
+    req: HttpRequest,
+    query_params: web::Query<serde_json::Value>,
+) -> impl Responder {
     let params = query_params.into_inner();
 
-    // validate query params ////////////////////////////////////////
-    match helpers::validate_query_params(&params) {
-        Ok(_) => {},
-        Err(response) => return response,
+    // Dataset-specific request-size policy: tile size, level set, radius cap.
+    let config = &dataset_config::BSOSE_CONFIG;
+
+    // The next_url we emit on success uses this request's own path, so the
+    // generated URL stays correct even if the route is re-mounted later.
+    let path = req.path().to_string();
+
+    // ---- validation ---------------------------------------------------
+    if let Err(response) = helpers::validate_query_params(&params) {
+        return response;
+    }
+    if let Err(response) = helpers::validate_radius_cap(&params, config) {
+        return response;
     }
 
-    // construct filter from query params //////////////////////////
-    let filter = filters::filter_timeseries(params.clone());
-
-    // open the cursor //////////////////////////////////////////////
-    let options = FindOptions::builder().build();
-    let mut cursor = match generate_cursor::<schema::BsoseSchema>("argo", "bsose", filter, Some(options)).await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Error opening cursor: {}", e);
-            return HttpResponse::InternalServerError().finish();
-        }
+    let start_idx = match pagination::parse_tile_index(&params) {
+        Ok(i) => i,
+        Err(e) => return HttpResponse::BadRequest().json(json!({"error": e})),
     };
 
-    // grab the cached timeseries vector once
+    // ---- tile sequence + cached startup data --------------------------
+    let tiles = tile_generator::generate_tiles(&params, config);
+
     let timeseries = {
         let ts = TIMESERIES.lock().unwrap();
         ts.clone().unwrap()
     };
 
-    let compression: Option<String> = params.get("compression")
+    let compression: Option<String> = params
+        .get("compression")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let batchmeta: Option<String> = params.get("batchmeta")
+    let batchmeta: Option<String> = params
+        .get("batchmeta")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // -------------------------------------------------------------------
-    // batchmeta: drain the bsose cursor, but only keep the (small) set of
-    // unique metadata IDs in memory. Then fetch the metadata documents and
-    // return them as a normal JSON array. Worst-case memory is bounded by
-    // the number of distinct metadata ids, not the number of bsose hits.
-    // -------------------------------------------------------------------
-    if batchmeta.is_some() {
-        let mut unique_metadata: HashSet<String> = HashSet::new();
+    let is_minimal = matches!(compression.as_deref(), Some("minimal"));
+
+    // ---- probe-forward loop -------------------------------------------
+    //
+    // For each candidate tile (starting at the caller-supplied tile_index),
+    // open a cursor and look for output. The flavour of "look" differs by
+    // branch: streaming peeks for the first doc that survives transformation
+    // (and keeps the cursor so the rest can be streamed straight through);
+    // batchmeta drains the entire cursor to collect unique metadata IDs
+    // (no streaming, but per-tile bounded by tile size). Either way, an
+    // empty tile drops through to the next iteration. We plod through
+    // empty tiles one at a time; a future land-mask short-circuit could
+    // replace this with a smarter skip.
+    for tile_idx in start_idx..tiles.len() {
+        let tile = &tiles[tile_idx];
+        let filter = filter_composer::compose_filter_with_tile(params.clone(), tile, config);
+        let options = FindOptions::builder().build();
+
+        let mut cursor = match generate_cursor::<schema::BsoseSchema>(
+            "argo", "bsose", filter, Some(options),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Error opening cursor for tile {}: {}", tile_idx, e);
+                return HttpResponse::InternalServerError().finish();
+            }
+        };
+
+        if batchmeta.is_some() {
+            // ---- batchmeta branch --------------------------------------
+            let mut unique_metadata: HashSet<String> = HashSet::new();
+            while let Some(result) = cursor.next().await {
+                match result {
+                    Ok(doc) => {
+                        if let Some(t) =
+                            transforms::transform_timeseries(&params, &timeseries, doc)
+                        {
+                            for m in t.metadata.iter() {
+                                unique_metadata.insert(m.clone());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Cursor error during batchmeta drain: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            if unique_metadata.is_empty() {
+                continue; // tile produced no metadata — try the next one.
+            }
+
+            let meta_filter = mongodb::bson::doc! {
+                "_id": { "$in": unique_metadata.into_iter().collect::<Vec<_>>() }
+            };
+            let meta_cursor = match generate_cursor::<Document>(
+                "argo", "timeseriesMeta", meta_filter, None,
+            )
+            .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error opening metadata cursor: {}", e);
+                    return HttpResponse::InternalServerError().finish();
+                }
+            };
+            let docs: Vec<_> = meta_cursor.map(|d| d.unwrap()).collect().await;
+
+            return HttpResponse::Ok().json(json!({
+                "docs": docs,
+                "next_url": next_url_value(&path, &params, tile_idx, tiles.len()),
+                "message": format!("page {}", tile_idx),
+            }));
+        }
+
+        // ---- streaming branch ------------------------------------------
+        //
+        // Peek-ahead until we find a doc that survives transformation.
+        // If none, advance to the next tile. If found, keep the cursor —
+        // we'll continue draining it from inside the response body.
+        let mut first_doc: Option<schema::BsoseSchema> = None;
         while let Some(result) = cursor.next().await {
             match result {
                 Ok(doc) => {
-                    if let Some(t) = transforms::transform_timeseries(&params, &timeseries, doc) {
-                        for m in t.metadata.iter() {
-                            unique_metadata.insert(m.clone());
-                        }
+                    if let Some(t) =
+                        transforms::transform_timeseries(&params, &timeseries, doc)
+                    {
+                        first_doc = Some(t);
+                        break;
                     }
                 }
                 Err(e) => {
-                    eprintln!("Cursor error: {}", e);
+                    eprintln!("Cursor error during peek for tile {}: {}", tile_idx, e);
                     return HttpResponse::InternalServerError().finish();
                 }
             }
         }
-        if unique_metadata.is_empty() {
-            return helpers::create_response::<Document>(vec![]);
-        }
-        let meta_filter = mongodb::bson::doc! {
-            "_id": { "$in": unique_metadata.into_iter().collect::<Vec<_>>() }
+
+        let first_doc = match first_doc {
+            Some(d) => d,
+            None => continue, // tile contributed no surviving docs — try next.
         };
-        let meta_cursor = match generate_cursor::<Document>("argo", "timeseriesMeta", meta_filter, None).await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Error opening metadata cursor: {}", e);
-                return HttpResponse::InternalServerError().finish();
-            }
-        };
-        let results: Vec<_> = meta_cursor.map(|doc| doc.unwrap()).collect().await;
-        return helpers::create_response(results);
-    }
 
-    // -------------------------------------------------------------------
-    // Default and compression=minimal both stream the bsose cursor through
-    // the per-document transforms straight to the HTTP response, never
-    // materializing the full result set in memory.
-    //
-    // We do still need to peek ahead until we've found at least one doc
-    // that survives transformation, so we can preserve the existing
-    // 404-on-empty contract. Once we have one survivor in hand, we open
-    // the streamed JSON array `[`, emit it, and continue draining the
-    // cursor doc-by-doc.
-    // -------------------------------------------------------------------
-    let is_minimal = matches!(compression.as_deref(), Some("minimal"));
+        let next_url = next_url_value(&path, &params, tile_idx, tiles.len());
+        let page_message = format!("page {}", tile_idx);
+        // Each of these gets moved into the stream! generator. params and
+        // timeseries are needed to transform each subsequent doc; the rest
+        // are emitted at the end of the response.
+        let params_for_stream = params.clone();
+        let ts_for_stream = timeseries.clone();
 
-    let mut first_doc: Option<schema::BsoseSchema> = None;
-    while let Some(result) = cursor.next().await {
-        match result {
-            Ok(doc) => {
-                if let Some(t) = transforms::transform_timeseries(&params, &timeseries, doc) {
-                    first_doc = Some(t);
-                    break;
-                }
-            }
-            Err(e) => {
-                eprintln!("Cursor error: {}", e);
-                return HttpResponse::InternalServerError().finish();
-            }
-        }
-    }
+        let body = stream! {
+            yield Ok::<_, Infallible>(web::Bytes::from_static(b"{\"docs\":["));
 
-    let first_doc = match first_doc {
-        Some(d) => d,
-        None => return helpers::create_response::<schema::BsoseSchema>(vec![]),
-    };
+            // Serialize the peeked first doc.
+            let first_bytes = if is_minimal {
+                let stub = transforms::timeseries_stub(&first_doc);
+                serde_json::to_vec(&stub).expect("serializing one stub should not fail")
+            } else {
+                serde_json::to_vec(&first_doc)
+                    .expect("serializing one bsose doc should not fail")
+            };
+            yield Ok(web::Bytes::from(first_bytes));
 
-    // Stream owns: cursor, params, timeseries, first_doc, is_minimal.
-    // Cursor errors mid-stream are logged and end the stream; we cannot
-    // change the HTTP status after bytes have been sent, so we close the
-    // JSON array cleanly and let the caller see whatever they already got.
-    let body = stream! {
-        yield Ok::<_, Infallible>(web::Bytes::from_static(b"["));
-
-        // Project + serialize the buffered first doc.
-        let first_bytes = if is_minimal {
-            let stub = transforms::timeseries_stub(&first_doc);
-            serde_json::to_vec(&stub).expect("serializing one stub should not fail")
-        } else {
-            serde_json::to_vec(&first_doc).expect("serializing one bsose doc should not fail")
-        };
-        yield Ok(web::Bytes::from(first_bytes));
-
-        while let Some(result) = cursor.next().await {
-            match result {
-                Ok(doc) => {
-                    if let Some(t) = transforms::transform_timeseries(&params, &timeseries, doc) {
-                        let bytes = if is_minimal {
-                            let stub = transforms::timeseries_stub(&t);
-                            serde_json::to_vec(&stub).expect("serializing one stub should not fail")
-                        } else {
-                            serde_json::to_vec(&t).expect("serializing one bsose doc should not fail")
-                        };
-                        yield Ok(web::Bytes::from_static(b","));
-                        yield Ok(web::Bytes::from(bytes));
+            while let Some(result) = cursor.next().await {
+                match result {
+                    Ok(doc) => {
+                        if let Some(t) = transforms::transform_timeseries(
+                            &params_for_stream, &ts_for_stream, doc,
+                        ) {
+                            let bytes = if is_minimal {
+                                let stub = transforms::timeseries_stub(&t);
+                                serde_json::to_vec(&stub)
+                                    .expect("serializing one stub should not fail")
+                            } else {
+                                serde_json::to_vec(&t)
+                                    .expect("serializing one bsose doc should not fail")
+                            };
+                            yield Ok(web::Bytes::from_static(b","));
+                            yield Ok(web::Bytes::from(bytes));
+                        }
+                    }
+                    Err(e) => {
+                        // Mid-stream error: status is already 200, so we
+                        // can only close the JSON cleanly and stop.
+                        eprintln!("Cursor error during stream: {}", e);
+                        break;
                     }
                 }
-                Err(e) => {
-                    eprintln!("Cursor error during stream: {}", e);
-                    break;
-                }
             }
-        }
 
-        yield Ok(web::Bytes::from_static(b"]"));
-    };
+            // Close the docs array and emit the trailer fields. The
+            // serialize calls only fail on non-finite floats inside the
+            // value; for the strings/Null we use here that's impossible,
+            // but we fall back to safe bytes if for some reason it does.
+            yield Ok(web::Bytes::from_static(b"],\"next_url\":"));
+            yield Ok(web::Bytes::from(
+                serde_json::to_vec(&next_url).unwrap_or_else(|_| b"null".to_vec()),
+            ));
+            yield Ok(web::Bytes::from_static(b",\"message\":"));
+            yield Ok(web::Bytes::from(
+                serde_json::to_vec(&page_message)
+                    .unwrap_or_else(|_| b"\"\"".to_vec()),
+            ));
+            yield Ok(web::Bytes::from_static(b"}"));
+        };
 
-    HttpResponse::Ok()
-        .content_type("application/json")
-        .streaming(body)
+        return HttpResponse::Ok()
+            .content_type("application/json")
+            .streaming(body);
+    }
+
+    // ---- no non-empty tile in the requested range ---------------------
+    //
+    // Empty results no longer return 404 — the paginated contract is that
+    // `next_url: null` means "no more data", so empty must remain 200.
+    HttpResponse::Ok().json(json!({
+        "docs": [],
+        "next_url": Value::Null,
+        "message": format!("no non-empty tiles from index {}", start_idx),
+    }))
+}
+
+/// Build the JSON value emitted as `next_url`. Returns `Value::Null` when
+/// the just-served tile was the last one (no further pages exist).
+fn next_url_value(
+    path: &str,
+    params: &serde_json::Value,
+    current_idx: usize,
+    total_tiles: usize,
+) -> Value {
+    if current_idx + 1 < total_tiles {
+        Value::String(pagination::build_next_url(path, params, current_idx + 1))
+    } else {
+        Value::Null
+    }
 }
 
 #[actix_web::main]

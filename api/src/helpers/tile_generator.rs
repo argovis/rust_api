@@ -368,6 +368,7 @@ mod tests {
         max_radius_meters: 1.0e6,
         levels: &[0.0, 100.0],
         coverage_bbox: None,
+        allowed_data_vars: &[],
     };
 
     // ---- top-level dispatch --------------------------------------------------
@@ -658,6 +659,7 @@ mod tests {
             sw: [-180.0, -90.0],
             ne: [180.0, -30.0],
         }),
+        allowed_data_vars: &[],
     };
 
     #[test]
@@ -881,6 +883,7 @@ mod tests {
             max_radius_meters: 1.0e6,
             levels: &[],
             coverage_bbox: None,
+            allowed_data_vars: &[],
         };
         let tiles = generate_tiles(
             &json!({"box": "[[0,0],[10,10]]"}),

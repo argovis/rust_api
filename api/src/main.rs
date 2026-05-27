@@ -151,6 +151,9 @@ where
     if let Err(response) = helpers::validate_radius_cap(&params, config) {
         return response;
     }
+    if let Err(response) = helpers::validate_data_param(&params, config) {
+        return response;
+    }
 
     let start_idx = match pagination::parse_tile_index(&params) {
         Ok(i) => i,

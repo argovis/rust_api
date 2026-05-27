@@ -170,6 +170,7 @@ mod tests {
         max_radius_meters: 1.0e6,
         levels: &[100.0, 500.0],
         coverage_bbox: None,
+        allowed_data_vars: &[],
     };
 
     fn null_tile() -> TileSpec {

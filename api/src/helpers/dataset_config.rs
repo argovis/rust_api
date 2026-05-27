@@ -50,11 +50,19 @@ use super::schema::DataInfo;
 /// — tile generation falls back to walking the whole globe. The
 /// rectangle is treated as inclusive on its edges; a doc lying exactly
 /// on the coverage boundary is preserved.
+///
+/// `allowed_data_vars`: the per-dataset variable names accepted in the
+/// `data=` qsp. Used by `validate_data_param` to reject typos (and to
+/// power the "did you mean" suggestion). Does not include the universal
+/// tokens (`all`, `except_data_values`) or integer QC filters —
+/// those are accepted regardless of dataset and handled by the
+/// validator directly.
 pub struct DatasetConfig {
     pub tile_degrees: f64,
     pub max_radius_meters: f64,
     pub levels: &'static [f64],
     pub coverage_bbox: Option<BoundingBox>,
+    pub allowed_data_vars: &'static [&'static str],
 }
 
 /// Per-dataset identity + Mongo client + startup-loaded metadata, built
@@ -123,6 +131,7 @@ pub const BSOSE_CONFIG: DatasetConfig = DatasetConfig {
         sw: [-180.0, -90.0],
         ne: [180.0, -30.0],
     }),
+    allowed_data_vars: &["THETA", "SALT"],
 };
 
 /// OI SST has a single vertical level (the sea surface). We model it as
@@ -148,6 +157,7 @@ pub const OISST_CONFIG: DatasetConfig = DatasetConfig {
     max_radius_meters: 100_000.0, // 100 km — relax once usage informs us
     levels: OISST_LEVELS,
     coverage_bbox: None,
+    allowed_data_vars: &["sst"],
 };
 
 #[cfg(test)]

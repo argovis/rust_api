@@ -95,7 +95,7 @@ antimeridian / north-pole docs aren't lost.
 | `center` + `radius` | JSON `[lon, lat]` + meters | Disk query. Radius capped at the dataset's `max_radius_meters`. |
 | `verticalRange` | JSON `[lo, hi]` | Half-open depth range applied on top of tile-level pagination. |
 | `startDate` / `endDate` | RFC-3339 string | Slices each doc's timeseries to this window. |
-| `data` | comma-separated | Variables to include. `all` keeps everything; a specific list filters columns. If the doc has no data to return after filtering (no matching columns, or a time window that collapsed to zero points), the whole doc is dropped from the response. Omitting `data=` entirely also omits the `data` field from each response doc — use that for slim listings. `except_data_values` in the list keeps the row but clears the values (schema-only mode) — that's the one case where an empty `data` array doesn't drop the doc. |
+| `data` | comma-separated | Variables to include. Each token must be: a dataset-specific variable name (BSOSE: `THETA`, `SALT`; OI SST: `sst`), the universal `all` (keep everything) or `except_data_values` (keep schema, clear values), or an integer (QC filter). Unknown tokens are rejected with a 400 + a "did you mean" suggestion. If the doc has no data to return after filtering (no matching columns, or a time window that collapsed to zero points), the whole doc is dropped from the response. Omitting `data=` entirely also omits the `data` field from each response doc — use that for slim listings. `except_data_values` in the list keeps the row but clears the values (schema-only mode) — that's the one case where an empty `data` array doesn't drop the doc. |
 | `compression` | `minimal` | See mode flags. |
 | `batchmeta` | any | See mode flags. |
 | `tile_index` | non-negative integer | Pagination cursor. Default `0`. Almost always supplied by the previous response's `next_url`. |
@@ -107,6 +107,10 @@ antimeridian / north-pole docs aren't lost.
   loudly instead of being silently ignored. When the typo is close to
   a real param name, the error message includes a "did you mean ..."
   suggestion.
+- Any token inside the `data=` list that isn't one of: the dataset's
+  declared variable names, the universal `all` / `except_data_values`,
+  or an integer (QC filter). Suggestions follow the same shape as the
+  qsp-name check.
 - More than one of `polygon` / `box` / `center` set.
 - `center` set without `radius`, or vice versa.
 - `radius` non-numeric, negative, non-finite, or above the dataset's cap.

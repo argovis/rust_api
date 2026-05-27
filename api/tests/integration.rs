@@ -175,16 +175,46 @@ async fn data_all_returns_full_timeseries_across_pages() {
 
 #[tokio::test]
 async fn data_specific_field_filters_columns_across_pages() {
-    let docs = get_paged("/timeseries/bsose", &[("data", "salinity")]).await;
+    let docs = get_paged("/timeseries/bsose", &[("data", "SALT")]).await;
     assert!(!docs.is_empty());
     for row in &docs {
         let names = &row["data_info"][0];
         assert_eq!(
             names.as_array().unwrap(),
-            &vec![Value::String("salinity".to_string())]
+            &vec![Value::String("SALT".to_string())]
         );
         assert_eq!(row["data"].as_array().unwrap().len(), 1);
     }
+}
+
+#[tokio::test]
+async fn unknown_data_value_returns_400() {
+    // `salinity` was the old BSOSE variable name; the production names
+    // are THETA/SALT. The whitelist should reject the typo with a
+    // suggestion that includes the right name.
+    let resp = get("/timeseries/bsose", &[("data", "salinity")]).await;
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn integer_data_value_accepted_as_qc_filter() {
+    // Integers in the data= list are accepted as QC filters at the
+    // validation layer, regardless of whether the dataset has any
+    // matching column. `1,SALT` should not 400.
+    let body = get_envelope(
+        "/timeseries/bsose",
+        &[("id", "bsose_doc_001"), ("data", "1,SALT")],
+    )
+    .await;
+    let docs = body["docs"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    // SALT survives column-filtering; the `1` is silently dropped by
+    // slice_data (no matching variable name) but accepted by validation.
+    let names = &docs[0]["data_info"][0];
+    assert_eq!(
+        names.as_array().unwrap(),
+        &vec![Value::String("SALT".to_string())]
+    );
 }
 
 // ---------------------------------------------------------------------------

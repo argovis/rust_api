@@ -14,9 +14,9 @@
       [34.50, 34.60, 34.70, 34.80]
     ],
     "data_info": [
-      ["temp", "salinity"],
+      ["THETA", "SALT"],
       ["units", "long_name"],
-      [["degC", "Temperature"], ["psu", "Salinity"]]
+      [["degC", "Potential Temperature"], ["psu", "Practical Salinity"]]
     ]
   },
   {
@@ -34,9 +34,9 @@
       [35.00, 35.10, 35.20, 35.30]
     ],
     "data_info": [
-      ["temp", "salinity"],
+      ["THETA", "SALT"],
       ["units", "long_name"],
-      [["degC", "Temperature"], ["psu", "Salinity"]]
+      [["degC", "Potential Temperature"], ["psu", "Practical Salinity"]]
     ]
   },
   {
@@ -54,9 +54,9 @@
       [33.10, 33.20, 33.30, 33.40]
     ],
     "data_info": [
-      ["temp", "salinity"],
+      ["THETA", "SALT"],
       ["units", "long_name"],
-      [["degC", "Temperature"], ["psu", "Salinity"]]
+      [["degC", "Potential Temperature"], ["psu", "Practical Salinity"]]
     ]
   },
   {
@@ -74,9 +74,9 @@
       [34.10, 34.20, 34.30, 34.40]
     ],
     "data_info": [
-      ["temp", "salinity"],
+      ["THETA", "SALT"],
       ["units", "long_name"],
-      [["degC", "Temperature"], ["psu", "Salinity"]]
+      [["degC", "Potential Temperature"], ["psu", "Practical Salinity"]]
     ]
   }
 ]

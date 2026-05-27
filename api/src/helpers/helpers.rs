@@ -194,6 +194,86 @@ pub fn validate_query_params(params: &serde_json::Value) -> Result<(), HttpRespo
     Ok(())
 }
 
+/// Universal tokens accepted in the `data=` qsp regardless of which
+/// dataset is being queried. `all` and `except_data_values` control
+/// response shape rather than naming a variable; both are documented
+/// in `api/PAGINATION.md`.
+const UNIVERSAL_DATA_TOKENS: &[&str] = &["all", "except_data_values"];
+
+/// Validate the contents of the `data=` qsp against the dataset's
+/// `allowed_data_vars`. Each comma-separated token must be one of:
+///
+///   - a universal token (`all` or `except_data_values`),
+///   - a variable name in `config.allowed_data_vars`, or
+///   - an integer (accepted as a QC filter; the QC system is dataset-
+///     agnostic so any non-negative integer is allowed at this layer).
+///
+/// Anything else returns 400 with a Levenshtein-suggested correction
+/// when one of the named candidates is within edit distance 2.
+///
+/// No-op when the `data=` qsp is absent.
+pub fn validate_data_param(
+    params: &serde_json::Value,
+    config: &DatasetConfig,
+) -> Result<(), HttpResponse> {
+    let raw = match params.get("data").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    for token in raw.split(',') {
+        if token.is_empty() {
+            return Err(HttpResponse::BadRequest().json(json!({
+                "error": "'data' qsp contains an empty token (likely a leading, trailing, or doubled comma)"
+            })));
+        }
+        if UNIVERSAL_DATA_TOKENS.contains(&token) {
+            continue;
+        }
+        if config.allowed_data_vars.contains(&token) {
+            continue;
+        }
+        // Integer QC filter (any signed integer; the QC layer
+        // interprets the value, this layer just gate-keeps the shape).
+        if token.parse::<i64>().is_ok() {
+            continue;
+        }
+        let msg = unknown_data_token_message(token, config);
+        return Err(HttpResponse::BadRequest().json(json!({"error": msg})));
+    }
+    Ok(())
+}
+
+fn unknown_data_token_message(token: &str, config: &DatasetConfig) -> String {
+    // Suggest only against named candidates (universal tokens + per-
+    // dataset variable names). Integer QC filters aren't suggestible
+    // — the user either types one correctly or they don't.
+    let candidates: Vec<&str> = UNIVERSAL_DATA_TOKENS
+        .iter()
+        .copied()
+        .chain(config.allowed_data_vars.iter().copied())
+        .collect();
+
+    let suggestion = candidates
+        .iter()
+        .map(|c| (*c, edit_distance(token, c)))
+        .filter(|(_, d)| *d <= 2)
+        .min_by_key(|&(_, d)| d)
+        .map(|(c, _)| c);
+
+    let allowed_list = candidates.join(", ");
+    match suggestion {
+        Some(s) => format!(
+            "Unknown 'data' value '{}'. Did you mean '{}'? Allowed values for this dataset: {} (plus any integer for QC filtering).",
+            token, s, allowed_list
+        ),
+        None => format!(
+            "Unknown 'data' value '{}'. Allowed values for this dataset: {} (plus any integer for QC filtering).",
+            token, allowed_list
+        ),
+    }
+}
+
 /// Enforce the dataset's `max_radius_meters` for `center + radius` queries.
 ///
 /// `center + radius` is the one geo mode that *isn't* spatially tiled
@@ -506,7 +586,120 @@ mod tests {
         max_radius_meters: 1_000_000.0, // 1000 km
         levels: &[0.0],
         coverage_bbox: None,
+        allowed_data_vars: &[],
     };
+
+    /// Test config with a couple of allowed variable names, used by
+    /// the `validate_data_param` tests below.
+    const DATA_TEST_CONFIG: DatasetConfig = DatasetConfig {
+        tile_degrees: 10.0,
+        max_radius_meters: 1_000_000.0,
+        levels: &[0.0],
+        coverage_bbox: None,
+        allowed_data_vars: &["THETA", "SALT"],
+    };
+
+    // ---- validate_data_param --------------------------------------------------
+
+    #[test]
+    fn validate_data_param_noop_when_data_absent() {
+        let params = json!({});
+        assert!(validate_data_param(&params, &DATA_TEST_CONFIG).is_ok());
+    }
+
+    #[test]
+    fn validate_data_param_accepts_universal_tokens() {
+        for token in ["all", "except_data_values"] {
+            let params = json!({ "data": token });
+            assert!(
+                validate_data_param(&params, &DATA_TEST_CONFIG).is_ok(),
+                "universal token '{}' should be accepted",
+                token
+            );
+        }
+    }
+
+    #[test]
+    fn validate_data_param_accepts_per_dataset_var_names() {
+        for token in ["THETA", "SALT"] {
+            let params = json!({ "data": token });
+            assert!(
+                validate_data_param(&params, &DATA_TEST_CONFIG).is_ok(),
+                "allowed var '{}' should be accepted",
+                token
+            );
+        }
+    }
+
+    #[test]
+    fn validate_data_param_accepts_integer_qc_filters() {
+        // Any signed integer should pass; the QC layer (downstream)
+        // interprets the actual value.
+        for token in ["0", "1", "42", "-1", "9999"] {
+            let params = json!({ "data": token });
+            assert!(
+                validate_data_param(&params, &DATA_TEST_CONFIG).is_ok(),
+                "integer token '{}' should be accepted",
+                token
+            );
+        }
+    }
+
+    #[test]
+    fn validate_data_param_accepts_mixed_list() {
+        let params = json!({ "data": "all,THETA,1,SALT" });
+        assert!(validate_data_param(&params, &DATA_TEST_CONFIG).is_ok());
+    }
+
+    #[test]
+    fn validate_data_param_rejects_unknown_var() {
+        let params = json!({ "data": "salinity" });
+        let err = validate_data_param(&params, &DATA_TEST_CONFIG).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn validate_data_param_rejects_unknown_var_in_mixed_list() {
+        // First token is fine, second is the bad one — should still
+        // reject (loops over every token).
+        let params = json!({ "data": "THETA,bogus" });
+        let err = validate_data_param(&params, &DATA_TEST_CONFIG).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn validate_data_param_rejects_empty_token() {
+        // Trailing or doubled commas yield an empty token in the
+        // split — surface that as its own clear error rather than
+        // bouncing through the suggestion path.
+        for raw in ["THETA,", ",THETA", "THETA,,SALT"] {
+            let params = json!({ "data": raw });
+            let err = validate_data_param(&params, &DATA_TEST_CONFIG).unwrap_err();
+            assert_eq!(err.status(), 400);
+        }
+    }
+
+    #[test]
+    fn unknown_data_token_message_includes_suggestion_when_close() {
+        // The single typo here is in the case of the last char; edit
+        // distance 1 → suggest THETA.
+        let msg = unknown_data_token_message("Theta", &DATA_TEST_CONFIG);
+        assert!(
+            msg.contains("Did you mean 'THETA'"),
+            "suggestion missing in: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn unknown_data_token_message_omits_suggestion_when_far() {
+        let msg = unknown_data_token_message("zzzzzzzzzzz", &DATA_TEST_CONFIG);
+        assert!(
+            !msg.contains("Did you mean"),
+            "should not suggest a far-away name: {}",
+            msg
+        );
+    }
 
     #[test]
     fn radius_cap_skipped_when_no_center() {

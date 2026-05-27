@@ -34,8 +34,14 @@ pub trait IsTimeseries {
     fn set_data(&mut self, data: Vec<Vec<f64>>);
     fn timeseries(&mut self) -> Option<&mut Vec<String>>;
     fn set_timeseries(&mut self, timeseries: Vec<String>);
-    fn data_info(&mut self) -> DataInfo;
-    fn set_data_info(&mut self, data_info: DataInfo);
+    /// `data_info` is `Option` because the response carries it only when
+    /// the user's query has *materially altered* the data layout —
+    /// concretely, when the `data=` qsp triggers column filtering. In
+    /// the no-`data=` case `transform_timeseries` writes `None` here so
+    /// the response omits the field, and clients fall back to the
+    /// dataset-wide `data_info` on the meta endpoint.
+    fn data_info(&mut self) -> Option<DataInfo>;
+    fn set_data_info(&mut self, data_info: Option<DataInfo>);
     fn _id(&self) -> String;
     fn longitude(&self) -> f64;
     fn latitude(&self) -> f64;
@@ -73,9 +79,18 @@ pub struct BsoseSchema {
     pub(crate) cell_z_size: f64,
     pub(crate) reference_density_profile: f64,
     pub(crate) data: Vec<Vec<f64>>,
-    // Not present in the source collection — gets populated by transforms.
+    // Both of the next two are response-shape-driven: present iff the
+    // user's query made the dataset-wide default insufficient. Per the
+    // response-shape rule, `data_info` appears only when `data=` qsp
+    // triggered column filtering; `timeseries` appears only when the
+    // user cut the time axis with `startDate` / `endDate`. Both
+    // serialize-absent when None and default to None / empty on
+    // deserialization, so a BSOSE source doc that carries `data_info`
+    // (the per-cell default for BSOSE today) still reads cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) timeseries: Option<Vec<String>>,
-    pub(crate) data_info: DataInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) data_info: Option<DataInfo>,
 }
 
 impl IsTimeseries for BsoseSchema {
@@ -99,11 +114,11 @@ impl IsTimeseries for BsoseSchema {
         self.timeseries = Some(timeseries);
     }
 
-    fn data_info(&mut self) -> DataInfo {
+    fn data_info(&mut self) -> Option<DataInfo> {
         self.data_info.clone()
     }
 
-    fn set_data_info(&mut self, data_info: DataInfo) {
+    fn set_data_info(&mut self, data_info: Option<DataInfo>) {
         self.data_info = data_info;
     }
 
@@ -209,16 +224,16 @@ pub struct OisstSchema {
     pub(crate) level: f64,
     pub(crate) data: Vec<Vec<f64>>,
     // OI SST data docs don't carry `timeseries` or `data_info` of their
-    // own — both are populated at request time. `timeseries` is filled
-    // by `slice_timerange`; `data_info` is stamped from the per-dataset
-    // cached default by `transform_timeseries` (the meta doc holds the
-    // dataset-wide variable info, single-variable for OI SST). Both
-    // default at deserialization so an absent field in the source doc
-    // produces an empty/None value rather than a parse error.
-    #[serde(default)]
+    // own — both are populated at request time per the response-shape
+    // rule. `timeseries` is filled by `slice_timerange` iff the user
+    // set `startDate` / `endDate`; `data_info` is stamped (from the
+    // per-dataset cached default) by `transform_timeseries` iff the
+    // user set `data=`. Both serialize-absent when None and default to
+    // None on deserialization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) timeseries: Option<Vec<String>>,
-    #[serde(default)]
-    pub(crate) data_info: DataInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) data_info: Option<DataInfo>,
 }
 
 impl IsTimeseries for OisstSchema {
@@ -242,11 +257,11 @@ impl IsTimeseries for OisstSchema {
         self.timeseries = Some(timeseries);
     }
 
-    fn data_info(&mut self) -> DataInfo {
+    fn data_info(&mut self) -> Option<DataInfo> {
         self.data_info.clone()
     }
 
-    fn set_data_info(&mut self, data_info: DataInfo) {
+    fn set_data_info(&mut self, data_info: Option<DataInfo>) {
         self.data_info = data_info;
     }
 

@@ -197,7 +197,24 @@ MONGODB_URI_NOAAOISST=mongodb://localhost:27017 \
   cargo run
 ```
 
-### `data_info` precedence rule
+### Response-shape rule for `data_info` and `timeseries`
+
+The fields `data_info` and `timeseries` on a response doc appear *only
+when the user's query has materially altered the dataset-wide defaults*:
+
+- `data_info` appears iff the user supplied `data=`. Without `data=`,
+  the column layout matches the dataset default and the field is
+  omitted (clients fall back to the meta endpoint).
+- `timeseries` appears iff the user supplied `startDate` or `endDate`.
+  Without either, the time axis matches the dataset default and the
+  field is omitted.
+
+The intent is response slimness: the data response carries only what
+*differs* from the meta endpoint's dataset-wide values. With both
+qsps unset, response docs are short (just `_id`, geolocation, level,
+metadata, and an empty `data` array).
+
+### `data_info` precedence rule (when `data=` is set)
 
 `data_info` (variable names, units, per-variable descriptors) may
 appear on either the data doc, the meta doc, or both:

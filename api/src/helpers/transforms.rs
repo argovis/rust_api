@@ -74,7 +74,27 @@ pub fn transform_timeseries<T: schema::IsTimeseries>(
         .unwrap_or_else(|| cached_data_info.clone());
     doc.set_data_info(Some(working_info.clone()));
 
-    slice_data(&data, &working_info, doc)
+    let mut sliced = slice_data(&data, &working_info, doc)?;
+
+    // Drop-on-empty: when the user asked for data and the surviving
+    // data is empty — whether the outer Vec is empty (no matching
+    // columns survived) OR the outer is non-empty but every inner is
+    // empty (e.g. a time window that collapsed every column to zero
+    // points) — the doc has nothing useful to convey, so drop it.
+    // `iter().all(|inner| inner.is_empty())` returns true for both
+    // shapes (vacuously true on an empty outer), so a single check
+    // covers both.
+    //
+    // Exception: `except_data_values` in the data list is an explicit
+    // "I want the (filtered) data_info but not the values" signal, so
+    // an empty data array is what the user asked for, not a sign that
+    // we should drop. Skip the drop check in that case.
+    let user_wants_empty_data = data.iter().any(|s| s == "except_data_values");
+    if !user_wants_empty_data && sliced.data().iter().all(|inner| inner.is_empty()) {
+        return None;
+    }
+
+    Some(sliced)
 }
 
 /// Slice the document's data columns and timeseries field to the time window
@@ -491,6 +511,85 @@ mod tests {
         assert_eq!(info.0, vec!["temp".to_string()]);
         // Without dates, timeseries still absent.
         assert!(out.timeseries().is_none());
+    }
+
+    // ---- drop-on-empty rule (data= set but data ends up empty) --------------
+
+    #[test]
+    fn transform_drops_doc_when_no_matching_columns() {
+        // User asked for a variable that doesn't exist on this doc.
+        // slice_data filters to an empty outer Vec → doc is dropped.
+        let timeseries = ts(&[1, 2]);
+        let doc = make_bsose("doc1", vec![vec![1.0, 2.0]], &["temp"]);
+        let params = json!({"data": "nonexistent"});
+        let out = transform_timeseries(&params, &timeseries, &empty_data_info(), doc);
+        assert!(out.is_none(), "doc with no matching columns should be dropped");
+    }
+
+    #[test]
+    fn transform_drops_doc_when_time_window_collapses_to_empty() {
+        // User asked for a time range past the dataset's last timestamp:
+        // each column survives column-filtering but ends up with zero
+        // time points. The doc has nothing useful to report — drop.
+        let timeseries = ts(&[1, 2, 3]); // Jan, Feb, Mar 2020
+        let doc = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0, 3.0], vec![10.0, 20.0, 30.0]],
+            &["temp", "salinity"],
+        );
+        let params = json!({
+            "data":      "all",
+            "startDate": "2021-01-01T00:00:00Z", // well past the timeseries
+        });
+        let out = transform_timeseries(&params, &timeseries, &empty_data_info(), doc);
+        assert!(
+            out.is_none(),
+            "doc whose time window collapsed to zero points should be dropped"
+        );
+    }
+
+    #[test]
+    fn transform_keeps_doc_with_except_data_values_despite_empty_data() {
+        // `except_data_values` is the user explicitly asking for
+        // "schema only, no values". slice_data clears the data after
+        // column-filtering; the drop-on-empty rule should skip this
+        // case rather than dropping the doc — the empty data was
+        // requested.
+        let timeseries = ts(&[1, 2]);
+        let doc = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            &["temp", "salinity"],
+        );
+        let params = json!({"data": "temp,except_data_values"});
+        let mut out = transform_timeseries(&params, &timeseries, &empty_data_info(), doc)
+            .expect("except_data_values should not trigger drop-on-empty");
+        // Data was deliberately cleared.
+        assert!(out.data().is_empty());
+        // But the filtered data_info still rides along — that's the
+        // whole point of except_data_values.
+        let info = out.data_info().expect("data_info still present");
+        assert_eq!(info.0, vec!["temp".to_string()]);
+    }
+
+    #[test]
+    fn transform_keeps_doc_when_at_least_some_data_remains() {
+        // User asked for a real column with a non-degenerate time
+        // window. The doc should survive.
+        let timeseries = ts(&[1, 2, 3, 4]);
+        let doc = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0, 3.0, 4.0], vec![10.0, 20.0, 30.0, 40.0]],
+            &["temp", "salinity"],
+        );
+        let params = json!({
+            "data":      "temp",
+            "startDate": "2020-02-01T00:00:00Z",
+            "endDate":   "2020-04-01T00:00:00Z",
+        });
+        let mut out = transform_timeseries(&params, &timeseries, &empty_data_info(), doc)
+            .expect("non-empty doc should survive");
+        assert_eq!(*out.data(), vec![vec![2.0, 3.0]]);
     }
 
     // ---- timeseries_stub -----------------------------------------------------

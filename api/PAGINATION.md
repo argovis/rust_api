@@ -95,7 +95,7 @@ antimeridian / north-pole docs aren't lost.
 | `center` + `radius` | JSON `[lon, lat]` + meters | Disk query. Radius capped at the dataset's `max_radius_meters`. |
 | `verticalRange` | JSON `[lo, hi]` | Half-open depth range applied on top of tile-level pagination. |
 | `startDate` / `endDate` | RFC-3339 string | Slices each doc's timeseries to this window. |
-| `data` | comma-separated | Variables to include. `all` keeps everything. `except_data_values` keeps the schema but clears values. |
+| `data` | comma-separated | Variables to include. `all` keeps everything; a specific list filters columns. If the doc has no data to return after filtering (no matching columns, or a time window that collapsed to zero points), the whole doc is dropped from the response. Omitting `data=` entirely also omits the `data` field from each response doc — use that for slim listings. `except_data_values` in the list keeps the row but clears the values (schema-only mode) — that's the one case where an empty `data` array doesn't drop the doc. |
 | `compression` | `minimal` | See mode flags. |
 | `batchmeta` | any | See mode flags. |
 | `tile_index` | non-negative integer | Pagination cursor. Default `0`. Almost always supplied by the previous response's `next_url`. |
@@ -197,11 +197,15 @@ MONGODB_URI_NOAAOISST=mongodb://localhost:27017 \
   cargo run
 ```
 
-### Response-shape rule for `data_info` and `timeseries`
+### Response-shape rules
 
-The fields `data_info` and `timeseries` on a response doc appear *only
-when the user's query has materially altered the dataset-wide defaults*:
+Three fields on a response doc — `data`, `data_info`, `timeseries` —
+appear *only when the user's query has materially asked for or altered
+them*:
 
+- `data` appears iff the user supplied `data=`. Without `data=`,
+  the field is omitted entirely and clients are signalled that they
+  asked for no per-cell values. Use this for slim listings.
 - `data_info` appears iff the user supplied `data=`. Without `data=`,
   the column layout matches the dataset default and the field is
   omitted (clients fall back to the meta endpoint).
@@ -209,10 +213,18 @@ when the user's query has materially altered the dataset-wide defaults*:
   Without either, the time axis matches the dataset default and the
   field is omitted.
 
-The intent is response slimness: the data response carries only what
-*differs* from the meta endpoint's dataset-wide values. With both
-qsps unset, response docs are short (just `_id`, geolocation, level,
-metadata, and an empty `data` array).
+A consequence of the `data` rule: if `data=` *is* supplied but the
+resulting data is empty (no columns survived filtering, or every
+column's time window collapsed to zero points), the whole doc is
+dropped from the response rather than serialized with an empty
+array. This keeps responses honest — a doc in the response always
+carries something the user asked for. The one exception is
+`except_data_values`: when present in the `data=` list, the user has
+explicitly opted into a schema-only response, so an empty `data`
+array is what they asked for and the doc stays.
+
+With all three qsps unset, response docs are short: `_id`,
+geolocation, level, metadata.
 
 ### `data_info` precedence rule (when `data=` is set)
 

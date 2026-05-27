@@ -78,6 +78,12 @@ pub struct BsoseSchema {
     pub(crate) sea_binary_mask_at_t_locaiton: bool,
     pub(crate) cell_z_size: f64,
     pub(crate) reference_density_profile: f64,
+    // `data` is the per-variable per-timestep array. Omitted from the
+    // response when empty so the no-`data=` qsp response stays slim
+    // (transform_timeseries clears it in that branch). When `data=` is
+    // set and `data` ends up empty after filtering, the whole doc gets
+    // dropped before serialization, so an empty array never ships.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) data: Vec<Vec<f64>>,
     // Both of the next two are response-shape-driven: present iff the
     // user's query made the dataset-wide default insufficient. Per the
@@ -222,6 +228,9 @@ pub struct OisstSchema {
     pub(crate) basin: f64,
     pub(crate) geolocation: GeoJSONPoint,
     pub(crate) level: f64,
+    // Omitted from the response when empty (no `data=` qsp); see the
+    // matching annotation on `BsoseSchema.data` for the full reasoning.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) data: Vec<Vec<f64>>,
     // OI SST data docs don't carry `timeseries` or `data_info` of their
     // own — both are populated at request time per the response-shape

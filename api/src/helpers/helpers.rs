@@ -40,7 +40,91 @@ pub fn create_response<T: Serialize>(results: Vec<T>) -> HttpResponse {
     }
 }
 
+/// Whitelist of query-string parameter names recognised by the
+/// `/timeseries/*` endpoints. Any qsp not in this list is rejected with
+/// a 400 so typos (e.g. `start_Date` instead of `startDate`) fail loudly
+/// with a useful suggestion rather than getting silently ignored
+/// downstream. Update this list when adding a new qsp; keep it in sync
+/// with the table in `api/PAGINATION.md`.
+const ALLOWED_QSP: &[&str] = &[
+    "id",
+    "box",
+    "polygon",
+    "center",
+    "radius",
+    "verticalRange",
+    "startDate",
+    "endDate",
+    "data",
+    "compression",
+    "batchmeta",
+    "tile_index",
+];
+
+/// Levenshtein edit distance — used to suggest a "did you mean" target
+/// when a qsp doesn't match the whitelist. Iterative table with O(m*n)
+/// space; m and n are at most ~15 chars in practice (the longest
+/// whitelist entry is `verticalRange`), so this is trivially fast and
+/// not worth optimising into the row-rolling form.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let m = a.len();
+    let n = b.len();
+    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for i in 0..=m {
+        dp[i][0] = i;
+    }
+    for j in 0..=n {
+        dp[0][j] = j;
+    }
+    for i in 1..=m {
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
+        }
+    }
+    dp[m][n]
+}
+
+/// Return the whitelist entry closest to `unknown` if one is within
+/// edit distance 2 — covers common typo flavours (single-char
+/// substitution / deletion / insertion, capitalisation differences)
+/// without firing on totally unrelated names. `None` when nothing is
+/// within range.
+fn suggest_qsp(unknown: &str) -> Option<&'static str> {
+    ALLOWED_QSP
+        .iter()
+        .map(|allowed| (*allowed, edit_distance(unknown, allowed)))
+        .filter(|(_, dist)| *dist <= 2)
+        .min_by_key(|&(_, dist)| dist)
+        .map(|(allowed, _)| allowed)
+}
+
 pub fn validate_query_params(params: &serde_json::Value) -> Result<(), HttpResponse> {
+
+    // Reject unknown qsp names before any further validation so a typo
+    // (e.g. `start_Date` instead of `startDate`) fails loudly with a
+    // useful suggestion rather than getting silently ignored downstream.
+    if let Some(obj) = params.as_object() {
+        for key in obj.keys() {
+            if !ALLOWED_QSP.contains(&key.as_str()) {
+                let msg = match suggest_qsp(key) {
+                    Some(closest) => format!(
+                        "Unknown query parameter '{}'. Did you mean '{}'? Allowed parameters: {}",
+                        key, closest, ALLOWED_QSP.join(", ")
+                    ),
+                    None => format!(
+                        "Unknown query parameter '{}'. Allowed parameters: {}",
+                        key, ALLOWED_QSP.join(", ")
+                    ),
+                };
+                return Err(HttpResponse::BadRequest().json(json!({"error": msg})));
+            }
+        }
+    }
 
     // should have at most one of polygon, box and center.
     let mut count = 0;
@@ -337,6 +421,80 @@ mod tests {
             "endDate":   "2020-12-31T23:59:59Z"
         });
         assert!(validate_query_params(&params).is_ok());
+    }
+
+    // ---- qsp whitelist --------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_unknown_qsp() {
+        let params = json!({"start_Date": "2020-01-01T00:00:00Z"});
+        let err = validate_query_params(&params).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn validate_rejects_unknown_qsp_even_when_other_params_valid() {
+        // A request that's well-formed apart from one stray unknown
+        // param should still be rejected — the whitelist check fires
+        // before any other validation.
+        let params = json!({
+            "box": "[[0,0],[10,10]]",
+            "frobnicate": "yes",
+        });
+        let err = validate_query_params(&params).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn validate_known_qsps_pass_through_whitelist() {
+        // Sanity check: every entry in the whitelist that doesn't have
+        // its own shape constraints should be accepted on its own.
+        // (Constrained params like `polygon` have their own dedicated
+        // tests above; this is purely the whitelist check.)
+        for (key, value) in [
+            ("id", "doc1"),
+            ("data", "all"),
+            ("compression", "minimal"),
+            ("batchmeta", "true"),
+            ("tile_index", "5"),
+            ("startDate", "2020-01-01T00:00:00Z"),
+            ("endDate", "2020-12-31T23:59:59Z"),
+        ] {
+            let params = json!({ key: value });
+            assert!(
+                validate_query_params(&params).is_ok(),
+                "whitelist should accept '{}' but rejected it",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn edit_distance_handles_common_typos() {
+        assert_eq!(edit_distance("startdate", "startDate"), 1); // case-only sub
+        assert_eq!(edit_distance("start_Date", "startDate"), 1); // single extra char
+        assert_eq!(edit_distance("verticalrange", "verticalRange"), 1); // case
+        assert_eq!(edit_distance("Box", "box"), 1);
+        assert_eq!(edit_distance("", "box"), 3); // pure insertion cost
+        assert_eq!(edit_distance("box", "box"), 0);
+        assert!(edit_distance("zzzzzzzzz", "startDate") > 2);
+    }
+
+    #[test]
+    fn suggest_qsp_finds_close_match() {
+        assert_eq!(suggest_qsp("start_Date"), Some("startDate"));
+        assert_eq!(suggest_qsp("startdate"), Some("startDate"));
+        assert_eq!(suggest_qsp("verticalrange"), Some("verticalRange"));
+        assert_eq!(suggest_qsp("Box"), Some("box"));
+    }
+
+    #[test]
+    fn suggest_qsp_returns_none_for_unrelated_input() {
+        // A name with no plausibly close match in the whitelist
+        // should return None rather than reaching for the nearest
+        // entry no matter how far.
+        assert_eq!(suggest_qsp("frobnicate"), None);
+        assert_eq!(suggest_qsp("xyzzy"), None);
     }
 
     // ---- validate_radius_cap -------------------------------------------------

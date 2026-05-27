@@ -102,6 +102,11 @@ antimeridian / north-pole docs aren't lost.
 
 ## Validation errors (HTTP 400)
 
+- Any query parameter not on the whitelist above. Unknown names are
+  rejected so typos (e.g. `start_Date` instead of `startDate`) fail
+  loudly instead of being silently ignored. When the typo is close to
+  a real param name, the error message includes a "did you mean ..."
+  suggestion.
 - More than one of `polygon` / `box` / `center` set.
 - `center` set without `radius`, or vice versa.
 - `radius` non-numeric, negative, non-finite, or above the dataset's cap.

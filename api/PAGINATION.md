@@ -160,12 +160,42 @@ implements `IsTimeseries`.
    discretisation is non-trivial) in `dataset_config.rs`.
 3. Add `<NAME>_SOURCE: Lazy<Mutex<Option<DatasetSource>>>` in
    `main.rs`, next to the existing dataset statics.
-4. In `main()`, load the source: `let x = load_dataset_source::<M>(...)
-   .await?; *<NAME>_SOURCE.lock().unwrap() = Some(x);`.
+4. In `main()`, gate on the dataset's URI env var and load conditionally:
+   ```
+   let mut enabled_<name> = false;
+   if let Some(client) = dataset_client("MONGODB_URI_<NAME>").await {
+       let x = load_dataset_source::<M>(client, ...).await?;
+       *<NAME>_SOURCE.lock().unwrap() = Some(x);
+       enabled_<name> = true;
+   }
+   ```
 5. Add a 4-line route handler annotated with `#[get("/timeseries/<name>")]`
    that clones the source out of the lock and forwards to
    `serve_timeseries::<S>`.
-6. Register the handler with `.service(<name>_handler)` on the `App`.
+6. Register the handler inside the `App::configure` callback, gated on
+   `enabled_<name>`. A dataset whose URI env var is unset stays
+   unregistered: no route, no startup work, no panic.
+
+### Per-deployment configuration
+
+Each dataset is enabled iff its `MONGODB_URI_<DATASET>` env var is set
+when `main()` runs. URI presence is the enable signal — there's no
+separate `DATASETS=` list to keep in sync. A deployment serving only
+one dataset just sets one env var:
+
+```
+MONGODB_URI_BSOSE=mongodb://bsose-mongo/ cargo run     # BSOSE-only
+MONGODB_URI_NOAAOISST=mongodb://noaa-mongo/ cargo run  # OI SST-only
+```
+
+For local dev / tests where one Mongo serves both, point both env vars
+at the same URI:
+
+```
+MONGODB_URI_BSOSE=mongodb://localhost:27017 \
+MONGODB_URI_NOAAOISST=mongodb://localhost:27017 \
+  cargo run
+```
 
 ### `data_info` precedence rule
 

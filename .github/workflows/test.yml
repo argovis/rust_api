@@ -24,7 +24,13 @@ jobs:
           --health-retries 12
 
     env:
+      # MONGODB_URI is used by the seeder binary. The API itself reads a
+      # per-dataset URI per dataset it serves — URI presence is the enable
+      # signal. Both point at the same Mongo container in CI; in production
+      # each dataset is typically deployed against its own Mongo.
       MONGODB_URI: mongodb://localhost:27017
+      MONGODB_URI_BSOSE: mongodb://localhost:27017
+      MONGODB_URI_NOAAOISST: mongodb://localhost:27017
       API_URL: http://localhost:8080
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1

@@ -1,18 +1,30 @@
 // Integration tests against a live API + MongoDB.
 //
 // Preconditions:
-//   * `cargo run --bin seed_test_db` has been run against the same MongoDB
-//     the API is connected to.
-//   * The API has been (re)started AFTER the seed, so it caches the right
-//     `timeseriesMeta.timeseries` vector at startup.
-//   * API_URL points at the running API (default: http://localhost:8080).
-//   * MONGODB_URI is reachable (default: mongodb://localhost:27017). It is
-//     not used directly by these tests but is read so that misconfigured
-//     environments fail loudly.
+//   * `cargo run --bin seed_test_db` has been run against the MongoDB the
+//     API is connected to. The seeder uses its own `MONGODB_URI` env var
+//     (distinct from the per-dataset URIs the API uses) to know where
+//     to write fixtures.
+//   * The API has been (re)started AFTER the seed, so it caches the
+//     right `timeseriesMeta` documents at startup.
+//   * The API process has per-dataset Mongo URIs set: at minimum
+//     `MONGODB_URI_BSOSE`, and `MONGODB_URI_NOAAOISST` if OI SST tests
+//     are enabled. A dataset whose env var is unset is simply not
+//     served by that deployment.
+//   * `API_URL` points at the running API (default
+//     `http://localhost:8080`). `MONGODB_URI` is read by these tests
+//     only as a sanity-check that the environment is configured;
+//     they don't connect to Mongo themselves.
 //
 // Run with:
-//   API_URL=http://localhost:8080 MONGODB_URI=mongodb://localhost:27017 \
+//   API_URL=http://localhost:8080 \
+//   MONGODB_URI=mongodb://localhost:27017 \
 //     cargo test --test integration -- --test-threads=1
+//
+// And start the API with, e.g. (same Mongo for both datasets locally):
+//   MONGODB_URI_BSOSE=mongodb://localhost:27017 \
+//   MONGODB_URI_NOAAOISST=mongodb://localhost:27017 \
+//     cargo run
 //
 // Every response is the paginated envelope:
 //   { "docs": [...], "next_url": "<rel path?…>" | null, "message": "..." }

@@ -10,15 +10,17 @@
 //! actually lives inside, so we skip probing tiles outside it.
 //!
 //! `DatasetSource` is the sibling struct that names *where* each dataset
-//! lives in Mongo (db, collection, meta collection, meta discriminator)
-//! and carries the startup-loaded metadata (the timeseries axis, the
-//! meta default `data_info`). It can't be `const`/`static` directly
-//! because the metadata fields are loaded from Mongo at runtime; it's
-//! built once in `main()` via `load_dataset_source` and stashed in a
-//! top-level `Lazy<Mutex<Option<DatasetSource>>>` (the same pattern the
-//! existing Mongo `CLIENT` static uses, so we don't drag in new
-//! initialization vocabulary). Handlers clone it out of the lock at the
-//! top of each request, then read its fields as plain owned data.
+//! lives in Mongo (db, collection, meta collection, meta discriminator),
+//! carries the per-dataset `mongodb::Client`, and carries the
+//! startup-loaded metadata (the timeseries axis, the meta default
+//! `data_info`). One `mongodb::Client` per dataset because the deployment
+//! topology may put each dataset in a different Mongo instance (env vars
+//! `MONGODB_URI_<DATASET>` per dataset). It can't be `const`/`static`
+//! directly because the metadata fields are loaded from Mongo at
+//! runtime; it's built once in `main()` via `load_dataset_source` and
+//! stashed in a top-level `Lazy<Mutex<Option<DatasetSource>>>`. Handlers
+//! clone it out of the lock at the top of each request, then read its
+//! fields as plain owned data.
 
 use mongodb::bson::DateTime as BsonDateTime;
 
@@ -55,9 +57,17 @@ pub struct DatasetConfig {
     pub coverage_bbox: Option<BoundingBox>,
 }
 
-/// Per-dataset identity + startup-loaded metadata, built once in `main()`.
+/// Per-dataset identity + Mongo client + startup-loaded metadata, built
+/// once in `main()`.
 ///
-/// The first four fields are the dataset's Mongo identity:
+/// `client` is this dataset's dedicated `mongodb::Client`. Each dataset
+/// gets its own URI (env `MONGODB_URI_<DATASET>`) and its own client —
+/// the deployment topology we expect is "BSOSE deployed against one
+/// Mongo, OI SST against another," so a single shared client doesn't
+/// fit. `mongodb::Client` is internally Arc-backed, so cloning it (and
+/// therefore cloning the whole `DatasetSource`) is cheap.
+///
+/// The next four fields are the dataset's Mongo identity:
 ///   - `db_name` / `collection`: where the data docs live.
 ///   - `meta_collection`: where the metadata doc lives. May or may not be
 ///     shared across datasets; today everything is in `timeseriesMeta`,
@@ -65,13 +75,14 @@ pub struct DatasetConfig {
 ///   - `meta_data_type`: the `data_type` discriminator that selects this
 ///     dataset's meta doc out of `meta_collection`.
 ///
-/// The remaining two fields are values we load *once* at startup from the
+/// The last two fields are values we load *once* at startup from the
 /// meta doc and read on every request. Plain owned types — no cells.
 ///
 /// `Clone` is derived so handlers can copy a `DatasetSource` out of the
 /// `Lazy<Mutex<Option<_>>>` static and use it locally without holding
-/// the mutex across `.await` points. The clone is small (a few KB of
-/// dates plus a few short strings).
+/// the mutex across `.await` points. The clone is cheap: the client is
+/// Arc-backed, identity strings are `&'static str`, and the metadata
+/// fields are a few KB of dates plus a few short strings.
 ///
 /// `data_info` is the *meta-level default* for the dataset. Per the
 /// precedence rule documented on `transforms::transform_timeseries`, a
@@ -82,6 +93,7 @@ pub struct DatasetConfig {
 /// it's still populated, just never consulted.
 #[derive(Clone)]
 pub struct DatasetSource {
+    pub client: mongodb::Client,
     pub db_name: &'static str,
     pub collection: &'static str,
     pub meta_collection: &'static str,

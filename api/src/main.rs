@@ -36,17 +36,22 @@ use serde_json::{json, Value};
 
 use dataset_config::{DatasetConfig, DatasetSource};
 
-static CLIENT: Lazy<Mutex<Option<mongodb::Client>>> = Lazy::new(|| Mutex::new(None));
-
-// Per-dataset source-of-truth: identity strings + values loaded from the
-// dataset's meta doc at startup. Same pattern as CLIENT above — the
-// `Lazy<Mutex<Option<T>>>` is what lets us declare a static that's
-// initialized once, after main() reads the value out of Mongo. Handlers
-// clone the inner DatasetSource out of the lock at the top of each
-// request and use it locally, so the mutex is never held across `.await`.
+// Per-dataset source-of-truth: identity strings + the dataset's Mongo
+// client + values loaded from the dataset's meta doc at startup. The
+// `Lazy<Mutex<Option<T>>>` shape is what lets us declare a static that's
+// initialized once, after main() connects to Mongo and reads the meta
+// doc. Handlers clone the inner DatasetSource out of the lock at the top
+// of each request and use it locally, so the mutex is never held across
+// `.await`.
 //
-// One static per dataset. Adding a new dataset is one more static here
-// plus one more load_dataset_source/ load-and-set block in main().
+// One static per dataset. A dataset is "enabled" iff its
+// `MONGODB_URI_<DATASET>` env var is set; if so, main() loads it and
+// fills this static, and the route handler is registered on the App.
+// If the env var is unset, the static stays `None` and the handler is
+// never registered (no route, no surprises).
+//
+// Adding a new dataset is one more static here plus one more
+// load-and-register block in main() and a route handler above.
 static BSOSE_SOURCE: Lazy<Mutex<Option<DatasetSource>>> = Lazy::new(|| Mutex::new(None));
 static OISST_SOURCE: Lazy<Mutex<Option<DatasetSource>>> = Lazy::new(|| Mutex::new(None));
 
@@ -192,6 +197,7 @@ where
         let options = FindOptions::builder().build();
 
         let mut cursor = match generate_cursor::<S>(
+            &source.client,
             source.db_name,
             source.collection,
             filter,
@@ -238,6 +244,7 @@ where
                 "_id": { "$in": unique_metadata.into_iter().collect::<Vec<_>>() }
             };
             let meta_cursor = match generate_cursor::<Document>(
+                &source.client,
                 source.db_name,
                 source.meta_collection,
                 meta_filter,
@@ -393,17 +400,19 @@ fn next_url_value(
 
 /// Build a `DatasetSource` by reading the dataset's meta doc out of Mongo.
 ///
-/// Called once per dataset at server startup. The four `'static str`
-/// arguments are the dataset's Mongo identity; the resulting struct
-/// bundles those identity strings with the values we read out of the
-/// meta doc (`timeseries`, `data_info`). `main()` then stashes the
-/// returned struct into the dataset's `*_SOURCE` static for handlers
-/// to read on each request.
+/// Called once per dataset at server startup. `client` is the dataset's
+/// dedicated Mongo client (constructed from its `MONGODB_URI_<DATASET>`
+/// env var); the four `'static str` arguments are the dataset's Mongo
+/// identity. The resulting struct bundles the client + identity strings
+/// with the values we read out of the meta doc (`timeseries`,
+/// `data_info`). `main()` then stashes the returned struct into the
+/// dataset's `*_SOURCE` static for handlers to read on each request.
 ///
 /// Panics if the meta doc can't be found or the cursor errors. Both
 /// indicate startup misconfiguration that should fail loudly rather
 /// than serve stale or partial data.
 async fn load_dataset_source<M>(
+    client: mongodb::Client,
     db_name: &'static str,
     collection: &'static str,
     meta_collection: &'static str,
@@ -415,7 +424,7 @@ where
     let filter = mongodb::bson::doc! {"data_type": meta_data_type};
     let options = FindOptions::builder().limit(1).build();
     let mut cursor =
-        generate_cursor::<M>(db_name, meta_collection, filter, Some(options)).await?;
+        generate_cursor::<M>(&client, db_name, meta_collection, filter, Some(options)).await?;
 
     let meta = match cursor.next().await {
         Some(Ok(m)) => m,
@@ -430,6 +439,7 @@ where
     };
 
     Ok(DatasetSource {
+        client,
         db_name,
         collection,
         meta_collection,
@@ -439,59 +449,110 @@ where
     })
 }
 
+/// Read a per-dataset Mongo URI env var (e.g. `MONGODB_URI_BSOSE`) and
+/// build a `mongodb::Client` from it. Returns `Some(client)` if the var
+/// is set and parses cleanly, `None` if the var is unset or empty (the
+/// dataset is simply disabled for this deployment), or panics on a
+/// malformed URI / unreachable Mongo (treated as deployment-config
+/// bugs that should fail loudly at startup).
+async fn dataset_client(env_var: &str) -> Option<mongodb::Client> {
+    let uri = match env::var(env_var) {
+        Ok(u) if !u.is_empty() => u,
+        _ => return None,
+    };
+    let opts = mongodb::options::ClientOptions::parse(&uri)
+        .await
+        .unwrap_or_else(|e| panic!("invalid {}: {}", env_var, e));
+    let client = mongodb::Client::with_options(opts)
+        .unwrap_or_else(|e| panic!("could not build Mongo client for {}: {}", env_var, e));
+    Some(client)
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
 
-    // Initialize the MongoDB client
-    let client_options = mongodb::options::ClientOptions::parse(env::var("MONGODB_URI").unwrap()).await.unwrap();
-    let client = mongodb::Client::with_options(client_options).unwrap();
-    *CLIENT.lock().unwrap() = Some(client);
+    // Each dataset is enabled iff its `MONGODB_URI_<DATASET>` env var is
+    // set. We build a Mongo client per enabled dataset, load its meta
+    // doc into the corresponding `*_SOURCE` static, and record a bool
+    // so the HttpServer factory below knows whether to register the
+    // dataset's route. An unset env var means "this deployment doesn't
+    // serve that dataset" — no load, no route, no surprises.
+    let mut enabled_bsose = false;
+    if let Some(client) = dataset_client("MONGODB_URI_BSOSE").await {
+        let bsose = load_dataset_source::<schema::BsoseMeta>(
+            client,
+            "argo",
+            "bsose",
+            "timeseriesMeta",
+            "BSOSE-profile",
+        )
+        .await
+        .expect("failed to load BSOSE dataset source at startup");
+        *BSOSE_SOURCE.lock().unwrap() = Some(bsose);
+        enabled_bsose = true;
+    }
 
-    // Load each dataset's source-of-truth and stash it in the static for
-    // handlers to read. The Mongo identity strings live here at the call
-    // site — one place per dataset — and the returned struct bundles
-    // them with the values read from the meta doc. Adding a new dataset
-    // is one more load-and-set block here.
-    let bsose = load_dataset_source::<schema::BsoseMeta>(
-        "argo",
-        "bsose",
-        "timeseriesMeta",
-        "BSOSE-profile",
-    )
-    .await
-    .expect("failed to load BSOSE dataset source at startup");
-    *BSOSE_SOURCE.lock().unwrap() = Some(bsose);
+    let mut enabled_oisst = false;
+    if let Some(client) = dataset_client("MONGODB_URI_NOAAOISST").await {
+        let oisst = load_dataset_source::<schema::OisstMeta>(
+            client,
+            "argo",
+            "noaaOIsst",
+            "timeseriesMeta",
+            "noaa-oi-sst-v2-high-res",
+        )
+        .await
+        .expect("failed to load OI SST dataset source at startup");
+        *OISST_SOURCE.lock().unwrap() = Some(oisst);
+        enabled_oisst = true;
+    }
 
-    let oisst = load_dataset_source::<schema::OisstMeta>(
-        "argo",
-        "noaaOIsst",
-        "timeseriesMeta",
-        "noaa-oi-sst-v2-high-res",
-    )
-    .await
-    .expect("failed to load OI SST dataset source at startup");
-    *OISST_SOURCE.lock().unwrap() = Some(oisst);
+    if !enabled_bsose && !enabled_oisst {
+        eprintln!(
+            "warning: no datasets enabled. Set at least one of \
+             MONGODB_URI_BSOSE / MONGODB_URI_NOAAOISST."
+        );
+    } else {
+        println!(
+            "Datasets enabled:{}{}",
+            if enabled_bsose { " bsose" } else { "" },
+            if enabled_oisst { " noaaoisst" } else { "" },
+        );
+    }
 
-    HttpServer::new(|| {
-        App::new()
-            .service(bsose_handler)
-            .service(oisst_handler)
+    // `App::configure` lets us register routes conditionally without
+    // running into the "each `.service(...)` call returns a new App
+    // type" problem.
+    HttpServer::new(move || {
+        App::new().configure(move |cfg| {
+            if enabled_bsose {
+                cfg.service(bsose_handler);
+            }
+            if enabled_oisst {
+                cfg.service(oisst_handler);
+            }
+        })
     })
     .bind(("0.0.0.0", 8080))?
     .run()
     .await
 }
 
-async fn generate_cursor<T: DeserializeOwned>(db_name: &str, collection_name: &str, filter: Document, options: Option<FindOptions>) -> Result<mongodb::Cursor<T>> {
-    let client = {
-        let guard = match CLIENT.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        match guard.as_ref() {
-            Some(client) => client.clone(),
-            None => return Err(mongodb::error::Error::from(std::io::Error::new(std::io::ErrorKind::Other, "Client is None"))),
-        }
-    };
-    client.database(db_name).collection::<T>(collection_name).find(filter, options).await
+/// Thin wrapper around `client.database(...).collection(...).find(...)`.
+/// Takes the Mongo client by reference so callers can keep one client
+/// per dataset (see `DatasetSource::client`) instead of reaching into a
+/// global. The wrapper exists mostly so the call sites read uniformly
+/// across the codebase.
+async fn generate_cursor<T: DeserializeOwned>(
+    client: &mongodb::Client,
+    db_name: &str,
+    collection_name: &str,
+    filter: Document,
+    options: Option<FindOptions>,
+) -> Result<mongodb::Cursor<T>> {
+    client
+        .database(db_name)
+        .collection::<T>(collection_name)
+        .find(filter, options)
+        .await
 }

@@ -107,13 +107,33 @@ pub fn slice_timerange<T: schema::IsTimeseries>(
     ts: &[BsonDateTime],
     doc: &mut T,
 ) {
-    let start_index = start_date
-        .and_then(|sd| ts.iter().position(|&t| t >= sd))
-        .unwrap_or(0);
+    // Match on the Option directly so "no filter" and "filter present but
+    // matches nothing" land at different ends of the axis:
+    //   - `start_date = None`           → start at 0 (no lower bound).
+    //   - `start_date = Some(sd)` and no timestamp is >= sd
+    //     (the filter is past the end of the data) → start at ts.len()
+    //     so the slice collapses to empty rather than degrading to
+    //     "whole range," which a plain `.unwrap_or(0)` would do.
+    // Symmetric reasoning for `end_date`.
+    let start_index = match start_date {
+        None => 0,
+        Some(sd) => ts.iter().position(|&t| t >= sd).unwrap_or(ts.len()),
+    };
+    let end_index = match end_date {
+        None => ts.len(),
+        Some(ed) => ts
+            .iter()
+            .rposition(|&t| t < ed)
+            .map(|i| i + 1)
+            .unwrap_or(0),
+    };
 
-    let end_index = end_date
-        .and_then(|ed| ts.iter().rposition(|&t| t < ed).map(|i| i + 1))
-        .unwrap_or(ts.len());
+    // If the user passed mutually unsatisfiable dates (or startDate is
+    // past everything *and* endDate is before everything), `start_index`
+    // could exceed `end_index` — slicing `[a..b]` with `a > b` panics.
+    // Clamp `end` up to `start` so the slice is always empty rather than
+    // a panic.
+    let end_index = end_index.max(start_index);
 
     let time_window: Vec<String> = ts[start_index..end_index]
         .iter()
@@ -295,6 +315,58 @@ mod tests {
 
         slice_timerange(None, None, &timeseries, &mut doc);
         assert_eq!(*doc.data(), vec![vec![1.0, 2.0, 3.0]]);
+    }
+
+    #[test]
+    fn slice_timerange_startdate_past_everything_yields_empty_range() {
+        // startDate is past the last timestamp — the resulting window
+        // should be empty, not the whole range (which the old
+        // `.unwrap_or(0)` shape gave by accident).
+        let timeseries = ts(&[1, 2, 3]); // Jan, Feb, Mar 2020
+        let mut doc = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0, 3.0]],
+            &["temp"],
+        );
+        let start = helpers::string2bsondate("2021-01-01T00:00:00Z");
+        slice_timerange(start, None, &timeseries, &mut doc);
+        assert!(doc.data()[0].is_empty());
+        assert!(doc.timeseries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn slice_timerange_enddate_before_everything_yields_empty_range() {
+        // endDate is before the first timestamp — the resulting window
+        // should be empty, not the whole range.
+        let timeseries = ts(&[6, 7, 8]); // Jun, Jul, Aug 2020
+        let mut doc = make_bsose(
+            "doc1",
+            vec![vec![6.0, 7.0, 8.0]],
+            &["temp"],
+        );
+        let end = helpers::string2bsondate("2020-01-01T00:00:00Z");
+        slice_timerange(None, end, &timeseries, &mut doc);
+        assert!(doc.data()[0].is_empty());
+        assert!(doc.timeseries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn slice_timerange_mutually_unsatisfiable_dates_collapse_to_empty() {
+        // startDate past the data AND endDate before the data: the
+        // raw indices would be start_index = ts.len(), end_index = 0,
+        // which would panic on the slice. The `end_index.max(start_index)`
+        // clamp keeps this safe (and empty).
+        let timeseries = ts(&[6, 7, 8]);
+        let mut doc = make_bsose(
+            "doc1",
+            vec![vec![6.0, 7.0, 8.0]],
+            &["temp"],
+        );
+        let start = helpers::string2bsondate("2021-01-01T00:00:00Z");
+        let end = helpers::string2bsondate("2019-01-01T00:00:00Z");
+        slice_timerange(start, end, &timeseries, &mut doc);
+        assert!(doc.data()[0].is_empty());
+        assert!(doc.timeseries().unwrap().is_empty());
     }
 
     // ---- slice_data ----------------------------------------------------------

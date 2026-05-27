@@ -91,13 +91,19 @@ fn edit_distance(a: &str, b: &str) -> usize {
 
 /// Return the whitelist entry closest to `unknown` if one is within
 /// edit distance 2 — covers common typo flavours (single-char
-/// substitution / deletion / insertion, capitalisation differences)
-/// without firing on totally unrelated names. `None` when nothing is
-/// within range.
+/// substitution / deletion / insertion) without firing on totally
+/// unrelated names. `None` when nothing is within range.
+///
+/// Distance is computed on the *lowercased* forms of both sides, so a
+/// fully-uppercased typo (`STARTDATE`) or any mixed-case shout still
+/// gets a useful suggestion — case differences between every letter
+/// would otherwise push the distance well past the threshold even
+/// though the user clearly meant the same name.
 fn suggest_qsp(unknown: &str) -> Option<&'static str> {
+    let unknown_lower = unknown.to_lowercase();
     ALLOWED_QSP
         .iter()
-        .map(|allowed| (*allowed, edit_distance(unknown, allowed)))
+        .map(|allowed| (*allowed, edit_distance(&unknown_lower, &allowed.to_lowercase())))
         .filter(|(_, dist)| *dist <= 2)
         .min_by_key(|&(_, dist)| dist)
         .map(|(allowed, _)| allowed)
@@ -248,15 +254,21 @@ fn unknown_data_token_message(token: &str, config: &DatasetConfig) -> String {
     // Suggest only against named candidates (universal tokens + per-
     // dataset variable names). Integer QC filters aren't suggestible
     // — the user either types one correctly or they don't.
+    //
+    // Distance is computed case-insensitively so a user typing `theta`
+    // or `Theta` still gets pointed at `THETA`. Validation itself is
+    // case-sensitive (the user is asked to fix their request), but the
+    // suggestion should be forgiving.
     let candidates: Vec<&str> = UNIVERSAL_DATA_TOKENS
         .iter()
         .copied()
         .chain(config.allowed_data_vars.iter().copied())
         .collect();
 
+    let token_lower = token.to_lowercase();
     let suggestion = candidates
         .iter()
-        .map(|c| (*c, edit_distance(token, c)))
+        .map(|c| (*c, edit_distance(&token_lower, &c.to_lowercase())))
         .filter(|(_, d)| *d <= 2)
         .min_by_key(|&(_, d)| d)
         .map(|(c, _)| c);
@@ -569,6 +581,17 @@ mod tests {
     }
 
     #[test]
+    fn suggest_qsp_is_case_insensitive() {
+        // Fully-uppercased or arbitrarily-cased typos should still get
+        // a useful suggestion — without case-folding, every letter
+        // would count as a substitution and the distance would blow
+        // past the threshold.
+        assert_eq!(suggest_qsp("STARTDATE"), Some("startDate"));
+        assert_eq!(suggest_qsp("StArTdAtE"), Some("startDate"));
+        assert_eq!(suggest_qsp("BOX"), Some("box"));
+    }
+
+    #[test]
     fn suggest_qsp_returns_none_for_unrelated_input() {
         // A name with no plausibly close match in the whitelist
         // should return None rather than reaching for the nearest
@@ -699,6 +722,24 @@ mod tests {
             "should not suggest a far-away name: {}",
             msg
         );
+    }
+
+    #[test]
+    fn unknown_data_token_message_suggestion_is_case_insensitive() {
+        // Fully-lowercased or fully-uppercased typos of a config'd var
+        // should still produce a suggestion pointing at the correctly-
+        // cased original. Without case-folding, every letter mismatch
+        // would be a substitution and the distance would exceed the
+        // threshold for variables like `THETA`.
+        for typo in ["theta", "Theta", "ThEtA"] {
+            let msg = unknown_data_token_message(typo, &DATA_TEST_CONFIG);
+            assert!(
+                msg.contains("Did you mean 'THETA'"),
+                "expected THETA suggestion for '{}', got: {}",
+                typo,
+                msg
+            );
+        }
     }
 
     #[test]

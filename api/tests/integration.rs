@@ -131,13 +131,26 @@ async fn no_filters_returns_all_seeded_documents_across_pages() {
     let docs = get_paged("/timeseries/bsose", &[]).await;
     assert_eq!(docs.len(), 4, "expected all 4 seeded docs across pages");
 
-    // Without `data` set, slice_data clears the data field but keeps rows.
+    // Per the response-shape rule, a request with neither `data=` nor
+    // `startDate`/`endDate` should return slim docs: `data`, `data_info`,
+    // and `timeseries` are all omitted because the user hasn't asked to
+    // see or alter them. Clients fall back to the meta endpoint for the
+    // dataset-wide variable info and time axis.
     for row in &docs {
-        let data = row.get("data").expect("each row should have a data field");
-        let outer = data.as_array().expect("data should be an array");
         assert!(
-            outer.is_empty(),
-            "data should be cleared when `data` query param is absent"
+            row.get("data").is_none(),
+            "`data` field should be absent when no `data` qsp is supplied; got: {:?}",
+            row.get("data")
+        );
+        assert!(
+            row.get("data_info").is_none(),
+            "`data_info` field should be absent when no `data` qsp is supplied; got: {:?}",
+            row.get("data_info")
+        );
+        assert!(
+            row.get("timeseries").is_none(),
+            "`timeseries` field should be absent when no date qsp is supplied; got: {:?}",
+            row.get("timeseries")
         );
     }
 }

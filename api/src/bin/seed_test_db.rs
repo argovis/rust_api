@@ -1,16 +1,17 @@
 // Seeds a MongoDB instance with the test fixtures used by the integration tests.
 //
 // Run before starting the API container so the API picks up the right
-// `timeseriesMeta` document at startup:
+// metadata documents at startup:
 //
 //     MONGODB_URI=mongodb://localhost:27017 cargo run --bin seed_test_db
 //
 // What it does:
-//   * drops the `argo.bsose` and `argo.timeseriesMeta` collections
+//   * drops the `argo.bsose`, `argo.noaaOIsst`, and `argo.timeseriesMeta`
+//     collections
 //   * loads the JSON fixtures embedded at compile time
 //   * converts ISO-8601 strings in known date fields to BSON DateTimes
 //   * inserts the resulting documents
-//   * creates a 2dsphere index on `geolocation` for the bsose collection
+//   * creates a 2dsphere index on `geolocation` for each data collection
 //
 // Date fields in the fixtures are written as ISO-8601 strings to keep the
 // JSON readable; the seeder converts them to BSON DateTimes here, since
@@ -26,6 +27,7 @@ use std::env;
 const TIMESERIES_META_FIXTURE: &str =
     include_str!("../../fixtures/timeseriesMeta.json");
 const BSOSE_FIXTURE: &str = include_str!("../../fixtures/bsose.json");
+const NOAA_OISST_FIXTURE: &str = include_str!("../../fixtures/noaaOIsst.json");
 
 const DB_NAME: &str = "argo";
 
@@ -37,7 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::with_options(opts)?;
     let db = client.database(DB_NAME);
 
-    // timeseriesMeta has BSON dates in two fields
+    // timeseriesMeta carries both BSOSE and OI SST meta docs;
+    // `date_updated_argovis` and `timeseries` are BSON-date fields on both.
     seed_collection(
         &db,
         "timeseriesMeta",
@@ -46,17 +49,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    // bsose has no top-level date fields
-    seed_collection(&db, "bsose", BSOSE_FIXTURE, &[]).await?;
-
-    // Geospatial queries (`$geoWithin`, `$near`) require a 2dsphere index on
-    // the GeoJSON field. MongoDB picks a default index name from the keys.
-    let geo_index = IndexModel::builder()
-        .keys(bson::doc! { "geolocation": "2dsphere" })
-        .build();
-    db.collection::<Document>("bsose")
-        .create_index(geo_index, None)
-        .await?;
+    // Data collections — no top-level date fields. Each gets its own
+    // 2dsphere index on `geolocation` for `$geoWithin` / `$near` queries.
+    for (name, fixture) in [
+        ("bsose", BSOSE_FIXTURE),
+        ("noaaOIsst", NOAA_OISST_FIXTURE),
+    ] {
+        seed_collection(&db, name, fixture, &[]).await?;
+        let geo_index = IndexModel::builder()
+            .keys(bson::doc! { "geolocation": "2dsphere" })
+            .build();
+        db.collection::<Document>(name)
+            .create_index(geo_index, None)
+            .await?;
+    }
 
     println!("Seed complete: {} populated.", DB_NAME);
     Ok(())

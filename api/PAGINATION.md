@@ -95,13 +95,22 @@ antimeridian / north-pole docs aren't lost.
 | `center` + `radius` | JSON `[lon, lat]` + meters | Disk query. Radius capped at the dataset's `max_radius_meters`. |
 | `verticalRange` | JSON `[lo, hi]` | Half-open depth range applied on top of tile-level pagination. |
 | `startDate` / `endDate` | RFC-3339 string | Slices each doc's timeseries to this window. |
-| `data` | comma-separated | Variables to include. `all` keeps everything. `except_data_values` keeps the schema but clears values. |
+| `data` | comma-separated | Variables to include. Each token must be: a dataset-specific variable name (BSOSE: `THETA`, `SALT`; OI SST: `sst`), the universal `all` (keep everything) or `except_data_values` (keep schema, clear values), or an integer (QC filter). Unknown tokens are rejected with a 400 + a "did you mean" suggestion. If the doc has no data to return after filtering (no matching columns, or a time window that collapsed to zero points), the whole doc is dropped from the response. Omitting `data=` entirely also omits the `data` field from each response doc — use that for slim listings. `except_data_values` in the list keeps the row but clears the values (schema-only mode) — that's the one case where an empty `data` array doesn't drop the doc. |
 | `compression` | `minimal` | See mode flags. |
 | `batchmeta` | any | See mode flags. |
 | `tile_index` | non-negative integer | Pagination cursor. Default `0`. Almost always supplied by the previous response's `next_url`. |
 
 ## Validation errors (HTTP 400)
 
+- Any query parameter not on the whitelist above. Unknown names are
+  rejected so typos (e.g. `start_Date` instead of `startDate`) fail
+  loudly instead of being silently ignored. When the typo is close to
+  a real param name, the error message includes a "did you mean ..."
+  suggestion.
+- Any token inside the `data=` list that isn't one of: the dataset's
+  declared variable names, the universal `all` / `except_data_values`,
+  or an integer (QC filter). Suggestions follow the same shape as the
+  qsp-name check.
 - More than one of `polygon` / `box` / `center` set.
 - `center` set without `radius`, or vice versa.
 - `radius` non-numeric, negative, non-finite, or above the dataset's cap.
@@ -131,11 +140,115 @@ antimeridian / north-pole docs aren't lost.
 
 ## Per-dataset configuration
 
-`api/src/helpers/dataset_config.rs` defines a `DatasetConfig` struct
-with the dataset's `tile_degrees`, `max_radius_meters`, the discrete
-`levels` array, and an optional `coverage_bbox`. The BSOSE handler
-binds `BSOSE_CONFIG` directly; adding a new dataset means defining its
-config there and wiring its handler through the same `tile_generator` /
-`filter_composer` machinery. `coverage_bbox: None` for a new dataset
-gives global-walk semantics; setting it to a bounding rectangle tells
-the tile generator to skip everything outside the rectangle.
+Two per-dataset structs sit side by side in `api/src/helpers/dataset_config.rs`:
+
+- **`DatasetConfig`** — *request-size policy*. `tile_degrees` (spatial
+  page size), `max_radius_meters` (cap for `center + radius` queries),
+  `levels` (discrete vertical pages — single-element `&[0.0]` for
+  surface-only datasets like OI SST), and an optional `coverage_bbox`
+  (rectangle the dataset's data lives inside; `None` means walk the
+  whole globe). Declared as a `pub const` per dataset.
+
+- **`DatasetSource`** — *Mongo identity* (`db_name`, `collection`,
+  `meta_collection`, `meta_data_type`) plus the values read once at
+  startup from the meta doc (`timeseries` axis, `data_info` default).
+  Built at runtime by `main()` via `load_dataset_source::<MetaSchema>`
+  and stashed in a `Lazy<Mutex<Option<DatasetSource>>>` static (same
+  pattern as the Mongo `CLIENT` static).
+
+The generic handler `serve_timeseries::<S>` in `main.rs` consumes
+`(&DatasetConfig, &DatasetSource)` plus a schema generic `S` that
+implements `IsTimeseries`.
+
+### Recipe for adding a new dataset
+
+1. Define the data-doc schema (`S`) and meta-doc schema (`M`) in
+   `api/src/helpers/schema.rs`. `S` implements `IsTimeseries`; `M`
+   implements `IsTimeseriesMeta`.
+2. Define `<NAME>_CONFIG: DatasetConfig` (and `<NAME>_LEVELS` if depth
+   discretisation is non-trivial) in `dataset_config.rs`.
+3. Add `<NAME>_SOURCE: Lazy<Mutex<Option<DatasetSource>>>` in
+   `main.rs`, next to the existing dataset statics.
+4. In `main()`, gate on the dataset's URI env var and load conditionally:
+   ```
+   let mut enabled_<name> = false;
+   if let Some(client) = dataset_client("MONGODB_URI_<NAME>").await {
+       let x = load_dataset_source::<M>(client, ...).await?;
+       *<NAME>_SOURCE.lock().unwrap() = Some(x);
+       enabled_<name> = true;
+   }
+   ```
+5. Add a 4-line route handler annotated with `#[get("/timeseries/<name>")]`
+   that clones the source out of the lock and forwards to
+   `serve_timeseries::<S>`.
+6. Register the handler inside the `App::configure` callback, gated on
+   `enabled_<name>`. A dataset whose URI env var is unset stays
+   unregistered: no route, no startup work, no panic.
+
+### Per-deployment configuration
+
+Each dataset is enabled iff its `MONGODB_URI_<DATASET>` env var is set
+when `main()` runs. URI presence is the enable signal — there's no
+separate `DATASETS=` list to keep in sync. A deployment serving only
+one dataset just sets one env var:
+
+```
+MONGODB_URI_BSOSE=mongodb://bsose-mongo/ cargo run     # BSOSE-only
+MONGODB_URI_NOAAOISST=mongodb://noaa-mongo/ cargo run  # OI SST-only
+```
+
+For local dev / tests where one Mongo serves both, point both env vars
+at the same URI:
+
+```
+MONGODB_URI_BSOSE=mongodb://localhost:27017 \
+MONGODB_URI_NOAAOISST=mongodb://localhost:27017 \
+  cargo run
+```
+
+### Response-shape rules
+
+Three fields on a response doc — `data`, `data_info`, `timeseries` —
+appear *only when the user's query has materially asked for or altered
+them*:
+
+- `data` appears iff the user supplied `data=`. Without `data=`,
+  the field is omitted entirely and clients are signalled that they
+  asked for no per-cell values. Use this for slim listings.
+- `data_info` appears iff the user supplied `data=`. Without `data=`,
+  the column layout matches the dataset default and the field is
+  omitted (clients fall back to the meta endpoint).
+- `timeseries` appears iff the user supplied `startDate` or `endDate`.
+  Without either, the time axis matches the dataset default and the
+  field is omitted.
+
+A consequence of the `data` rule: if `data=` *is* supplied but the
+resulting data is empty (no columns survived filtering, or every
+column's time window collapsed to zero points), the whole doc is
+dropped from the response rather than serialized with an empty
+array. This keeps responses honest — a doc in the response always
+carries something the user asked for. The one exception is
+`except_data_values`: when present in the `data=` list, the user has
+explicitly opted into a schema-only response, so an empty `data`
+array is what they asked for and the doc stays.
+
+With all three qsps unset, response docs are short: `_id`,
+geolocation, level, metadata.
+
+### `data_info` precedence rule (when `data=` is set)
+
+`data_info` (variable names, units, per-variable descriptors) may
+appear on either the data doc, the meta doc, or both:
+
+- **Doc-level wins.** If a data doc carries its own non-empty
+  `data_info` (BSOSE today), that's what `slice_data` filters
+  against. The cached meta-level default is ignored.
+- **Cache fallback.** If the data doc has no `data_info` (OI SST: the
+  field lives only on the meta doc), the per-dataset cached default —
+  loaded from the meta doc at startup — is stamped onto the doc
+  before column filtering runs.
+
+The cache for a dataset whose meta doc has no `data_info` is the empty
+tuple, and `transform_timeseries` treats empty as "no default to
+apply". So a dataset can store `data_info` per data doc, per meta doc,
+or per both — the response carries the right thing in each case.

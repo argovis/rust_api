@@ -28,25 +28,118 @@ use std::sync::Mutex;
 use futures::stream::StreamExt;
 use std::env;
 use std::convert::Infallible;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use mongodb::bson::DateTime;
 use std::collections::HashSet;
 use async_stream::stream;
 use serde_json::{json, Value};
 
-static CLIENT: Lazy<Mutex<Option<mongodb::Client>>> = Lazy::new(|| Mutex::new(None));
-static TIMESERIES: Lazy<Mutex<Option<Vec<DateTime>>>> = Lazy::new(|| Mutex::new(None));
+use dataset_config::{DatasetConfig, DatasetSource};
+
+// Per-dataset source-of-truth: identity strings + the dataset's Mongo
+// client + values loaded from the dataset's meta doc at startup. The
+// `Lazy<Mutex<Option<T>>>` shape is what lets us declare a static that's
+// initialized once, after main() connects to Mongo and reads the meta
+// doc. Handlers clone the inner DatasetSource out of the lock at the top
+// of each request and use it locally, so the mutex is never held across
+// `.await`.
+//
+// One static per dataset. A dataset is "enabled" iff its
+// `MONGODB_URI_<DATASET>` env var is set; if so, main() loads it and
+// fills this static, and the route handler is registered on the App.
+// If the env var is unset, the static stays `None` and the handler is
+// never registered (no route, no surprises).
+//
+// Adding a new dataset is one more static here plus one more
+// load-and-register block in main() and a route handler above.
+static BSOSE_SOURCE: Lazy<Mutex<Option<DatasetSource>>> = Lazy::new(|| Mutex::new(None));
+static OISST_SOURCE: Lazy<Mutex<Option<DatasetSource>>> = Lazy::new(|| Mutex::new(None));
+
+// ---- route handlers --------------------------------------------------------
+//
+// Each dataset gets its own one-route handler that resolves the dataset
+// generic and hands off to `serve_timeseries`. Keeps Actix's `#[get(...)]`
+// attribute discoverable per-dataset and lets the routing table grow
+// without touching the generic core. Adding a new dataset is: define its
+// `*_CONFIG` in `dataset_config.rs`, define its schema + meta in
+// `schema.rs`, add a `*_SOURCE` static + a `load_dataset_source` call
+// in `main()`, and add a 4-line handler here.
 
 #[get("/timeseries/bsose")]
-async fn search_data_schema(
+async fn bsose_handler(
     req: HttpRequest,
     query_params: web::Query<serde_json::Value>,
 ) -> impl Responder {
-    let params = query_params.into_inner();
+    // Snapshot the source out of the lock before any `.await`. Holding
+    // the mutex guard across an await would let other tasks on the same
+    // worker deadlock on it, so the idiom is "lock, clone, unlock, then
+    // do async work with the local copy."
+    let source = BSOSE_SOURCE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("BSOSE_SOURCE not initialized at startup")
+        .clone();
 
-    // Dataset-specific request-size policy: tile size, level set, radius cap.
-    let config = &dataset_config::BSOSE_CONFIG;
+    serve_timeseries::<schema::BsoseSchema>(
+        req,
+        query_params.into_inner(),
+        &dataset_config::BSOSE_CONFIG,
+        &source,
+    )
+    .await
+}
 
+#[get("/timeseries/noaaoisst")]
+async fn oisst_handler(
+    req: HttpRequest,
+    query_params: web::Query<serde_json::Value>,
+) -> impl Responder {
+    let source = OISST_SOURCE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("OISST_SOURCE not initialized at startup")
+        .clone();
+
+    serve_timeseries::<schema::OisstSchema>(
+        req,
+        query_params.into_inner(),
+        &dataset_config::OISST_CONFIG,
+        &source,
+    )
+    .await
+}
+
+// ---- generic timeseries handler --------------------------------------------
+
+/// Generic body of the `/timeseries/{dataset}` endpoint. Parameterized by
+/// `S`, the per-dataset data-doc schema (e.g. `BsoseSchema`). The dataset's
+/// request-size policy comes in as `config` (tile size, level set, radius
+/// cap, coverage); its Mongo identity and startup caches come in as
+/// `source` (db/collection names, the cached `timeseries` axis and the
+/// cached meta-level `data_info` default).
+///
+/// Behaviour is the same as the previous BSOSE-specific handler: validate
+/// the query, generate the tile sequence, then probe-forward through
+/// tiles serving at most one non-empty tile per request. The two branches
+/// (streaming docs vs. `batchmeta` metadata lookup) are unchanged from
+/// the original implementation.
+async fn serve_timeseries<S>(
+    req: HttpRequest,
+    params: serde_json::Value,
+    config: &DatasetConfig,
+    source: &DatasetSource,
+) -> HttpResponse
+where
+    S: schema::IsTimeseries
+        + DeserializeOwned
+        + Serialize
+        + Send
+        + Sync
+        + Unpin
+        + 'static,
+{
     // The next_url we emit on success uses this request's own path, so the
     // generated URL stays correct even if the route is re-mounted later.
     let path = req.path().to_string();
@@ -58,19 +151,25 @@ async fn search_data_schema(
     if let Err(response) = helpers::validate_radius_cap(&params, config) {
         return response;
     }
+    if let Err(response) = helpers::validate_data_param(&params, config) {
+        return response;
+    }
 
     let start_idx = match pagination::parse_tile_index(&params) {
         Ok(i) => i,
         Err(e) => return HttpResponse::BadRequest().json(json!({"error": e})),
     };
 
-    // ---- tile sequence + cached startup data --------------------------
+    // ---- tile sequence + startup-loaded data --------------------------
     let tiles = tile_generator::generate_tiles(&params, config);
 
-    let timeseries = {
-        let ts = TIMESERIES.lock().unwrap();
-        ts.clone().unwrap()
-    };
+    // Clone the cached values out of `source` locally so the streaming
+    // branch can move owned copies into its async generator without
+    // juggling lifetimes — both are small (timeseries is a few KB of
+    // dates; data_info is a few strings), so cloning per request is
+    // cheap relative to the actual query work.
+    let timeseries = source.timeseries.clone();
+    let cached_data_info = source.data_info.clone();
 
     let compression: Option<String> = params
         .get("compression")
@@ -100,8 +199,12 @@ async fn search_data_schema(
         let filter = filter_composer::compose_filter_with_tile(params.clone(), tile, config);
         let options = FindOptions::builder().build();
 
-        let mut cursor = match generate_cursor::<schema::BsoseSchema>(
-            "argo", "bsose", filter, Some(options),
+        let mut cursor = match generate_cursor::<S>(
+            &source.client,
+            source.db_name,
+            source.collection,
+            filter,
+            Some(options),
         )
         .await
         {
@@ -118,11 +221,14 @@ async fn search_data_schema(
             while let Some(result) = cursor.next().await {
                 match result {
                     Ok(doc) => {
-                        if let Some(t) =
-                            transforms::transform_timeseries(&params, &timeseries, doc)
-                        {
-                            for m in t.metadata.iter() {
-                                unique_metadata.insert(m.clone());
+                        if let Some(t) = transforms::transform_timeseries(
+                            &params,
+                            &timeseries,
+                            &cached_data_info,
+                            doc,
+                        ) {
+                            for m in t.metadata().into_iter() {
+                                unique_metadata.insert(m);
                             }
                         }
                     }
@@ -141,7 +247,11 @@ async fn search_data_schema(
                 "_id": { "$in": unique_metadata.into_iter().collect::<Vec<_>>() }
             };
             let meta_cursor = match generate_cursor::<Document>(
-                "argo", "timeseriesMeta", meta_filter, None,
+                &source.client,
+                source.db_name,
+                source.meta_collection,
+                meta_filter,
+                None,
             )
             .await
             {
@@ -165,13 +275,16 @@ async fn search_data_schema(
         // Peek-ahead until we find a doc that survives transformation.
         // If none, advance to the next tile. If found, keep the cursor —
         // we'll continue draining it from inside the response body.
-        let mut first_doc: Option<schema::BsoseSchema> = None;
+        let mut first_doc: Option<S> = None;
         while let Some(result) = cursor.next().await {
             match result {
                 Ok(doc) => {
-                    if let Some(t) =
-                        transforms::transform_timeseries(&params, &timeseries, doc)
-                    {
+                    if let Some(t) = transforms::transform_timeseries(
+                        &params,
+                        &timeseries,
+                        &cached_data_info,
+                        doc,
+                    ) {
                         first_doc = Some(t);
                         break;
                     }
@@ -190,11 +303,13 @@ async fn search_data_schema(
 
         let next_url = next_url_value(&path, &params, tile_idx, tiles.len());
         let page_message = format!("page {}", tile_idx);
-        // Each of these gets moved into the stream! generator. params and
-        // timeseries are needed to transform each subsequent doc; the rest
-        // are emitted at the end of the response.
+        // Each of these gets moved into the stream! generator. params,
+        // timeseries, and the data_info cache are needed to transform
+        // each subsequent doc; the rest are emitted at the end of the
+        // response.
         let params_for_stream = params.clone();
         let ts_for_stream = timeseries.clone();
+        let data_info_for_stream = cached_data_info.clone();
 
         let body = stream! {
             yield Ok::<_, Infallible>(web::Bytes::from_static(b"{\"docs\":["));
@@ -205,7 +320,7 @@ async fn search_data_schema(
                 serde_json::to_vec(&stub).expect("serializing one stub should not fail")
             } else {
                 serde_json::to_vec(&first_doc)
-                    .expect("serializing one bsose doc should not fail")
+                    .expect("serializing a timeseries doc should not fail")
             };
             yield Ok(web::Bytes::from(first_bytes));
 
@@ -213,7 +328,10 @@ async fn search_data_schema(
                 match result {
                     Ok(doc) => {
                         if let Some(t) = transforms::transform_timeseries(
-                            &params_for_stream, &ts_for_stream, doc,
+                            &params_for_stream,
+                            &ts_for_stream,
+                            &data_info_for_stream,
+                            doc,
                         ) {
                             let bytes = if is_minimal {
                                 let stub = transforms::timeseries_stub(&t);
@@ -221,7 +339,7 @@ async fn search_data_schema(
                                     .expect("serializing one stub should not fail")
                             } else {
                                 serde_json::to_vec(&t)
-                                    .expect("serializing one bsose doc should not fail")
+                                    .expect("serializing a timeseries doc should not fail")
                             };
                             yield Ok(web::Bytes::from_static(b","));
                             yield Ok(web::Bytes::from(bytes));
@@ -283,50 +401,161 @@ fn next_url_value(
     }
 }
 
+/// Build a `DatasetSource` by reading the dataset's meta doc out of Mongo.
+///
+/// Called once per dataset at server startup. `client` is the dataset's
+/// dedicated Mongo client (constructed from its `MONGODB_URI_<DATASET>`
+/// env var); the four `'static str` arguments are the dataset's Mongo
+/// identity. The resulting struct bundles the client + identity strings
+/// with the values we read out of the meta doc (`timeseries`,
+/// `data_info`). `main()` then stashes the returned struct into the
+/// dataset's `*_SOURCE` static for handlers to read on each request.
+///
+/// Panics if the meta doc can't be found or the cursor errors. Both
+/// indicate startup misconfiguration that should fail loudly rather
+/// than serve stale or partial data.
+async fn load_dataset_source<M>(
+    client: mongodb::Client,
+    db_name: &'static str,
+    collection: &'static str,
+    meta_collection: &'static str,
+    meta_data_type: &'static str,
+) -> Result<DatasetSource>
+where
+    M: schema::IsTimeseriesMeta + DeserializeOwned + Unpin + Send + Sync,
+{
+    let filter = mongodb::bson::doc! {"data_type": meta_data_type};
+    let options = FindOptions::builder().limit(1).build();
+    let mut cursor =
+        generate_cursor::<M>(&client, db_name, meta_collection, filter, Some(options)).await?;
+
+    let meta = match cursor.next().await {
+        Some(Ok(m)) => m,
+        Some(Err(e)) => panic!(
+            "Error reading meta doc for {}.{} (data_type={}): {}",
+            db_name, meta_collection, meta_data_type, e
+        ),
+        None => panic!(
+            "No meta doc found in {}.{} matching data_type={}",
+            db_name, meta_collection, meta_data_type
+        ),
+    };
+
+    Ok(DatasetSource {
+        client,
+        db_name,
+        collection,
+        meta_collection,
+        meta_data_type,
+        timeseries: meta.timeseries(),
+        data_info: meta.data_info(),
+    })
+}
+
+/// Read a per-dataset Mongo URI env var (e.g. `MONGODB_URI_BSOSE`) and
+/// build a `mongodb::Client` from it. Returns `Some(client)` if the var
+/// is set and parses cleanly, `None` if the var is unset or empty (the
+/// dataset is simply disabled for this deployment), or panics on a
+/// malformed URI / unreachable Mongo (treated as deployment-config
+/// bugs that should fail loudly at startup).
+async fn dataset_client(env_var: &str) -> Option<mongodb::Client> {
+    let uri = match env::var(env_var) {
+        Ok(u) if !u.is_empty() => u,
+        _ => return None,
+    };
+    let opts = mongodb::options::ClientOptions::parse(&uri)
+        .await
+        .unwrap_or_else(|e| panic!("invalid {}: {}", env_var, e));
+    let client = mongodb::Client::with_options(opts)
+        .unwrap_or_else(|e| panic!("could not build Mongo client for {}: {}", env_var, e));
+    Some(client)
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
 
-    // Initialize the MongoDB client
-    let client_options = mongodb::options::ClientOptions::parse(env::var("MONGODB_URI").unwrap()).await.unwrap();
-    let client = mongodb::Client::with_options(client_options).unwrap(); 
-    *CLIENT.lock().unwrap() = Some(client);
-
-    // some generic data useful to have on hand
-    let mut filter = mongodb::bson::doc! {"data_type": "BSOSE-profile"};
-    let mut options = FindOptions::builder().limit(1).build();
-    let mut metacursor = generate_cursor::<schema::BsoseMeta>("argo", "timeseriesMeta", filter, Some(options)).await.unwrap();
-    let mut metadata = Vec::new();
-    while let Some(result) = metacursor.next().await {
-        match result {
-            Ok(document) => {
-                metadata.push(document);
-            },  
-            Err(e) => {
-                eprintln!("Error: {}", e);
-            }
-        }
+    // Each dataset is enabled iff its `MONGODB_URI_<DATASET>` env var is
+    // set. We build a Mongo client per enabled dataset, load its meta
+    // doc into the corresponding `*_SOURCE` static, and record a bool
+    // so the HttpServer factory below knows whether to register the
+    // dataset's route. An unset env var means "this deployment doesn't
+    // serve that dataset" — no load, no route, no surprises.
+    let mut enabled_bsose = false;
+    if let Some(client) = dataset_client("MONGODB_URI_BSOSE").await {
+        let bsose = load_dataset_source::<schema::BsoseMeta>(
+            client,
+            "argo",
+            "bsose",
+            "timeseriesMeta",
+            "BSOSE-profile",
+        )
+        .await
+        .expect("failed to load BSOSE dataset source at startup");
+        *BSOSE_SOURCE.lock().unwrap() = Some(bsose);
+        enabled_bsose = true;
     }
-    *TIMESERIES.lock().unwrap() = Some(metadata[0].timeseries.clone());
 
-    HttpServer::new(|| {
-        App::new()
-            .service(search_data_schema)
+    let mut enabled_oisst = false;
+    if let Some(client) = dataset_client("MONGODB_URI_NOAAOISST").await {
+        let oisst = load_dataset_source::<schema::OisstMeta>(
+            client,
+            "argo",
+            "noaaOIsst",
+            "timeseriesMeta",
+            "noaa-oi-sst-v2-high-res",
+        )
+        .await
+        .expect("failed to load OI SST dataset source at startup");
+        *OISST_SOURCE.lock().unwrap() = Some(oisst);
+        enabled_oisst = true;
+    }
+
+    if !enabled_bsose && !enabled_oisst {
+        eprintln!(
+            "warning: no datasets enabled. Set at least one of \
+             MONGODB_URI_BSOSE / MONGODB_URI_NOAAOISST."
+        );
+    } else {
+        println!(
+            "Datasets enabled:{}{}",
+            if enabled_bsose { " bsose" } else { "" },
+            if enabled_oisst { " noaaoisst" } else { "" },
+        );
+    }
+
+    // `App::configure` lets us register routes conditionally without
+    // running into the "each `.service(...)` call returns a new App
+    // type" problem.
+    HttpServer::new(move || {
+        App::new().configure(move |cfg| {
+            if enabled_bsose {
+                cfg.service(bsose_handler);
+            }
+            if enabled_oisst {
+                cfg.service(oisst_handler);
+            }
+        })
     })
     .bind(("0.0.0.0", 8080))?
     .run()
     .await
 }
 
-async fn generate_cursor<T: DeserializeOwned>(db_name: &str, collection_name: &str, filter: Document, options: Option<FindOptions>) -> Result<mongodb::Cursor<T>> {
-    let client = {
-        let guard = match CLIENT.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        match guard.as_ref() {
-            Some(client) => client.clone(),
-            None => return Err(mongodb::error::Error::from(std::io::Error::new(std::io::ErrorKind::Other, "Client is None"))),
-        }
-    };
-    client.database(db_name).collection::<T>(collection_name).find(filter, options).await
+/// Thin wrapper around `client.database(...).collection(...).find(...)`.
+/// Takes the Mongo client by reference so callers can keep one client
+/// per dataset (see `DatasetSource::client`) instead of reaching into a
+/// global. The wrapper exists mostly so the call sites read uniformly
+/// across the codebase.
+async fn generate_cursor<T: DeserializeOwned>(
+    client: &mongodb::Client,
+    db_name: &str,
+    collection_name: &str,
+    filter: Document,
+    options: Option<FindOptions>,
+) -> Result<mongodb::Cursor<T>> {
+    client
+        .database(db_name)
+        .collection::<T>(collection_name)
+        .find(filter, options)
+        .await
 }

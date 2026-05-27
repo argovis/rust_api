@@ -1,0 +1,42 @@
+[
+  {
+    "_id": "noaaoisst_doc_001",
+    "metadata": ["noaa-oi-sst-v2-high-res"],
+    "basin": 1.0,
+    "geolocation": { "type": "Point", "coordinates": [20.0, -50.0] },
+    "level": 0.0,
+    "data": [
+      [10.1, 11.2, 12.3, 13.4]
+    ]
+  },
+  {
+    "_id": "noaaoisst_doc_002",
+    "metadata": ["noaa-oi-sst-v2-high-res"],
+    "basin": 1.0,
+    "geolocation": { "type": "Point", "coordinates": [40.0, -40.0] },
+    "level": 0.0,
+    "data": [
+      [15.0, 16.0, 17.0, 18.0]
+    ]
+  },
+  {
+    "_id": "noaaoisst_doc_003",
+    "metadata": ["noaa-oi-sst-v2-high-res"],
+    "basin": 2.0,
+    "geolocation": { "type": "Point", "coordinates": [-170.0, -55.0] },
+    "level": 0.0,
+    "data": [
+      [-1.0, 0.0, 1.0, 2.0]
+    ]
+  },
+  {
+    "_id": "noaaoisst_doc_004",
+    "metadata": ["noaa-oi-sst-v2-high-res"],
+    "basin": 1.0,
+    "geolocation": { "type": "Point", "coordinates": [0.0, 45.0] },
+    "level": 0.0,
+    "data": [
+      [12.5, 13.5, 14.5, 15.5]
+    ]
+  }
+]

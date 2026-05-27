@@ -40,7 +40,97 @@ pub fn create_response<T: Serialize>(results: Vec<T>) -> HttpResponse {
     }
 }
 
+/// Whitelist of query-string parameter names recognised by the
+/// `/timeseries/*` endpoints. Any qsp not in this list is rejected with
+/// a 400 so typos (e.g. `start_Date` instead of `startDate`) fail loudly
+/// with a useful suggestion rather than getting silently ignored
+/// downstream. Update this list when adding a new qsp; keep it in sync
+/// with the table in `api/PAGINATION.md`.
+const ALLOWED_QSP: &[&str] = &[
+    "id",
+    "box",
+    "polygon",
+    "center",
+    "radius",
+    "verticalRange",
+    "startDate",
+    "endDate",
+    "data",
+    "compression",
+    "batchmeta",
+    "tile_index",
+];
+
+/// Levenshtein edit distance — used to suggest a "did you mean" target
+/// when a qsp doesn't match the whitelist. Iterative table with O(m*n)
+/// space; m and n are at most ~15 chars in practice (the longest
+/// whitelist entry is `verticalRange`), so this is trivially fast and
+/// not worth optimising into the row-rolling form.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let m = a.len();
+    let n = b.len();
+    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for i in 0..=m {
+        dp[i][0] = i;
+    }
+    for j in 0..=n {
+        dp[0][j] = j;
+    }
+    for i in 1..=m {
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
+        }
+    }
+    dp[m][n]
+}
+
+/// Return the whitelist entry closest to `unknown` if one is within
+/// edit distance 2 — covers common typo flavours (single-char
+/// substitution / deletion / insertion) without firing on totally
+/// unrelated names. `None` when nothing is within range.
+///
+/// Distance is computed on the *lowercased* forms of both sides, so a
+/// fully-uppercased typo (`STARTDATE`) or any mixed-case shout still
+/// gets a useful suggestion — case differences between every letter
+/// would otherwise push the distance well past the threshold even
+/// though the user clearly meant the same name.
+fn suggest_qsp(unknown: &str) -> Option<&'static str> {
+    let unknown_lower = unknown.to_lowercase();
+    ALLOWED_QSP
+        .iter()
+        .map(|allowed| (*allowed, edit_distance(&unknown_lower, &allowed.to_lowercase())))
+        .filter(|(_, dist)| *dist <= 2)
+        .min_by_key(|&(_, dist)| dist)
+        .map(|(allowed, _)| allowed)
+}
+
 pub fn validate_query_params(params: &serde_json::Value) -> Result<(), HttpResponse> {
+
+    // Reject unknown qsp names before any further validation so a typo
+    // (e.g. `start_Date` instead of `startDate`) fails loudly with a
+    // useful suggestion rather than getting silently ignored downstream.
+    if let Some(obj) = params.as_object() {
+        for key in obj.keys() {
+            if !ALLOWED_QSP.contains(&key.as_str()) {
+                let msg = match suggest_qsp(key) {
+                    Some(closest) => format!(
+                        "Unknown query parameter '{}'. Did you mean '{}'? Allowed parameters: {}",
+                        key, closest, ALLOWED_QSP.join(", ")
+                    ),
+                    None => format!(
+                        "Unknown query parameter '{}'. Allowed parameters: {}",
+                        key, ALLOWED_QSP.join(", ")
+                    ),
+                };
+                return Err(HttpResponse::BadRequest().json(json!({"error": msg})));
+            }
+        }
+    }
 
     // should have at most one of polygon, box and center.
     let mut count = 0;
@@ -108,6 +198,92 @@ pub fn validate_query_params(params: &serde_json::Value) -> Result<(), HttpRespo
 
     // If all validations pass, return Ok(())
     Ok(())
+}
+
+/// Universal tokens accepted in the `data=` qsp regardless of which
+/// dataset is being queried. `all` and `except_data_values` control
+/// response shape rather than naming a variable; both are documented
+/// in `api/PAGINATION.md`.
+const UNIVERSAL_DATA_TOKENS: &[&str] = &["all", "except_data_values"];
+
+/// Validate the contents of the `data=` qsp against the dataset's
+/// `allowed_data_vars`. Each comma-separated token must be one of:
+///
+///   - a universal token (`all` or `except_data_values`),
+///   - a variable name in `config.allowed_data_vars`, or
+///   - an integer (accepted as a QC filter; the QC system is dataset-
+///     agnostic so any non-negative integer is allowed at this layer).
+///
+/// Anything else returns 400 with a Levenshtein-suggested correction
+/// when one of the named candidates is within edit distance 2.
+///
+/// No-op when the `data=` qsp is absent.
+pub fn validate_data_param(
+    params: &serde_json::Value,
+    config: &DatasetConfig,
+) -> Result<(), HttpResponse> {
+    let raw = match params.get("data").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    for token in raw.split(',') {
+        if token.is_empty() {
+            return Err(HttpResponse::BadRequest().json(json!({
+                "error": "'data' qsp contains an empty token (likely a leading, trailing, or doubled comma)"
+            })));
+        }
+        if UNIVERSAL_DATA_TOKENS.contains(&token) {
+            continue;
+        }
+        if config.allowed_data_vars.contains(&token) {
+            continue;
+        }
+        // Integer QC filter (any signed integer; the QC layer
+        // interprets the value, this layer just gate-keeps the shape).
+        if token.parse::<i64>().is_ok() {
+            continue;
+        }
+        let msg = unknown_data_token_message(token, config);
+        return Err(HttpResponse::BadRequest().json(json!({"error": msg})));
+    }
+    Ok(())
+}
+
+fn unknown_data_token_message(token: &str, config: &DatasetConfig) -> String {
+    // Suggest only against named candidates (universal tokens + per-
+    // dataset variable names). Integer QC filters aren't suggestible
+    // — the user either types one correctly or they don't.
+    //
+    // Distance is computed case-insensitively so a user typing `theta`
+    // or `Theta` still gets pointed at `THETA`. Validation itself is
+    // case-sensitive (the user is asked to fix their request), but the
+    // suggestion should be forgiving.
+    let candidates: Vec<&str> = UNIVERSAL_DATA_TOKENS
+        .iter()
+        .copied()
+        .chain(config.allowed_data_vars.iter().copied())
+        .collect();
+
+    let token_lower = token.to_lowercase();
+    let suggestion = candidates
+        .iter()
+        .map(|c| (*c, edit_distance(&token_lower, &c.to_lowercase())))
+        .filter(|(_, d)| *d <= 2)
+        .min_by_key(|&(_, d)| d)
+        .map(|(c, _)| c);
+
+    let allowed_list = candidates.join(", ");
+    match suggestion {
+        Some(s) => format!(
+            "Unknown 'data' value '{}'. Did you mean '{}'? Allowed values for this dataset: {} (plus any integer for QC filtering).",
+            token, s, allowed_list
+        ),
+        None => format!(
+            "Unknown 'data' value '{}'. Allowed values for this dataset: {} (plus any integer for QC filtering).",
+            token, allowed_list
+        ),
+    }
 }
 
 /// Enforce the dataset's `max_radius_meters` for `center + radius` queries.
@@ -339,6 +515,91 @@ mod tests {
         assert!(validate_query_params(&params).is_ok());
     }
 
+    // ---- qsp whitelist --------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_unknown_qsp() {
+        let params = json!({"start_Date": "2020-01-01T00:00:00Z"});
+        let err = validate_query_params(&params).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn validate_rejects_unknown_qsp_even_when_other_params_valid() {
+        // A request that's well-formed apart from one stray unknown
+        // param should still be rejected — the whitelist check fires
+        // before any other validation.
+        let params = json!({
+            "box": "[[0,0],[10,10]]",
+            "frobnicate": "yes",
+        });
+        let err = validate_query_params(&params).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn validate_known_qsps_pass_through_whitelist() {
+        // Sanity check: every entry in the whitelist that doesn't have
+        // its own shape constraints should be accepted on its own.
+        // (Constrained params like `polygon` have their own dedicated
+        // tests above; this is purely the whitelist check.)
+        for (key, value) in [
+            ("id", "doc1"),
+            ("data", "all"),
+            ("compression", "minimal"),
+            ("batchmeta", "true"),
+            ("tile_index", "5"),
+            ("startDate", "2020-01-01T00:00:00Z"),
+            ("endDate", "2020-12-31T23:59:59Z"),
+        ] {
+            let params = json!({ key: value });
+            assert!(
+                validate_query_params(&params).is_ok(),
+                "whitelist should accept '{}' but rejected it",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn edit_distance_handles_common_typos() {
+        assert_eq!(edit_distance("startdate", "startDate"), 1); // case-only sub
+        assert_eq!(edit_distance("start_Date", "startDate"), 1); // single extra char
+        assert_eq!(edit_distance("verticalrange", "verticalRange"), 1); // case
+        assert_eq!(edit_distance("Box", "box"), 1);
+        assert_eq!(edit_distance("", "box"), 3); // pure insertion cost
+        assert_eq!(edit_distance("box", "box"), 0);
+        assert!(edit_distance("zzzzzzzzz", "startDate") > 2);
+    }
+
+    #[test]
+    fn suggest_qsp_finds_close_match() {
+        assert_eq!(suggest_qsp("start_Date"), Some("startDate"));
+        assert_eq!(suggest_qsp("startdate"), Some("startDate"));
+        assert_eq!(suggest_qsp("verticalrange"), Some("verticalRange"));
+        assert_eq!(suggest_qsp("Box"), Some("box"));
+    }
+
+    #[test]
+    fn suggest_qsp_is_case_insensitive() {
+        // Fully-uppercased or arbitrarily-cased typos should still get
+        // a useful suggestion — without case-folding, every letter
+        // would count as a substitution and the distance would blow
+        // past the threshold.
+        assert_eq!(suggest_qsp("STARTDATE"), Some("startDate"));
+        assert_eq!(suggest_qsp("StArTdAtE"), Some("startDate"));
+        assert_eq!(suggest_qsp("BOX"), Some("box"));
+    }
+
+    #[test]
+    fn suggest_qsp_returns_none_for_unrelated_input() {
+        // A name with no plausibly close match in the whitelist
+        // should return None rather than reaching for the nearest
+        // entry no matter how far.
+        assert_eq!(suggest_qsp("frobnicate"), None);
+        assert_eq!(suggest_qsp("xyzzy"), None);
+    }
+
     // ---- validate_radius_cap -------------------------------------------------
 
     /// Minimal config for radius-cap testing. tile_degrees / levels are
@@ -348,7 +609,138 @@ mod tests {
         max_radius_meters: 1_000_000.0, // 1000 km
         levels: &[0.0],
         coverage_bbox: None,
+        allowed_data_vars: &[],
     };
+
+    /// Test config with a couple of allowed variable names, used by
+    /// the `validate_data_param` tests below.
+    const DATA_TEST_CONFIG: DatasetConfig = DatasetConfig {
+        tile_degrees: 10.0,
+        max_radius_meters: 1_000_000.0,
+        levels: &[0.0],
+        coverage_bbox: None,
+        allowed_data_vars: &["THETA", "SALT"],
+    };
+
+    // ---- validate_data_param --------------------------------------------------
+
+    #[test]
+    fn validate_data_param_noop_when_data_absent() {
+        let params = json!({});
+        assert!(validate_data_param(&params, &DATA_TEST_CONFIG).is_ok());
+    }
+
+    #[test]
+    fn validate_data_param_accepts_universal_tokens() {
+        for token in ["all", "except_data_values"] {
+            let params = json!({ "data": token });
+            assert!(
+                validate_data_param(&params, &DATA_TEST_CONFIG).is_ok(),
+                "universal token '{}' should be accepted",
+                token
+            );
+        }
+    }
+
+    #[test]
+    fn validate_data_param_accepts_per_dataset_var_names() {
+        for token in ["THETA", "SALT"] {
+            let params = json!({ "data": token });
+            assert!(
+                validate_data_param(&params, &DATA_TEST_CONFIG).is_ok(),
+                "allowed var '{}' should be accepted",
+                token
+            );
+        }
+    }
+
+    #[test]
+    fn validate_data_param_accepts_integer_qc_filters() {
+        // Any signed integer should pass; the QC layer (downstream)
+        // interprets the actual value.
+        for token in ["0", "1", "42", "-1", "9999"] {
+            let params = json!({ "data": token });
+            assert!(
+                validate_data_param(&params, &DATA_TEST_CONFIG).is_ok(),
+                "integer token '{}' should be accepted",
+                token
+            );
+        }
+    }
+
+    #[test]
+    fn validate_data_param_accepts_mixed_list() {
+        let params = json!({ "data": "all,THETA,1,SALT" });
+        assert!(validate_data_param(&params, &DATA_TEST_CONFIG).is_ok());
+    }
+
+    #[test]
+    fn validate_data_param_rejects_unknown_var() {
+        let params = json!({ "data": "salinity" });
+        let err = validate_data_param(&params, &DATA_TEST_CONFIG).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn validate_data_param_rejects_unknown_var_in_mixed_list() {
+        // First token is fine, second is the bad one — should still
+        // reject (loops over every token).
+        let params = json!({ "data": "THETA,bogus" });
+        let err = validate_data_param(&params, &DATA_TEST_CONFIG).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn validate_data_param_rejects_empty_token() {
+        // Trailing or doubled commas yield an empty token in the
+        // split — surface that as its own clear error rather than
+        // bouncing through the suggestion path.
+        for raw in ["THETA,", ",THETA", "THETA,,SALT"] {
+            let params = json!({ "data": raw });
+            let err = validate_data_param(&params, &DATA_TEST_CONFIG).unwrap_err();
+            assert_eq!(err.status(), 400);
+        }
+    }
+
+    #[test]
+    fn unknown_data_token_message_includes_suggestion_when_close() {
+        // The single typo here is in the case of the last char; edit
+        // distance 1 → suggest THETA.
+        let msg = unknown_data_token_message("Theta", &DATA_TEST_CONFIG);
+        assert!(
+            msg.contains("Did you mean 'THETA'"),
+            "suggestion missing in: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn unknown_data_token_message_omits_suggestion_when_far() {
+        let msg = unknown_data_token_message("zzzzzzzzzzz", &DATA_TEST_CONFIG);
+        assert!(
+            !msg.contains("Did you mean"),
+            "should not suggest a far-away name: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn unknown_data_token_message_suggestion_is_case_insensitive() {
+        // Fully-lowercased or fully-uppercased typos of a config'd var
+        // should still produce a suggestion pointing at the correctly-
+        // cased original. Without case-folding, every letter mismatch
+        // would be a substitution and the distance would exceed the
+        // threshold for variables like `THETA`.
+        for typo in ["theta", "Theta", "ThEtA"] {
+            let msg = unknown_data_token_message(typo, &DATA_TEST_CONFIG);
+            assert!(
+                msg.contains("Did you mean 'THETA'"),
+                "expected THETA suggestion for '{}', got: {}",
+                typo,
+                msg
+            );
+        }
+    }
 
     #[test]
     fn radius_cap_skipped_when_no_center() {

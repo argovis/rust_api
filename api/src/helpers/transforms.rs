@@ -5,9 +5,38 @@ use mongodb::bson::DateTime as BsonDateTime;
 /// Apply the user's `startDate` / `endDate` / `data` parameters to a single
 /// timeseries document. Returns `None` if the document was filtered out
 /// entirely (e.g. `data=somefield` produced no matching columns).
+///
+/// Response-shape rules enforced here:
+///
+///   - `timeseries` appears on the returned doc *iff* the user supplied
+///     `startDate` or `endDate`. Otherwise the field stays `None`, and
+///     clients fall back to the dataset-wide timeseries on the meta
+///     endpoint. (Mechanically: `slice_timerange` populates the field
+///     only when invoked, which only happens for date-bounded queries.)
+///
+///   - `data_info` appears on the returned doc *iff* the user supplied
+///     `data=`. With `data=` set we materialise the working `data_info`
+///     (see precedence rule below) onto the doc so `slice_data` can
+///     filter, and the resulting filtered `data_info` rides along in
+///     the response. Without `data=`, we scrub `data_info` to `None`
+///     (even if the source doc carried one — the BSOSE case) so the
+///     response stays slim and clients defer to the meta endpoint.
+///
+/// Precedence rule for the working `data_info` when `data=` is set:
+///
+///   - If the data doc carries its own non-empty `data_info` (the BSOSE
+///     case today), it wins; the cached meta-level default is ignored.
+///   - If the data doc has no `data_info` (the OI SST case — single
+///     variable, info kept on the meta doc), the cached default is
+///     stamped onto the doc before `slice_data` runs.
+///
+/// The cache parameter is `&DataInfo` (not `Option`): an empty tuple
+/// is its own "no default" sentinel, so a dataset whose meta doc has
+/// no `data_info` field just lands an empty tuple in the cache.
 pub fn transform_timeseries<T: schema::IsTimeseries>(
     params: &serde_json::Value,
     ts: &[BsonDateTime],
+    cached_data_info: &schema::DataInfo,
     mut doc: T,
 ) -> Option<T> {
     let start_date = params.get("startDate")
@@ -26,7 +55,46 @@ pub fn transform_timeseries<T: schema::IsTimeseries>(
     if start_date.is_some() || end_date.is_some() {
         slice_timerange(start_date, end_date, ts, &mut doc);
     }
-    slice_data(&data, doc)
+
+    if data.is_empty() {
+        // No `data=` qsp. Clear `data` (the historical behaviour for
+        // this code path) and scrub `data_info` so the response omits
+        // it. Clients that need variable info read the meta endpoint.
+        doc.set_data(Vec::new());
+        doc.set_data_info(None);
+        return Some(doc);
+    }
+
+    // `data=` qsp set. Materialise the working `data_info`: doc-level
+    // wins over cache, and an empty (or absent) doc-level value falls
+    // back to the meta-level cached default.
+    let working_info: schema::DataInfo = doc
+        .data_info()
+        .filter(|di| !di.0.is_empty())
+        .unwrap_or_else(|| cached_data_info.clone());
+    doc.set_data_info(Some(working_info.clone()));
+
+    let mut sliced = slice_data(&data, &working_info, doc)?;
+
+    // Drop-on-empty: when the user asked for data and the surviving
+    // data is empty — whether the outer Vec is empty (no matching
+    // columns survived) OR the outer is non-empty but every inner is
+    // empty (e.g. a time window that collapsed every column to zero
+    // points) — the doc has nothing useful to convey, so drop it.
+    // `iter().all(|inner| inner.is_empty())` returns true for both
+    // shapes (vacuously true on an empty outer), so a single check
+    // covers both.
+    //
+    // Exception: `except_data_values` in the data list is an explicit
+    // "I want the (filtered) data_info but not the values" signal, so
+    // an empty data array is what the user asked for, not a sign that
+    // we should drop. Skip the drop check in that case.
+    let user_wants_empty_data = data.iter().any(|s| s == "except_data_values");
+    if !user_wants_empty_data && sliced.data().iter().all(|inner| inner.is_empty()) {
+        return None;
+    }
+
+    Some(sliced)
 }
 
 /// Slice the document's data columns and timeseries field to the time window
@@ -39,13 +107,33 @@ pub fn slice_timerange<T: schema::IsTimeseries>(
     ts: &[BsonDateTime],
     doc: &mut T,
 ) {
-    let start_index = start_date
-        .and_then(|sd| ts.iter().position(|&t| t >= sd))
-        .unwrap_or(0);
+    // Match on the Option directly so "no filter" and "filter present but
+    // matches nothing" land at different ends of the axis:
+    //   - `start_date = None`           → start at 0 (no lower bound).
+    //   - `start_date = Some(sd)` and no timestamp is >= sd
+    //     (the filter is past the end of the data) → start at ts.len()
+    //     so the slice collapses to empty rather than degrading to
+    //     "whole range," which a plain `.unwrap_or(0)` would do.
+    // Symmetric reasoning for `end_date`.
+    let start_index = match start_date {
+        None => 0,
+        Some(sd) => ts.iter().position(|&t| t >= sd).unwrap_or(ts.len()),
+    };
+    let end_index = match end_date {
+        None => ts.len(),
+        Some(ed) => ts
+            .iter()
+            .rposition(|&t| t < ed)
+            .map(|i| i + 1)
+            .unwrap_or(0),
+    };
 
-    let end_index = end_date
-        .and_then(|ed| ts.iter().rposition(|&t| t < ed).map(|i| i + 1))
-        .unwrap_or(ts.len());
+    // If the user passed mutually unsatisfiable dates (or startDate is
+    // past everything *and* endDate is before everything), `start_index`
+    // could exceed `end_index` — slicing `[a..b]` with `a > b` panics.
+    // Clamp `end` up to `start` so the slice is always empty rather than
+    // a panic.
+    let end_index = end_index.max(start_index);
 
     let time_window: Vec<String> = ts[start_index..end_index]
         .iter()
@@ -64,30 +152,32 @@ pub fn slice_timerange<T: schema::IsTimeseries>(
     }
 }
 
-/// Apply the `data=` query parameter to a single document. Behaviour mirrors
-/// the previous Vec-based implementation:
+/// Apply the `data=` query parameter to a single document. Called only
+/// when `data=` was actually supplied — the empty-`data` case is handled
+/// by `transform_timeseries` before getting here.
 ///
-///   - empty `data`: clears the document's `data` field but keeps the row.
-///   - `data` contains "all": leaves everything untouched.
-///   - otherwise: filters the data columns down to the named variables;
-///     returns `None` if no requested variables match (caller drops the row).
-///   - if `data` also contains "except_data_values", clears the data field
-///     after column-filtering, but keeps the row.
+///   - `data` contains "all": leaves data/data_info untouched.
+///   - otherwise: filters the data columns down to the named variables
+///     and writes the filtered `data_info` back onto the doc; returns
+///     `None` if no requested variables match (caller drops the row).
+///   - if `data` also contains "except_data_values", clears the `data`
+///     field after column-filtering, but keeps the row (the filtered
+///     `data_info` is what the caller wanted to see).
+///
+/// `data_info` is passed in as an explicit `&DataInfo` rather than read
+/// off the doc — the caller (`transform_timeseries`) is responsible
+/// for deciding which `data_info` is in effect (doc-level vs cached
+/// meta-level default) and putting it on the doc before calling here.
 pub fn slice_data<T: schema::IsTimeseries>(
     data: &[String],
+    data_info: &schema::DataInfo,
     mut doc: T,
 ) -> Option<T> {
-    if data.is_empty() {
-        doc.set_data(Vec::new());
-        return Some(doc);
-    }
-
     if data.iter().any(|s| s == "all") {
         return Some(doc);
     }
 
     // Specific fields requested — filter columns.
-    let data_info = doc.data_info();
     let indexes: Vec<usize> = data
         .iter()
         .filter_map(|item| data_info.0.iter().position(|x| x == item))
@@ -99,12 +189,12 @@ pub fn slice_data<T: schema::IsTimeseries>(
         .collect();
     doc.set_data(filtered_data);
 
-    let filtered_data_info: (Vec<String>, Vec<String>, Vec<Vec<String>>) = (
+    let filtered_data_info: schema::DataInfo = (
         indexes.iter().filter_map(|&i| data_info.0.get(i).cloned()).collect(),
         data_info.1.clone(),
         indexes.iter().filter_map(|&i| data_info.2.get(i).cloned()).collect(),
     );
-    doc.set_data_info(filtered_data_info);
+    doc.set_data_info(Some(filtered_data_info));
 
     // No matching columns -> caller drops the row.
     if doc.data().is_empty() {
@@ -133,21 +223,33 @@ pub fn timeseries_stub<T: schema::IsTimeseries>(result: &T) -> schema::Timeserie
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::helpers::schema::{BsoseSchema, GeoJSONPoint, IsTimeseries};
+    use crate::helpers::schema::{BsoseSchema, DataInfo, GeoJSONPoint, IsTimeseries};
     use serde_json::json;
 
-    // Helper: construct a BsoseSchema directly. Field-level visibility is
-    // `pub(crate)` so this struct literal works from any test in the crate
-    // and gets compile-time field checking — if a schema field is renamed,
-    // the test stops compiling.
-    fn make_bsose(id: &str, data: Vec<Vec<f64>>, var_names: &[&str]) -> BsoseSchema {
+    // Helper: construct a DataInfo from variable names. Used both inside
+    // `make_bsose` and at slice_data call sites that need to pass an
+    // explicit DataInfo.
+    fn make_data_info(var_names: &[&str]) -> DataInfo {
         let names: Vec<String> = var_names.iter().map(|s| s.to_string()).collect();
         let units = vec!["units".to_string(), "long_name".to_string()];
         let per_var_info: Vec<Vec<String>> = names
             .iter()
             .map(|n| vec!["u".to_string(), n.clone()])
             .collect();
+        (names, units, per_var_info)
+    }
 
+    /// Empty DataInfo sentinel — used as the "no meta-level default" cache
+    /// value in tests that exercise the BSOSE-style doc-level precedence.
+    fn empty_data_info() -> DataInfo {
+        (vec![], vec![], vec![])
+    }
+
+    // Helper: construct a BsoseSchema directly. Field-level visibility is
+    // `pub(crate)` so this struct literal works from any test in the crate
+    // and gets compile-time field checking — if a schema field is renamed,
+    // the test stops compiling.
+    fn make_bsose(id: &str, data: Vec<Vec<f64>>, var_names: &[&str]) -> BsoseSchema {
         BsoseSchema {
             _id: id.to_string(),
             metadata: vec!["meta1".to_string()],
@@ -163,7 +265,7 @@ mod tests {
             reference_density_profile: 1.0,
             data,
             timeseries: None,
-            data_info: (names, units, per_var_info),
+            data_info: Some(make_data_info(var_names)),
         }
     }
 
@@ -215,61 +317,104 @@ mod tests {
         assert_eq!(*doc.data(), vec![vec![1.0, 2.0, 3.0]]);
     }
 
-    // ---- slice_data ----------------------------------------------------------
-
     #[test]
-    fn slice_data_empty_request_drops_data() {
-        let doc = make_bsose(
+    fn slice_timerange_startdate_past_everything_yields_empty_range() {
+        // startDate is past the last timestamp — the resulting window
+        // should be empty, not the whole range (which the old
+        // `.unwrap_or(0)` shape gave by accident).
+        let timeseries = ts(&[1, 2, 3]); // Jan, Feb, Mar 2020
+        let mut doc = make_bsose(
             "doc1",
-            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
-            &["temp", "salinity"],
+            vec![vec![1.0, 2.0, 3.0]],
+            &["temp"],
         );
-        let mut out = slice_data(&[], doc).expect("empty data param keeps the row");
-        assert!(out.data().is_empty());
+        let start = helpers::string2bsondate("2021-01-01T00:00:00Z");
+        slice_timerange(start, None, &timeseries, &mut doc);
+        assert!(doc.data()[0].is_empty());
+        assert!(doc.timeseries().unwrap().is_empty());
     }
 
     #[test]
+    fn slice_timerange_enddate_before_everything_yields_empty_range() {
+        // endDate is before the first timestamp — the resulting window
+        // should be empty, not the whole range.
+        let timeseries = ts(&[6, 7, 8]); // Jun, Jul, Aug 2020
+        let mut doc = make_bsose(
+            "doc1",
+            vec![vec![6.0, 7.0, 8.0]],
+            &["temp"],
+        );
+        let end = helpers::string2bsondate("2020-01-01T00:00:00Z");
+        slice_timerange(None, end, &timeseries, &mut doc);
+        assert!(doc.data()[0].is_empty());
+        assert!(doc.timeseries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn slice_timerange_mutually_unsatisfiable_dates_collapse_to_empty() {
+        // startDate past the data AND endDate before the data: the
+        // raw indices would be start_index = ts.len(), end_index = 0,
+        // which would panic on the slice. The `end_index.max(start_index)`
+        // clamp keeps this safe (and empty).
+        let timeseries = ts(&[6, 7, 8]);
+        let mut doc = make_bsose(
+            "doc1",
+            vec![vec![6.0, 7.0, 8.0]],
+            &["temp"],
+        );
+        let start = helpers::string2bsondate("2021-01-01T00:00:00Z");
+        let end = helpers::string2bsondate("2019-01-01T00:00:00Z");
+        slice_timerange(start, end, &timeseries, &mut doc);
+        assert!(doc.data()[0].is_empty());
+        assert!(doc.timeseries().unwrap().is_empty());
+    }
+
+    // ---- slice_data ----------------------------------------------------------
+    //
+    // `slice_data` is only called from `transform_timeseries` in the
+    // `data=` qsp case, so these tests always supply a non-empty `data`
+    // vector. The empty-data case is exercised through the
+    // `transform_timeseries` tests below.
+
+    #[test]
     fn slice_data_all_keeps_everything() {
+        let info = make_data_info(&["temp", "salinity"]);
         let doc = make_bsose(
             "doc1",
             vec![vec![1.0, 2.0], vec![3.0, 4.0]],
             &["temp", "salinity"],
         );
-        let mut out = slice_data(&["all".to_string()], doc).unwrap();
+        let mut out = slice_data(&["all".to_string()], &info, doc).unwrap();
         assert_eq!(*out.data(), vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
     }
 
     #[test]
     fn slice_data_specific_field_filters_columns() {
+        let info = make_data_info(&["temp", "salinity"]);
         let doc = make_bsose(
             "doc1",
             vec![vec![1.0, 2.0], vec![3.0, 4.0]],
             &["temp", "salinity"],
         );
-        let mut out = slice_data(&["salinity".to_string()], doc).unwrap();
+        let mut out = slice_data(&["salinity".to_string()], &info, doc).unwrap();
         assert_eq!(*out.data(), vec![vec![3.0, 4.0]]);
     }
 
     #[test]
     fn slice_data_unknown_field_drops_result() {
-        let doc = make_bsose(
-            "doc1",
-            vec![vec![1.0, 2.0]],
-            &["temp"],
-        );
-        let out = slice_data(&["nonexistent".to_string()], doc);
+        let info = make_data_info(&["temp"]);
+        let doc = make_bsose("doc1", vec![vec![1.0, 2.0]], &["temp"]);
+        let out = slice_data(&["nonexistent".to_string()], &info, doc);
         assert!(out.is_none(), "no matching columns -> row is dropped");
     }
 
     #[test]
     fn slice_data_except_data_values_clears_after_filtering() {
-        let doc = make_bsose(
-            "doc1",
-            vec![vec![1.0, 2.0]],
-            &["temp"],
-        );
+        let info = make_data_info(&["temp"]);
+        let doc = make_bsose("doc1", vec![vec![1.0, 2.0]], &["temp"]);
         let mut out = slice_data(
             &["temp".to_string(), "except_data_values".to_string()],
+            &info,
             doc,
         )
         .unwrap();
@@ -293,8 +438,230 @@ mod tests {
             "data":      "salinity",
         });
 
-        let mut out = transform_timeseries(&params, &timeseries, doc).unwrap();
+        // Empty cached_data_info — this doc already carries its own
+        // data_info, so the precedence rule means the cache is never
+        // consulted regardless.
+        let mut out = transform_timeseries(&params, &timeseries, &empty_data_info(), doc).unwrap();
         assert_eq!(*out.data(), vec![vec![20.0, 30.0]]);
+    }
+
+    // ---- transform_timeseries: data_info precedence -------------------------
+
+    #[test]
+    fn transform_uses_cached_data_info_when_doc_has_none() {
+        // OI SST-style: the data doc carries no data_info; the meta-level
+        // cache supplies the variable names so slice_data can resolve
+        // `data=sst`.
+        let timeseries = ts(&[1, 2]);
+        let mut doc = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0]],
+            &["sst"], // overridden to None below to simulate an OI SST doc
+        );
+        // Clear the doc's data_info so the cache fallback kicks in.
+        doc.data_info = None;
+
+        let cache: schema::DataInfo = (
+            vec!["sst".to_string()],
+            vec!["units".to_string(), "long_name".to_string()],
+            vec![vec!["degC".to_string(), "SST".to_string()]],
+        );
+
+        let params = json!({"data": "sst"});
+        let mut out =
+            transform_timeseries(&params, &timeseries, &cache, doc).expect("should resolve");
+        // sst column survives.
+        assert_eq!(*out.data(), vec![vec![1.0, 2.0]]);
+        // data_info has been stamped from the cache, then column-filtered
+        // by slice_data — should still list sst.
+        let info = out.data_info().expect("data_info present when data= is set");
+        assert_eq!(info.0, vec!["sst".to_string()]);
+    }
+
+    #[test]
+    fn transform_doc_data_info_wins_over_cache() {
+        // BSOSE-style: the doc has data_info and the cache also has
+        // something (hypothetically). The doc's value should take
+        // precedence — the cache should not overwrite it.
+        let timeseries = ts(&[1, 2]);
+        let doc = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            &["temp", "salinity"],
+        );
+
+        // Cache says "sst" — but doc has temp/salinity. Doc wins; the
+        // request for `data=temp` should resolve against the doc, not
+        // get clobbered by the cache.
+        let cache: schema::DataInfo = (
+            vec!["sst".to_string()],
+            vec!["units".to_string()],
+            vec![vec!["degC".to_string()]],
+        );
+
+        let params = json!({"data": "temp"});
+        let mut out =
+            transform_timeseries(&params, &timeseries, &cache, doc).expect("should resolve");
+        assert_eq!(*out.data(), vec![vec![1.0, 2.0]]);
+        let info = out.data_info().expect("data_info present when data= is set");
+        assert_eq!(info.0, vec!["temp".to_string()]);
+    }
+
+    // ---- response-shape rule: data_info & timeseries omitted unless munged --
+
+    #[test]
+    fn transform_omits_data_info_when_no_data_qsp() {
+        // No `data=` in params: the response doc should carry no
+        // data_info — clients fall back to the meta endpoint.
+        let timeseries = ts(&[1, 2]);
+        let doc = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            &["temp", "salinity"],
+        );
+        let params = json!({}); // no data=, no dates
+        let mut out = transform_timeseries(&params, &timeseries, &empty_data_info(), doc)
+            .expect("doc should survive");
+        assert!(
+            out.data_info().is_none(),
+            "data_info should be absent when data= qsp is unset, got {:?}",
+            out.data_info()
+        );
+        // data field is cleared in the no-data= branch (historical behaviour).
+        assert!(out.data().is_empty());
+    }
+
+    #[test]
+    fn transform_omits_timeseries_when_no_date_qsp() {
+        // No `startDate` / `endDate`: the response doc should carry no
+        // timeseries field — clients fall back to the meta endpoint's
+        // dataset-wide timeseries.
+        let timeseries = ts(&[1, 2]);
+        let doc = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            &["temp", "salinity"],
+        );
+        let params = json!({"data": "all"});
+        let mut out = transform_timeseries(&params, &timeseries, &empty_data_info(), doc)
+            .expect("doc should survive");
+        assert!(
+            out.timeseries().is_none(),
+            "timeseries should be absent when neither startDate nor endDate is set"
+        );
+    }
+
+    #[test]
+    fn transform_includes_timeseries_when_start_date_set() {
+        // startDate alone is enough to trigger timeseries on the response.
+        let timeseries = ts(&[1, 2, 3]);
+        let doc = make_bsose("doc1", vec![vec![1.0, 2.0, 3.0]], &["temp"]);
+        let params = json!({"startDate": "2020-02-01T00:00:00Z"});
+        let mut out = transform_timeseries(&params, &timeseries, &empty_data_info(), doc)
+            .expect("doc should survive");
+        let ts_field = out.timeseries().expect("timeseries present when startDate set");
+        assert_eq!(ts_field.len(), 2);
+        assert!(ts_field[0].starts_with("2020-02-01"));
+        // Without `data=`, data_info still absent.
+        assert!(out.data_info().is_none());
+    }
+
+    #[test]
+    fn transform_includes_data_info_when_data_qsp_set() {
+        // `data=` alone is enough to trigger data_info on the response,
+        // even without date params.
+        let timeseries = ts(&[1, 2]);
+        let doc = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            &["temp", "salinity"],
+        );
+        let params = json!({"data": "temp"});
+        let mut out = transform_timeseries(&params, &timeseries, &empty_data_info(), doc)
+            .expect("doc should survive");
+        let info = out.data_info().expect("data_info present when data= is set");
+        assert_eq!(info.0, vec!["temp".to_string()]);
+        // Without dates, timeseries still absent.
+        assert!(out.timeseries().is_none());
+    }
+
+    // ---- drop-on-empty rule (data= set but data ends up empty) --------------
+
+    #[test]
+    fn transform_drops_doc_when_no_matching_columns() {
+        // User asked for a variable that doesn't exist on this doc.
+        // slice_data filters to an empty outer Vec → doc is dropped.
+        let timeseries = ts(&[1, 2]);
+        let doc = make_bsose("doc1", vec![vec![1.0, 2.0]], &["temp"]);
+        let params = json!({"data": "nonexistent"});
+        let out = transform_timeseries(&params, &timeseries, &empty_data_info(), doc);
+        assert!(out.is_none(), "doc with no matching columns should be dropped");
+    }
+
+    #[test]
+    fn transform_drops_doc_when_time_window_collapses_to_empty() {
+        // User asked for a time range past the dataset's last timestamp:
+        // each column survives column-filtering but ends up with zero
+        // time points. The doc has nothing useful to report — drop.
+        let timeseries = ts(&[1, 2, 3]); // Jan, Feb, Mar 2020
+        let doc = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0, 3.0], vec![10.0, 20.0, 30.0]],
+            &["temp", "salinity"],
+        );
+        let params = json!({
+            "data":      "all",
+            "startDate": "2021-01-01T00:00:00Z", // well past the timeseries
+        });
+        let out = transform_timeseries(&params, &timeseries, &empty_data_info(), doc);
+        assert!(
+            out.is_none(),
+            "doc whose time window collapsed to zero points should be dropped"
+        );
+    }
+
+    #[test]
+    fn transform_keeps_doc_with_except_data_values_despite_empty_data() {
+        // `except_data_values` is the user explicitly asking for
+        // "schema only, no values". slice_data clears the data after
+        // column-filtering; the drop-on-empty rule should skip this
+        // case rather than dropping the doc — the empty data was
+        // requested.
+        let timeseries = ts(&[1, 2]);
+        let doc = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            &["temp", "salinity"],
+        );
+        let params = json!({"data": "temp,except_data_values"});
+        let mut out = transform_timeseries(&params, &timeseries, &empty_data_info(), doc)
+            .expect("except_data_values should not trigger drop-on-empty");
+        // Data was deliberately cleared.
+        assert!(out.data().is_empty());
+        // But the filtered data_info still rides along — that's the
+        // whole point of except_data_values.
+        let info = out.data_info().expect("data_info still present");
+        assert_eq!(info.0, vec!["temp".to_string()]);
+    }
+
+    #[test]
+    fn transform_keeps_doc_when_at_least_some_data_remains() {
+        // User asked for a real column with a non-degenerate time
+        // window. The doc should survive.
+        let timeseries = ts(&[1, 2, 3, 4]);
+        let doc = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0, 3.0, 4.0], vec![10.0, 20.0, 30.0, 40.0]],
+            &["temp", "salinity"],
+        );
+        let params = json!({
+            "data":      "temp",
+            "startDate": "2020-02-01T00:00:00Z",
+            "endDate":   "2020-04-01T00:00:00Z",
+        });
+        let mut out = transform_timeseries(&params, &timeseries, &empty_data_info(), doc)
+            .expect("non-empty doc should survive");
+        assert_eq!(*out.data(), vec![vec![2.0, 3.0]]);
     }
 
     // ---- timeseries_stub -----------------------------------------------------

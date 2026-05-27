@@ -1,18 +1,30 @@
 // Integration tests against a live API + MongoDB.
 //
 // Preconditions:
-//   * `cargo run --bin seed_test_db` has been run against the same MongoDB
-//     the API is connected to.
-//   * The API has been (re)started AFTER the seed, so it caches the right
-//     `timeseriesMeta.timeseries` vector at startup.
-//   * API_URL points at the running API (default: http://localhost:8080).
-//   * MONGODB_URI is reachable (default: mongodb://localhost:27017). It is
-//     not used directly by these tests but is read so that misconfigured
-//     environments fail loudly.
+//   * `cargo run --bin seed_test_db` has been run against the MongoDB the
+//     API is connected to. The seeder uses its own `MONGODB_URI` env var
+//     (distinct from the per-dataset URIs the API uses) to know where
+//     to write fixtures.
+//   * The API has been (re)started AFTER the seed, so it caches the
+//     right `timeseriesMeta` documents at startup.
+//   * The API process has per-dataset Mongo URIs set: at minimum
+//     `MONGODB_URI_BSOSE`, and `MONGODB_URI_NOAAOISST` if OI SST tests
+//     are enabled. A dataset whose env var is unset is simply not
+//     served by that deployment.
+//   * `API_URL` points at the running API (default
+//     `http://localhost:8080`). `MONGODB_URI` is read by these tests
+//     only as a sanity-check that the environment is configured;
+//     they don't connect to Mongo themselves.
 //
 // Run with:
-//   API_URL=http://localhost:8080 MONGODB_URI=mongodb://localhost:27017 \
+//   API_URL=http://localhost:8080 \
+//   MONGODB_URI=mongodb://localhost:27017 \
 //     cargo test --test integration -- --test-threads=1
+//
+// And start the API with, e.g. (same Mongo for both datasets locally):
+//   MONGODB_URI_BSOSE=mongodb://localhost:27017 \
+//   MONGODB_URI_NOAAOISST=mongodb://localhost:27017 \
+//     cargo run
 //
 // Every response is the paginated envelope:
 //   { "docs": [...], "next_url": "<rel path?…>" | null, "message": "..." }
@@ -119,13 +131,26 @@ async fn no_filters_returns_all_seeded_documents_across_pages() {
     let docs = get_paged("/timeseries/bsose", &[]).await;
     assert_eq!(docs.len(), 4, "expected all 4 seeded docs across pages");
 
-    // Without `data` set, slice_data clears the data field but keeps rows.
+    // Per the response-shape rule, a request with neither `data=` nor
+    // `startDate`/`endDate` should return slim docs: `data`, `data_info`,
+    // and `timeseries` are all omitted because the user hasn't asked to
+    // see or alter them. Clients fall back to the meta endpoint for the
+    // dataset-wide variable info and time axis.
     for row in &docs {
-        let data = row.get("data").expect("each row should have a data field");
-        let outer = data.as_array().expect("data should be an array");
         assert!(
-            outer.is_empty(),
-            "data should be cleared when `data` query param is absent"
+            row.get("data").is_none(),
+            "`data` field should be absent when no `data` qsp is supplied; got: {:?}",
+            row.get("data")
+        );
+        assert!(
+            row.get("data_info").is_none(),
+            "`data_info` field should be absent when no `data` qsp is supplied; got: {:?}",
+            row.get("data_info")
+        );
+        assert!(
+            row.get("timeseries").is_none(),
+            "`timeseries` field should be absent when no date qsp is supplied; got: {:?}",
+            row.get("timeseries")
         );
     }
 }
@@ -150,16 +175,46 @@ async fn data_all_returns_full_timeseries_across_pages() {
 
 #[tokio::test]
 async fn data_specific_field_filters_columns_across_pages() {
-    let docs = get_paged("/timeseries/bsose", &[("data", "salinity")]).await;
+    let docs = get_paged("/timeseries/bsose", &[("data", "SALT")]).await;
     assert!(!docs.is_empty());
     for row in &docs {
         let names = &row["data_info"][0];
         assert_eq!(
             names.as_array().unwrap(),
-            &vec![Value::String("salinity".to_string())]
+            &vec![Value::String("SALT".to_string())]
         );
         assert_eq!(row["data"].as_array().unwrap().len(), 1);
     }
+}
+
+#[tokio::test]
+async fn unknown_data_value_returns_400() {
+    // `salinity` was the old BSOSE variable name; the production names
+    // are THETA/SALT. The whitelist should reject the typo with a
+    // suggestion that includes the right name.
+    let resp = get("/timeseries/bsose", &[("data", "salinity")]).await;
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn integer_data_value_accepted_as_qc_filter() {
+    // Integers in the data= list are accepted as QC filters at the
+    // validation layer, regardless of whether the dataset has any
+    // matching column. `1,SALT` should not 400.
+    let body = get_envelope(
+        "/timeseries/bsose",
+        &[("id", "bsose_doc_001"), ("data", "1,SALT")],
+    )
+    .await;
+    let docs = body["docs"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    // SALT survives column-filtering; the `1` is silently dropped by
+    // slice_data (no matching variable name) but accepted by validation.
+    let names = &docs[0]["data_info"][0];
+    assert_eq!(
+        names.as_array().unwrap(),
+        &vec![Value::String("SALT".to_string())]
+    );
 }
 
 // ---------------------------------------------------------------------------

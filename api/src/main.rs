@@ -54,6 +54,7 @@ use dataset_config::{DatasetConfig, DatasetSource};
 // load-and-register block in main() and a route handler above.
 static BSOSE_SOURCE: Lazy<Mutex<Option<DatasetSource>>> = Lazy::new(|| Mutex::new(None));
 static OISST_SOURCE: Lazy<Mutex<Option<DatasetSource>>> = Lazy::new(|| Mutex::new(None));
+static COPERNICUSSLA_SOURCE: Lazy<Mutex<Option<DatasetSource>>> = Lazy::new(|| Mutex::new(None));
 
 // ---- route handlers --------------------------------------------------------
 //
@@ -106,6 +107,27 @@ async fn oisst_handler(
         req,
         query_params.into_inner(),
         &dataset_config::OISST_CONFIG,
+        &source,
+    )
+    .await
+}
+
+#[get("/timeseries/copernicussla")]
+async fn copernicussla_handler(
+    req: HttpRequest,
+    query_params: web::Query<serde_json::Value>,
+) -> impl Responder {
+    let source = COPERNICUSSLA_SOURCE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("COPERNICUSSLA_SOURCE not initialized at startup")
+        .clone();
+
+    serve_timeseries::<schema::CopernicusSlaSchema>(
+        req,
+        query_params.into_inner(),
+        &dataset_config::COPERNICUSSLA_CONFIG,
         &source,
     )
     .await
@@ -510,16 +532,32 @@ async fn main() -> std::io::Result<()> {
         enabled_oisst = true;
     }
 
-    if !enabled_bsose && !enabled_oisst {
+    let mut enabled_copernicussla = false;
+    if let Some(client) = dataset_client("MONGODB_URI_COPERNICUSSLA").await {
+        let copernicussla = load_dataset_source::<schema::CopernicusSlaMeta>(
+            client,
+            "argo",
+            "copernicusSLA",
+            "timeseriesMeta",
+            "sea_level_anomaly",
+        )
+        .await
+        .expect("failed to load Copernicus SLA dataset source at startup");
+        *COPERNICUSSLA_SOURCE.lock().unwrap() = Some(copernicussla);
+        enabled_copernicussla = true;
+    }
+
+    if !enabled_bsose && !enabled_oisst && !enabled_copernicussla {
         eprintln!(
             "warning: no datasets enabled. Set at least one of \
-             MONGODB_URI_BSOSE / MONGODB_URI_NOAAOISST."
+             MONGODB_URI_BSOSE / MONGODB_URI_NOAAOISST / MONGODB_URI_COPERNICUSSLA."
         );
     } else {
         println!(
-            "Datasets enabled:{}{}",
+            "Datasets enabled:{}{}{}",
             if enabled_bsose { " bsose" } else { "" },
             if enabled_oisst { " noaaoisst" } else { "" },
+            if enabled_copernicussla { " copernicussla" } else { "" },
         );
     }
 
@@ -533,6 +571,9 @@ async fn main() -> std::io::Result<()> {
             }
             if enabled_oisst {
                 cfg.service(oisst_handler);
+            }
+            if enabled_copernicussla {
+                cfg.service(copernicussla_handler);
             }
         })
     })

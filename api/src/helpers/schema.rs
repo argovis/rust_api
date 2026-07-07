@@ -324,6 +324,113 @@ impl IsTimeseriesMeta for OisstMeta {
     }
 }
 
+// copernicus sla /////////////////////////////////////////////////////////////
+
+/// One spatial cell of the Copernicus sea level anomaly grid. Surface-only
+/// (no vertical dimension; `level` is always `0.0`), exactly the OI SST
+/// shape. `data` holds the timeseries per variable — up to six (sla, adt,
+/// ugosa, ugos, vgosa, vgos), ordered per the meta doc's `data_info`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CopernicusSlaSchema {
+    pub(crate) _id: String,
+    // Reachable from main.rs (batchmeta branch reads `metadata()`), so
+    // `pub` for symmetry with the other schemas.
+    pub metadata: Vec<String>,
+    pub(crate) basin: f64,
+    pub(crate) geolocation: GeoJSONPoint,
+    pub(crate) level: f64,
+    // Omitted from the response when empty (no `data=` qsp); see the
+    // matching annotation on `BsoseSchema.data` for the full reasoning.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) data: Vec<Vec<f64>>,
+    // Like OI SST, data docs don't carry `timeseries` or `data_info` of
+    // their own — both are populated at request time per the
+    // response-shape rule (see the annotations on `OisstSchema`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) timeseries: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) data_info: Option<DataInfo>,
+}
+
+impl IsTimeseries for CopernicusSlaSchema {
+    fn get_timeseries(&self) -> bool {
+        return true;
+    }
+
+    fn data(&mut self) -> &mut Vec<Vec<f64>> {
+        &mut self.data
+    }
+
+    fn set_data(&mut self, data: Vec<Vec<f64>>) {
+        self.data = data;
+    }
+
+    fn timeseries(&mut self) -> Option<&mut Vec<String>> {
+        self.timeseries.as_mut()
+    }
+
+    fn set_timeseries(&mut self, timeseries: Vec<String>) {
+        self.timeseries = Some(timeseries);
+    }
+
+    fn data_info(&mut self) -> Option<DataInfo> {
+        self.data_info.clone()
+    }
+
+    fn set_data_info(&mut self, data_info: Option<DataInfo>) {
+        self.data_info = data_info;
+    }
+
+    fn _id(&self) -> String {
+        self._id.clone()
+    }
+
+    fn longitude(&self) -> f64 {
+        self.geolocation.coordinates[0]
+    }
+
+    fn latitude(&self) -> f64 {
+        self.geolocation.coordinates[1]
+    }
+
+    fn level(&self) -> f64 {
+        self.level
+    }
+
+    fn metadata(&self) -> Vec<String> {
+        self.metadata.clone()
+    }
+}
+
+/// Metadata doc for the Copernicus SLA dataset. Same layout as
+/// `OisstMeta` — `data_info` lives here (per-dataset default) rather than
+/// on every data doc, and the `source` / `lattice` substructures follow
+/// the same pipeline conventions, so those structs are reused directly.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CopernicusSlaMeta {
+    pub(crate) _id: String,
+    pub(crate) data_type: String,
+    pub data_info: DataInfo,
+    pub(crate) date_updated_argovis: BsonDateTime,
+    pub timeseries: Vec<BsonDateTime>,
+    pub(crate) source: Vec<OisstSourceMeta>,
+    pub(crate) lattice: Lattice,
+}
+
+impl IsTimeseriesMeta for CopernicusSlaMeta {
+    fn get_timeseries_meta(&self) -> bool {
+        return true;
+    }
+
+    fn timeseries(&self) -> Vec<BsonDateTime> {
+        self.timeseries.clone()
+    }
+
+    fn data_info(&self) -> DataInfo {
+        self.data_info.clone()
+    }
+}
+
 // ///////////////////////////////////////////////////////////////////////////
 
 #[derive(Deserialize, Debug, Clone)]

@@ -160,6 +160,27 @@ pub const OISST_CONFIG: DatasetConfig = DatasetConfig {
     allowed_data_vars: &["sst"],
 };
 
+/// Copernicus SLA is a sea-surface product: like OI SST, a single
+/// vertical level modeled as a one-element levels array of 0.0 so the
+/// tile_generator / filter_composer path works unchanged. See the
+/// comment on `OISST_LEVELS` for the mechanics.
+pub const COPERNICUSSLA_LEVELS: &[f64] = &[0.0];
+
+/// Configuration for the Copernicus sea level anomaly timeseries dataset.
+///
+/// Surface-only, global coverage. Tile size and radius cap deliberately
+/// match OI SST (5° / 100 km) — same uniformity argument, same "relax
+/// once usage informs us" caveat. Six variables: sea level anomaly,
+/// absolute dynamic topography, and the geostrophic velocity components
+/// for each (u/v, anomaly and absolute).
+pub const COPERNICUSSLA_CONFIG: DatasetConfig = DatasetConfig {
+    tile_degrees: 5.0,
+    max_radius_meters: 100_000.0, // 100 km — same starting cap as OI SST
+    levels: COPERNICUSSLA_LEVELS,
+    coverage_bbox: None,
+    allowed_data_vars: &["sla", "adt", "ugosa", "ugos", "vgosa", "vgos"],
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,5 +288,52 @@ mod tests {
     fn oisst_has_global_coverage() {
         // OI SST is global; no coverage_bbox skip available.
         assert!(OISST_CONFIG.coverage_bbox.is_none());
+    }
+
+    // ---- Copernicus SLA config invariants (mirror the OI SST checks) -------
+
+    #[test]
+    fn copernicussla_tile_degrees_is_positive_and_divides_a_hemisphere() {
+        assert!(COPERNICUSSLA_CONFIG.tile_degrees > 0.0);
+        assert!(
+            (180.0_f64 % COPERNICUSSLA_CONFIG.tile_degrees).abs() < 1e-9,
+            "tile_degrees should evenly divide 180° for clean global coverage"
+        );
+        assert!(
+            (360.0_f64 % COPERNICUSSLA_CONFIG.tile_degrees).abs() < 1e-9,
+            "tile_degrees should evenly divide 360° for clean global coverage"
+        );
+    }
+
+    #[test]
+    fn copernicussla_max_radius_is_positive_and_subhemispheric() {
+        assert!(COPERNICUSSLA_CONFIG.max_radius_meters > 0.0);
+        assert!(COPERNICUSSLA_CONFIG.max_radius_meters < 1.0e7);
+    }
+
+    #[test]
+    fn copernicussla_has_exactly_one_surface_level() {
+        // Sea level anomaly is by construction a surface product; the
+        // single-element levels array keeps the tile generator on the
+        // no-special-case path (see OI SST).
+        assert_eq!(COPERNICUSSLA_CONFIG.levels.len(), 1);
+        assert!((COPERNICUSSLA_CONFIG.levels[0] - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn copernicussla_has_global_coverage() {
+        // Altimetry-derived SLA is global; no coverage_bbox skip available.
+        assert!(COPERNICUSSLA_CONFIG.coverage_bbox.is_none());
+    }
+
+    #[test]
+    fn copernicussla_advertises_all_six_variables() {
+        // sla/adt plus u/v geostrophic velocities in anomaly and absolute
+        // flavours. If the upstream product adds or drops a variable this
+        // list (and the meta doc's data_info) must move together.
+        assert_eq!(
+            COPERNICUSSLA_CONFIG.allowed_data_vars,
+            &["sla", "adt", "ugosa", "ugos", "vgosa", "vgos"]
+        );
     }
 }

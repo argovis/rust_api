@@ -33,7 +33,9 @@ use super::schema::DataInfo;
 /// spatial pagination tile.
 ///
 /// `max_radius_meters`: hard upper bound on the `radius` query parameter
-/// for `center + radius` requests. These bypass tile pagination because
+/// for `center + radius` requests. The qsp itself is expressed in km
+/// (2.x API format) and converted at validation; the cap stays in meters
+/// to match Mongo's `$maxDistance`. These bypass tile pagination because
 /// Mongo's `$near` enforces its own bound; we cap the bound so a
 /// malicious or naive caller can't ask for a half-globe disk.
 ///
@@ -54,7 +56,7 @@ use super::schema::DataInfo;
 /// `allowed_data_vars`: the per-dataset variable names accepted in the
 /// `data=` qsp. Used by `validate_data_param` to reject typos (and to
 /// power the "did you mean" suggestion). Does not include the universal
-/// tokens (`all`, `except_data_values`) or integer QC filters —
+/// tokens (`all`, `except-data-values`) or integer QC filters —
 /// those are accepted regardless of dataset and handled by the
 /// validator directly.
 pub struct DatasetConfig {

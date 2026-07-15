@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn user_vertical_range_plus_tile_level_wraps_in_and_and_keeps_both() {
         let f = compose_filter_with_tile(
-            json!({"verticalRange": "[0.0, 1000.0]"}),
+            json!({"verticalRange": "0.0,1000.0"}),
             &TileSpec {
                 tile_bbox: None,
                 level_index: Some(0),

@@ -34,7 +34,7 @@ use serde_json::Value;
 
 use super::dataset_config::DatasetConfig;
 use super::geometry::BoundingBox;
-use super::helpers::validlonlat;
+use super::helpers::{tidy_box, validlonlat};
 
 /// One unit of pagination. Both fields are `Option` because some query
 /// shapes naturally suppress one or the other:
@@ -123,8 +123,10 @@ fn box_tiles(boxregion: &str, config: &DatasetConfig) -> Vec<TileSpec> {
     // Normalize coords into [-180, 180] / [-90, 90] so they match what
     // filters::box_filter sends to Mongo. Without this, out-of-range
     // inputs like lon=181 stay raw here and produce tile bboxes outside
-    // the valid coordinate range, which Mongo then rejects.
-    let parsed = validlonlat(parsed);
+    // the valid coordinate range, which Mongo then rejects. Then apply
+    // the same 2.x-style tidying box_filter does (swap reversed lats)
+    // so tiling and the user filter agree on the box.
+    let parsed = tidy_box(validlonlat(parsed));
     let sw = [parsed[0][0], parsed[0][1]];
     let ne = [parsed[1][0], parsed[1][1]];
 
@@ -149,6 +151,9 @@ fn box_tiles(boxregion: &str, config: &DatasetConfig) -> Vec<TileSpec> {
 
     let mut tiles = Vec::new();
     for bbox in sub_boxes {
+        // No user-geometry sag for boxes ($box is planar), but the tile
+        // grid's own edge sag and NE ownership still need covering.
+        let bbox = pad_bbox_for_tiling(bbox, 0.0, 0.0, config.tile_degrees);
         tiles.extend(grid_aligned_tiles(bbox, config.tile_degrees));
     }
     cross_levels(apply_coverage(tiles, config), config)
@@ -166,8 +171,16 @@ fn polygon_tiles(polygon: &str, config: &DatasetConfig) -> Vec<TileSpec> {
     // genuinely has |lon_diff| > 180°).
     let coords = validlonlat(coords);
 
+    // Mongo evaluates the polygon with geodesic edges, which overshoot
+    // the vertex latitudes poleward; the naive vertex bbox does not
+    // contain that overshoot, so expand it by the analytic sag bound or
+    // docs inside the Mongo polygon would fall in no tile (and thus on
+    // no page).
+    let (south_pad, north_pad) = polygon_sag_padding(&coords);
+
     let mut spatial = Vec::new();
     for bbox in polygon_bboxes(&coords) {
+        let bbox = pad_bbox_for_tiling(bbox, south_pad, north_pad, config.tile_degrees);
         spatial.extend(grid_aligned_tiles(bbox, config.tile_degrees));
     }
     cross_levels(apply_coverage(spatial, config), config)
@@ -301,6 +314,117 @@ fn polygon_bboxes(coords: &[Vec<f64>]) -> Vec<BoundingBox> {
     }
 }
 
+/// Ownership pad for the tiling bbox's north edge: tiles are half-open,
+/// so a doc sitting exactly on the bbox's top grid line is owned by the
+/// row *above* it. Padding the north bound by a hair makes that row
+/// exist. (No equivalent needed at the south bound: half-open ownership
+/// is inclusive at a tile's SW corner.)
+const NE_OWNERSHIP_PAD_DEG: f64 = 1e-6;
+
+/// Maximum poleward latitude overshoot ("sag"), in degrees, of the
+/// geodesic joining two points, beyond the more poleward endpoint.
+///
+/// Mongo's `$geoWithin $geometry` connects polygon vertices with great
+/// circles, and a great circle between two points at latitude φ
+/// separated by Δλ of longitude reaches tan(φ_max) = tan(φ)/cos(Δλ/2) —
+/// poleward of the parallel through the endpoints (≈6° for an 80°-wide
+/// edge at 60°, ≈0.02° for a 5° tile edge). Tiles must cover that
+/// overshoot or docs inside the Mongo polygon fall between pages.
+///
+/// For endpoints at unequal latitudes we bound with the equal-latitude
+/// worst case at max(|lat1|, |lat2|); this can over-pad (extra tiles
+/// are probed and skipped, which is cheap) but never under-pads. Note
+/// the bound is genuinely large for near-antipodal longitudes: an edge
+/// with Δλ = 180° passes over the pole, and the formula says so.
+fn geodesic_sag_deg(lat1: f64, lat2: f64, lon1: f64, lon2: f64) -> f64 {
+    let phi = lat1.abs().max(lat2.abs());
+    if phi <= 0.0 || phi >= 90.0 {
+        return 0.0;
+    }
+    let dlon = {
+        let d = (lon1 - lon2).abs() % 360.0;
+        if d > 180.0 {
+            360.0 - d
+        } else {
+            d
+        }
+    };
+    let cos_half = (dlon / 2.0).to_radians().cos();
+    let phi_max = if cos_half <= 0.0 {
+        90.0
+    } else {
+        (phi.to_radians().tan() / cos_half).atan().to_degrees()
+    };
+    (phi_max - phi).max(0.0)
+}
+
+/// Directional sag padding for a polygon's edges: the max poleward
+/// overshoot southward and northward across all edges, as
+/// `(south_pad, north_pad)` degrees. An edge wholly in one hemisphere
+/// bulges poleward in that hemisphere only; an edge crossing the
+/// equator is charged to both sides (conservative).
+fn polygon_sag_padding(coords: &[Vec<f64>]) -> (f64, f64) {
+    let mut south = 0.0_f64;
+    let mut north = 0.0_f64;
+    for w in coords.windows(2) {
+        if w[0].len() < 2 || w[1].len() < 2 {
+            continue;
+        }
+        let sag = geodesic_sag_deg(w[0][1], w[1][1], w[0][0], w[1][0]);
+        if sag <= 0.0 {
+            continue;
+        }
+        if w[0][1] >= 0.0 && w[1][1] >= 0.0 {
+            north = north.max(sag);
+        } else if w[0][1] <= 0.0 && w[1][1] <= 0.0 {
+            south = south.max(sag);
+        } else {
+            north = north.max(sag);
+            south = south.max(sag);
+        }
+    }
+    (south, north)
+}
+
+/// Expand a tiling bbox's latitude bounds so the generated tiles cover
+/// everything the Mongo predicate can match:
+///
+///   - `south_pad` / `north_pad`: user-geometry sag from
+///     `polygon_sag_padding` (zero for boxes — their planar `$box`
+///     edges follow parallels exactly);
+///   - the tile grid's own edge sag: tile edges are geodesics too and
+///     bulge poleward, so coverage recedes from the *equatorward* outer
+///     grid line — pad a north-hemisphere south bound and a
+///     south-hemisphere north bound by one tile-edge sag;
+///   - `NE_OWNERSHIP_PAD_DEG` on the north bound, so docs exactly on a
+///     grid-aligned north edge (owned by the row above, per half-open
+///     tile membership) get their row generated.
+///
+/// Longitude is untouched: meridians are great circles, so east/west
+/// tile edges have no sag. The Mongo predicates are not changed by any
+/// of this — padding only adds candidate tiles, and empty ones are
+/// skipped by probe-forward.
+fn pad_bbox_for_tiling(
+    mut bbox: BoundingBox,
+    south_pad: f64,
+    north_pad: f64,
+    tile_degrees: f64,
+) -> BoundingBox {
+    let tile_south = if bbox.sw[1] > 0.0 {
+        geodesic_sag_deg(bbox.sw[1], bbox.sw[1], 0.0, tile_degrees)
+    } else {
+        0.0
+    };
+    let tile_north = if bbox.ne[1] < 0.0 {
+        geodesic_sag_deg(bbox.ne[1], bbox.ne[1], 0.0, tile_degrees)
+    } else {
+        0.0
+    };
+    bbox.sw[1] = (bbox.sw[1] - south_pad - tile_south).max(-90.0);
+    bbox.ne[1] = (bbox.ne[1] + north_pad + tile_north + NE_OWNERSHIP_PAD_DEG).min(90.0);
+    bbox
+}
+
 /// Tile a bbox into grid-aligned cells of side `tile_degrees`. The grid is
 /// anchored at integer multiples of `tile_degrees` from the origin (so for
 /// tile_degrees=10, edges are at ...,-20, -10, 0, 10, 20,...). Each emitted
@@ -401,7 +525,7 @@ mod tests {
     #[test]
     fn center_radius_is_level_only() {
         let tiles = generate_tiles(
-            &json!({"center": "[0,0]", "radius": "1000"}),
+            &json!({"center": "0,0", "radius": "100"}),
             &TEST_CONFIG,
         );
         assert_eq!(tiles.len(), TEST_CONFIG.levels.len());
@@ -456,9 +580,10 @@ mod tests {
     #[test]
     fn ordering_is_spatial_outer_level_inner() {
         let tiles = generate_tiles(&json!({"box": "[[0,0],[20,10]]"}), &TEST_CONFIG);
-        // 2 spatial tiles × 2 levels = 4 specs, in order:
-        //   (tile0, lvl0), (tile0, lvl1), (tile1, lvl0), (tile1, lvl1)
-        assert_eq!(tiles.len(), 4);
+        // 2 cols × 2 rows (the grid-aligned north edge at lat 10 gains
+        // its ownership row) = 4 spatial tiles × 2 levels = 8 specs, in
+        // order: (tile0, lvl0), (tile0, lvl1), (tile1, lvl0), ...
+        assert_eq!(tiles.len(), 8);
         assert_eq!(tiles[0].level_index, Some(0));
         assert_eq!(tiles[1].level_index, Some(1));
         assert_eq!(tiles[2].level_index, Some(0));
@@ -475,7 +600,10 @@ mod tests {
     #[test]
     fn single_cell_box_grid_aligned() {
         let tiles = generate_tiles(&json!({"box": "[[0,0],[10,10]]"}), &TEST_CONFIG);
-        assert_eq!(tiles.len(), TEST_CONFIG.levels.len());
+        // 2 spatial tiles: the cell itself plus the ownership row above
+        // its grid-aligned north edge (docs at exactly lat 10 belong to
+        // the row starting at 10, per half-open membership).
+        assert_eq!(tiles.len(), 2 * TEST_CONFIG.levels.len());
         assert_eq!(
             tiles[0].tile_bbox,
             Some(BoundingBox {
@@ -483,6 +611,16 @@ mod tests {
                 ne: [10.0, 10.0]
             })
         );
+    }
+
+    #[test]
+    fn box_with_reversed_latitudes_gets_tidied() {
+        // 2.x-style tidying: [[0,10],[10,0]] tiles identically to
+        // [[0,0],[10,10]]. Longitude order is never touched (dateline
+        // semantics) — only the lat pair is swapped.
+        let tidied = generate_tiles(&json!({"box": "[[0,10],[10,0]]"}), &TEST_CONFIG);
+        let ordered = generate_tiles(&json!({"box": "[[0,0],[10,10]]"}), &TEST_CONFIG);
+        assert_eq!(tidied, ordered);
     }
 
     #[test]
@@ -526,8 +664,10 @@ mod tests {
             &json!({"box": "[[170,10],[-170,20]]"}),
             &TEST_CONFIG,
         );
-        // Two sub-boxes, each one 10°×10° = one grid cell, × 2 levels = 4.
-        assert_eq!(tiles.len(), 2 * TEST_CONFIG.levels.len());
+        // Two sub-boxes; each gains a row below (NH south bound pads
+        // down by the tile-edge sag) and the ownership row above the
+        // grid-aligned north edge: 3 rows × 1 col × 2 bands = 6 spatial.
+        assert_eq!(tiles.len(), 6 * TEST_CONFIG.levels.len());
 
         let bboxes: Vec<_> = tiles.iter().map(|t| t.tile_bbox.clone()).collect();
         // East band tile
@@ -558,13 +698,16 @@ mod tests {
             &json!({"polygon": "[[10,15],[15,10],[20,15],[15,20],[10,15]]"}),
             &TEST_CONFIG,
         );
-        // bbox spans one 10° cell, so 1 spatial tile × 2 levels = 2 specs.
-        assert_eq!(tiles.len(), TEST_CONFIG.levels.len());
+        // Naive bbox is one 10° cell, but sag padding expands it: the
+        // NH south bound at lat 10 pads down past the grid line (tile-
+        // edge sag), the north bound pads up by the polygon-edge sag +
+        // ownership pad past lat 20. 3 rows × 1 col = 3 spatial tiles.
+        assert_eq!(tiles.len(), 3 * TEST_CONFIG.levels.len());
         assert_eq!(
             tiles[0].tile_bbox,
             Some(BoundingBox {
-                sw: [10.0, 10.0],
-                ne: [20.0, 20.0]
+                sw: [10.0, 0.0],
+                ne: [20.0, 10.0]
             })
         );
     }
@@ -599,9 +742,9 @@ mod tests {
             &TEST_CONFIG,
         );
 
-        // 2 spatial sub-bboxes × 1 spatial tile each × 2 levels = 4 specs.
-        // (Each sub-bbox is exactly 10°×10°, so one tile.)
-        assert_eq!(tiles.len(), 2 * TEST_CONFIG.levels.len());
+        // 2 spatial sub-bboxes × 2 rows each (the top edge at lat 10
+        // sags + ownership pad → the row above is generated) × 2 levels.
+        assert_eq!(tiles.len(), 2 * 2 * TEST_CONFIG.levels.len());
 
         let bboxes: Vec<_> = tiles.iter().map(|t| t.tile_bbox.clone()).collect();
         assert!(bboxes.contains(&Some(BoundingBox {
@@ -621,7 +764,9 @@ mod tests {
             &json!({"polygon": "[[10,0],[20,0],[20,10],[10,10],[10,0]]"}),
             &TEST_CONFIG,
         );
-        assert_eq!(tiles.len(), TEST_CONFIG.levels.len());
+        // 2 rows: the ownership/sag pad past the grid-aligned top edge
+        // at lat 10 generates the row above.
+        assert_eq!(tiles.len(), 2 * TEST_CONFIG.levels.len());
         assert_eq!(
             tiles[0].tile_bbox,
             Some(BoundingBox {
@@ -638,7 +783,8 @@ mod tests {
             &json!({"polygon": "[[-20,0],[-10,0],[-10,10],[-20,10],[-20,0]]"}),
             &TEST_CONFIG,
         );
-        assert_eq!(tiles.len(), TEST_CONFIG.levels.len());
+        // 2 rows, same shape as the east-of-dateline case above.
+        assert_eq!(tiles.len(), 2 * TEST_CONFIG.levels.len());
         assert_eq!(
             tiles[0].tile_bbox,
             Some(BoundingBox {
@@ -646,6 +792,100 @@ mod tests {
                 ne: [-10.0, 10.0],
             })
         );
+    }
+
+    // ---- geodesic sag padding -------------------------------------------------
+
+    #[test]
+    fn geodesic_sag_matches_hand_computed_values() {
+        // tan(φ_max) = tan(φ)/cos(Δλ/2), sag = φ_max − φ.
+        // 80°-wide edge at 60°: φ_max = atan(tan60°/cos40°) ≈ 66.143°.
+        assert!((geodesic_sag_deg(60.0, 60.0, -40.0, 40.0) - 6.143).abs() < 0.01);
+        // Sag peaks at mid-latitudes: bigger at 50° than 60° for the same width.
+        assert!((geodesic_sag_deg(50.0, 50.0, -40.0, 40.0) - 7.264).abs() < 0.01);
+        // A 5° tile edge at 60° sags only ~0.024°.
+        assert!((geodesic_sag_deg(60.0, 60.0, 0.0, 5.0) - 0.0236).abs() < 0.001);
+        // Equatorial edges are geodesics already — zero sag.
+        assert_eq!(geodesic_sag_deg(0.0, 0.0, -40.0, 40.0), 0.0);
+        // Near-antipodal longitudes swing wildly poleward.
+        assert!((geodesic_sag_deg(10.0, 10.0, 0.0, 170.0) - 53.69).abs() < 0.05);
+        // Southern hemisphere is symmetric.
+        assert!(
+            (geodesic_sag_deg(-60.0, -60.0, -40.0, 40.0)
+                - geodesic_sag_deg(60.0, 60.0, -40.0, 40.0))
+            .abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn wide_polar_polygon_pads_tiles_poleward() {
+        // THE regression this padding exists for: an 80°-wide polygon
+        // with its southern edge at 60S. Mongo's geodesic edge dips to
+        // ~66.1S (and the 50S edge to ~57.3S) near the central meridian;
+        // docs down there satisfy the Mongo filter, so tiles must reach
+        // them or they appear on no page. South pad = max edge sag
+        // (7.26° from the 50S edge) → bbox south bound −67.3 → snapped
+        // row start at −70.
+        let tiles = generate_tiles(
+            &json!({"polygon": "[[-40,-60],[40,-60],[40,-50],[-40,-50],[-40,-60]]"}),
+            &TEST_CONFIG,
+        );
+        let min_sw_lat = tiles
+            .iter()
+            .filter_map(|t| t.tile_bbox.as_ref())
+            .map(|b| b.sw[1])
+            .fold(f64::INFINITY, f64::min);
+        assert_eq!(min_sw_lat, -70.0, "tiles must reach the geodesic sag region");
+        // The SH north bound at −50 also gains its equatorward sliver
+        // row (tile edges themselves sag south of the −50 grid line).
+        assert!(
+            tiles
+                .iter()
+                .filter_map(|t| t.tile_bbox.as_ref())
+                .any(|b| b.sw[1] == -50.0),
+            "equatorward sliver row at -50 should be generated"
+        );
+        // 3 rows (−70, −60, −50) × 8 cols (−40..30) × 2 levels.
+        assert_eq!(tiles.len(), 24 * TEST_CONFIG.levels.len());
+    }
+
+    #[test]
+    fn sh_box_grid_aligned_north_edge_gains_sliver_row() {
+        // Box top at −30 (grid-aligned, SH): the −30 grid line's tile
+        // edges sag south of it, so the sliver just under −30 is only
+        // covered by the row starting at −30 — which must be generated.
+        let tiles = generate_tiles(&json!({"box": "[[0,-60],[10,-30]]"}), &TEST_CONFIG);
+        assert!(
+            tiles
+                .iter()
+                .filter_map(|t| t.tile_bbox.as_ref())
+                .any(|b| b.sw[1] == -30.0),
+            "sliver row at -30 should be generated"
+        );
+        // SH south bound needs no pad (tile edges sag *outward* there):
+        // rows are −60, −50, −40, −30.
+        let min_sw_lat = tiles
+            .iter()
+            .filter_map(|t| t.tile_bbox.as_ref())
+            .map(|b| b.sw[1])
+            .fold(f64::INFINITY, f64::min);
+        assert_eq!(min_sw_lat, -60.0);
+        assert_eq!(tiles.len(), 4 * TEST_CONFIG.levels.len());
+    }
+
+    #[test]
+    fn nh_box_grid_aligned_south_edge_gains_row_below() {
+        // Mirror image: box bottom at 30 (grid-aligned, NH). The row
+        // [30,40)'s bottom edge sags *north* of the 30 grid line, so the
+        // sliver just above 30 belongs to the row below — generate it.
+        let tiles = generate_tiles(&json!({"box": "[[0,30],[10,60]]"}), &TEST_CONFIG);
+        let min_sw_lat = tiles
+            .iter()
+            .filter_map(|t| t.tile_bbox.as_ref())
+            .map(|b| b.sw[1])
+            .fold(f64::INFINITY, f64::min);
+        assert_eq!(min_sw_lat, 20.0, "row below the NH south bound should be generated");
     }
 
     // ---- coverage_bbox filtering --------------------------------------------
@@ -764,10 +1004,14 @@ mod tests {
             &crate::helpers::dataset_config::BSOSE_CONFIG,
         );
 
-        // 2 spatial sub-bboxes × 1 spatial tile each × N levels.
+        // 2 spatial sub-bboxes × 2 rows each × N levels. The polygon's
+        // southern edge at 60S sags ~0.004° past the grid-aligned south
+        // bound, pulling in the row below. The north bound at -58 is
+        // not grid-aligned and its pads don't reach -55, so no extra
+        // row appears on top.
         assert_eq!(
             tiles.len(),
-            2 * crate::helpers::dataset_config::BSOSE_CONFIG.levels.len()
+            2 * 2 * crate::helpers::dataset_config::BSOSE_CONFIG.levels.len()
         );
 
         let bboxes: Vec<_> = tiles.iter().map(|t| t.tile_bbox.clone()).collect();
@@ -889,7 +1133,10 @@ mod tests {
             &json!({"box": "[[0,0],[10,10]]"}),
             &EMPTY_LEVELS_CONFIG,
         );
-        assert_eq!(tiles.len(), 1);
+        // 2 spatial tiles (cell + ownership row above the grid-aligned
+        // north edge), one spec each.
+        assert_eq!(tiles.len(), 2);
         assert_eq!(tiles[0].level_index, None);
+        assert_eq!(tiles[1].level_index, None);
     }
 }

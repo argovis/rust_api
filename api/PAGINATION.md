@@ -70,9 +70,9 @@ antimeridian / north-pole docs aren't lost.
 | Mode | Tile sequence |
 |------|---------------|
 | `id` | A single passthrough tile — no spatial or level constraint is added. |
-| `center + radius` | No spatial tiling; pagination is level-only. Radius must satisfy `radius ≤ max_radius_meters` (100 km for BSOSE today). |
-| `polygon` | Tile the polygon's bounding box. Mongo `$geoWithin` does the actual polygon intersection per tile. |
-| `box` | Tile the box. A dateline-crossing box (`sw_lon > ne_lon`) is split into east and west sub-boxes; tile generation runs on each. |
+| `center + radius` | No spatial tiling; pagination is level-only. Radius (km) must satisfy `radius ≤ max_radius_meters / 1000` (100 km for BSOSE today). |
+| `polygon` | Tile the polygon's bounding box, expanded poleward by the analytic geodesic-sag bound: Mongo connects vertices with great circles, which overshoot the vertex latitudes poleward (tan φ_max = tan φ / cos(Δλ/2); ~6° for an 80°-wide edge at 60°), and tiles must cover the overshoot or docs inside the Mongo polygon would appear on no page. Mongo `$geoWithin` does the actual polygon intersection per tile; the padding only adds candidate tiles, and empty ones are skipped by probe-forward. |
+| `box` | Tile the box. A dateline-crossing box (`sw_lon > ne_lon`) is split into east and west sub-boxes; tile generation runs on each. The tiling bbox is padded equatorward by one tile-edge sag (tile edges are geodesics and bulge poleward, so coverage recedes from the equatorward grid line) and by a hair at the north edge for half-open tile ownership. |
 | no spatial param | Tile the whole globe. |
 
 ## Mode flags
@@ -90,12 +90,12 @@ antimeridian / north-pole docs aren't lost.
 | Param | Type | Notes |
 |-------|------|-------|
 | `id` | string | Exact match on `_id`. |
-| `box` | JSON `[[sw_lon, sw_lat], [ne_lon, ne_lat]]` | Bounding box. Wraps the dateline if `sw_lon > ne_lon`. |
+| `box` | JSON `[[sw_lon, sw_lat], [ne_lon, ne_lat]]` | Bounding box. Wraps the dateline if `sw_lon > ne_lon`. A reversed latitude pair (`sw_lat > ne_lat`) is silently swapped, 2.x-style — e.g. `[[0,10],[10,0]]` is treated as `[[0,0],[10,10]]`. Longitude order is never "fixed" because it encodes dateline crossing. |
 | `polygon` | JSON `[[lon, lat], ...]` | Closed ring of vertices (first = last), ≥ 4 points. |
-| `center` + `radius` | JSON `[lon, lat]` + meters | Disk query. Radius capped at the dataset's `max_radius_meters`. |
-| `verticalRange` | JSON `[lo, hi]` | Half-open depth range applied on top of tile-level pagination. |
-| `startDate` / `endDate` | RFC-3339 string | Slices each doc's timeseries to this window. |
-| `data` | comma-separated | Variables to include. Each token must be: a dataset-specific variable name (BSOSE: `THETA`, `SALT`; OI SST: `sst`), the universal `all` (keep everything) or `except_data_values` (keep schema, clear values), or an integer (QC filter). Unknown tokens are rejected with a 400 + a "did you mean" suggestion. If the doc has no data to return after filtering (no matching columns, or a time window that collapsed to zero points), the whole doc is dropped from the response. Omitting `data=` entirely also omits the `data` field from each response doc — use that for slim listings. `except_data_values` in the list keeps the row but clears the values (schema-only mode) — that's the one case where an empty `data` array doesn't drop the doc. |
+| `center` + `radius` | comma-separated `lon,lat` (e.g. `center=0,0`) + km | Disk query, 2.x API format. Radius capped at the dataset's `max_radius_meters` (converted to km). |
+| `verticalRange` | comma-separated `lo,hi` (e.g. `verticalRange=0,10`) | Half-open depth range applied on top of tile-level pagination. 2.x API format. |
+| `startDate` / `endDate` | RFC-3339 string | Slices each doc's timeseries to this window. A doc whose timeseries is empty after windowing (no timestamps in range) is dropped from the response entirely — regardless of `data=` mode. |
+| `data` | comma-separated | Variables to include. Each token must be: a dataset-specific variable name (BSOSE: `THETA`, `SALT`; OI SST: `sst`), the universal `all` (keep everything) or `except-data-values` (keep schema, clear values), or an integer (QC filter). Unknown tokens are rejected with a 400 + a "did you mean" suggestion. If the doc has no data to return after filtering (no matching columns, or a time window that collapsed to zero points), the whole doc is dropped from the response. Omitting `data=` entirely also omits the `data` field from each response doc — use that for slim listings. `except-data-values` in the list keeps the row but clears the values (schema-only mode) — that's the one case where an empty `data` array doesn't drop the doc. `data=except-data-values` on its own is nonsense ("clear the values of nothing") and is silently normalized, 2.x-style, to the absent-`data=` behaviour. |
 | `compression` | `minimal` | See mode flags. |
 | `batchmeta` | any | See mode flags. |
 | `tile_index` | non-negative integer | Pagination cursor. Default `0`. Almost always supplied by the previous response's `next_url`. |
@@ -108,11 +108,14 @@ antimeridian / north-pole docs aren't lost.
   a real param name, the error message includes a "did you mean ..."
   suggestion.
 - Any token inside the `data=` list that isn't one of: the dataset's
-  declared variable names, the universal `all` / `except_data_values`,
+  declared variable names, the universal `all` / `except-data-values`,
   or an integer (QC filter). Suggestions follow the same shape as the
   qsp-name check.
 - More than one of `polygon` / `box` / `center` set.
 - `center` set without `radius`, or vice versa.
+- `center` not comma-separated `lon,lat`, or `verticalRange` not
+  comma-separated `lo,hi` (brackets, e.g. `[0,0]`, are rejected — that
+  was the pre-2.x-compatibility format).
 - `radius` non-numeric, negative, non-finite, or above the dataset's cap.
 - `polygon` malformed: fewer than 4 points, not closed, or any vertex
   that isn't a 2-element pair.
@@ -128,11 +131,14 @@ antimeridian / north-pole docs aren't lost.
   polygons covering more than half the sphere, may over-tile — the
   result is still correct (Mongo's `$geoWithin` does the actual
   polygon intersection), just slower than ideal.
-- **Grid-aligned user box NE corner.** A user-supplied box whose NE
-  corner sits exactly on a tile grid line (e.g.
-  `box=[[20,10],[40,30]]`) will lose docs at that exact NE corner,
-  because the rightmost/topmost tile's NE is shrunk by the half-open
-  mechanism. Workaround on the client: pad the NE by a tiny amount.
+- **Grid-aligned user box NE corner (longitude only).** The latitude
+  half of this is fixed: the tiling bbox's north bound is padded so the
+  row above a grid-aligned top edge is generated. But a box whose NE
+  *longitude* sits exactly on a tile grid line (e.g. `ne_lon=40` with
+  5° tiles) still loses docs at that exact meridian, because the
+  rightmost tile's NE is shrunk by the half-open mechanism and the
+  column to its east isn't generated. Workaround on the client: pad
+  the NE longitude by a tiny amount.
 - **Antipodal docs at `lon=±180` stored as distinct values.** Docs at
   `lon=+180` land in the easternmost tile, docs at `lon=-180` in the
   westernmost — same physical meridian, two different pages. Data
@@ -228,9 +234,12 @@ column's time window collapsed to zero points), the whole doc is
 dropped from the response rather than serialized with an empty
 array. This keeps responses honest — a doc in the response always
 carries something the user asked for. The one exception is
-`except_data_values`: when present in the `data=` list, the user has
-explicitly opted into a schema-only response, so an empty `data`
-array is what they asked for and the doc stays.
+`except-data-values`: when present in the `data=` list alongside
+variable names, the user has explicitly opted into a schema-only
+response, so an empty `data` array is what they asked for and the
+doc stays. Note this exception covers empty *data* only — a doc
+whose time *window* is empty is dropped before this rule applies. (A `data=` list consisting of *only* `except-data-values`
+doesn't reach this rule — it's normalized to absent-`data=` first.)
 
 With all three qsps unset, response docs are short: `_id`,
 geolocation, level, metadata.

@@ -4,7 +4,8 @@ use mongodb::bson::DateTime as BsonDateTime;
 
 /// Apply the user's `startDate` / `endDate` / `data` parameters to a single
 /// timeseries document. Returns `None` if the document was filtered out
-/// entirely (e.g. `data=somefield` produced no matching columns).
+/// entirely (e.g. `data=somefield` produced no matching columns, or the
+/// date window contains none of the doc's timestamps).
 ///
 /// Response-shape rules enforced here:
 ///
@@ -47,13 +48,32 @@ pub fn transform_timeseries<T: schema::IsTimeseries>(
         .and_then(|v| v.as_str())
         .and_then(helpers::string2bsondate);
 
-    let data: Vec<String> = params.get("data")
+    let mut data: Vec<String> = params.get("data")
         .and_then(|v| v.as_str())
         .map(|s| s.split(',').map(|s| s.to_string()).collect())
         .unwrap_or_default();
 
+    // `data=except-data-values` alone is a nonsense query ("clear the
+    // values of… nothing"): 2.x silently normalized it to the most
+    // literal interpretation — as if `data=` weren't there at all — and
+    // we match that. Only the lone-and-exact token is normalized;
+    // `except-data-values` alongside variable names keeps its meaning
+    // (filtered data_info, values cleared).
+    if data.len() == 1 && data[0] == "except-data-values" {
+        data = Vec::new();
+    }
+
     if start_date.is_some() || end_date.is_some() {
         slice_timerange(start_date, end_date, ts, &mut doc);
+        // An empty timeseries after windowing means no timestamps at
+        // this grid point fall inside the requested range — there's
+        // effectively no data here for this window, so drop the doc.
+        // This fires regardless of `data=` mode: even a schema-only
+        // (`except-data-values`) response is meaningless for a window
+        // the doc doesn't cover.
+        if doc.timeseries().map_or(true, |t| t.is_empty()) {
+            return None;
+        }
     }
 
     if data.is_empty() {
@@ -85,11 +105,11 @@ pub fn transform_timeseries<T: schema::IsTimeseries>(
     // shapes (vacuously true on an empty outer), so a single check
     // covers both.
     //
-    // Exception: `except_data_values` in the data list is an explicit
+    // Exception: `except-data-values` in the data list is an explicit
     // "I want the (filtered) data_info but not the values" signal, so
     // an empty data array is what the user asked for, not a sign that
     // we should drop. Skip the drop check in that case.
-    let user_wants_empty_data = data.iter().any(|s| s == "except_data_values");
+    let user_wants_empty_data = data.iter().any(|s| s == "except-data-values");
     if !user_wants_empty_data && sliced.data().iter().all(|inner| inner.is_empty()) {
         return None;
     }
@@ -160,7 +180,7 @@ pub fn slice_timerange<T: schema::IsTimeseries>(
 ///   - otherwise: filters the data columns down to the named variables
 ///     and writes the filtered `data_info` back onto the doc; returns
 ///     `None` if no requested variables match (caller drops the row).
-///   - if `data` also contains "except_data_values", clears the `data`
+///   - if `data` also contains "except-data-values", clears the `data`
 ///     field after column-filtering, but keeps the row (the filtered
 ///     `data_info` is what the caller wanted to see).
 ///
@@ -201,8 +221,8 @@ pub fn slice_data<T: schema::IsTimeseries>(
         return None;
     }
 
-    // except_data_values clears data after column-filtering.
-    if data.iter().any(|s| s == "except_data_values") {
+    // except-data-values clears data after column-filtering.
+    if data.iter().any(|s| s == "except-data-values") {
         doc.set_data(Vec::new());
     }
 
@@ -413,7 +433,7 @@ mod tests {
         let info = make_data_info(&["temp"]);
         let doc = make_bsose("doc1", vec![vec![1.0, 2.0]], &["temp"]);
         let mut out = slice_data(
-            &["temp".to_string(), "except_data_values".to_string()],
+            &["temp".to_string(), "except-data-values".to_string()],
             &info,
             doc,
         )
@@ -532,6 +552,30 @@ mod tests {
     }
 
     #[test]
+    fn transform_treats_lone_except_data_values_as_no_data_qsp() {
+        // `data=except-data-values` with nothing else in the list is
+        // nonsense ("clear the values of… nothing"); 2.x normalized it
+        // to the absent-`data=` behaviour and so do we: doc survives,
+        // data cleared, data_info scrubbed — byte-identical to the
+        // no-data= response above.
+        let timeseries = ts(&[1, 2]);
+        let doc = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            &["temp", "salinity"],
+        );
+        let params = json!({"data": "except-data-values"});
+        let mut out = transform_timeseries(&params, &timeseries, &empty_data_info(), doc)
+            .expect("doc should survive normalization to the no-data= path");
+        assert!(
+            out.data_info().is_none(),
+            "lone except-data-values should scrub data_info like absent data=, got {:?}",
+            out.data_info()
+        );
+        assert!(out.data().is_empty());
+    }
+
+    #[test]
     fn transform_omits_timeseries_when_no_date_qsp() {
         // No `startDate` / `endDate`: the response doc should carry no
         // timeseries field — clients fall back to the meta endpoint's
@@ -621,8 +665,47 @@ mod tests {
     }
 
     #[test]
+    fn transform_drops_doc_when_window_empty_even_without_data_qsp() {
+        // Same collapsed window, but with no `data=` at all. The doc
+        // used to survive into the slim-listing branch with an empty
+        // timeseries; an empty window means there's effectively no data
+        // at this grid point in the requested range, so drop it.
+        let timeseries = ts(&[1, 2, 3]);
+        let doc = make_bsose("doc1", vec![vec![1.0, 2.0, 3.0]], &["temp"]);
+        let params = json!({"startDate": "2021-01-01T00:00:00Z"});
+        let out = transform_timeseries(&params, &timeseries, &empty_data_info(), doc);
+        assert!(
+            out.is_none(),
+            "empty time window should drop the doc even without data="
+        );
+    }
+
+    #[test]
+    fn transform_drops_doc_when_window_empty_despite_except_data_values() {
+        // `except-data-values` exempts a doc from drop-on-empty *data*
+        // (the user asked for schema-only), but it does not exempt an
+        // empty time *window* — a schema-only response for a range the
+        // doc doesn't cover is meaningless.
+        let timeseries = ts(&[1, 2, 3]);
+        let doc = make_bsose(
+            "doc1",
+            vec![vec![1.0, 2.0, 3.0], vec![10.0, 20.0, 30.0]],
+            &["temp", "salinity"],
+        );
+        let params = json!({
+            "data":      "temp,except-data-values",
+            "startDate": "2021-01-01T00:00:00Z", // past the timeseries
+        });
+        let out = transform_timeseries(&params, &timeseries, &empty_data_info(), doc);
+        assert!(
+            out.is_none(),
+            "empty time window should drop the doc despite except-data-values"
+        );
+    }
+
+    #[test]
     fn transform_keeps_doc_with_except_data_values_despite_empty_data() {
-        // `except_data_values` is the user explicitly asking for
+        // `except-data-values` is the user explicitly asking for
         // "schema only, no values". slice_data clears the data after
         // column-filtering; the drop-on-empty rule should skip this
         // case rather than dropping the doc — the empty data was
@@ -633,13 +716,13 @@ mod tests {
             vec![vec![1.0, 2.0], vec![3.0, 4.0]],
             &["temp", "salinity"],
         );
-        let params = json!({"data": "temp,except_data_values"});
+        let params = json!({"data": "temp,except-data-values"});
         let mut out = transform_timeseries(&params, &timeseries, &empty_data_info(), doc)
-            .expect("except_data_values should not trigger drop-on-empty");
+            .expect("except-data-values should not trigger drop-on-empty");
         // Data was deliberately cleared.
         assert!(out.data().is_empty());
         // But the filtered data_info still rides along — that's the
-        // whole point of except_data_values.
+        // whole point of except-data-values.
         let info = out.data_info().expect("data_info still present");
         assert_eq!(info.0, vec!["temp".to_string()]);
     }

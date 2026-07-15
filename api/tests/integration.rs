@@ -260,7 +260,7 @@ async fn vertical_range_filters_by_level_across_pages() {
     // restricts which level brackets contribute docs.
     let docs = get_paged(
         "/timeseries/bsose",
-        &[("verticalRange", "[0, 30]"), ("data", "all")],
+        &[("verticalRange", "0,30"), ("data", "all")],
     )
     .await;
     assert_eq!(docs.len(), 3);
@@ -377,8 +377,8 @@ async fn center_radius_filter_matches_nearby_points_across_pages() {
     let docs = get_paged(
         "/timeseries/bsose",
         &[
-            ("center", "[20.0, -50.0]"),
-            ("radius", "100000"), // 100 km — at the cap
+            ("center", "20.0,-50.0"),
+            ("radius", "100"), // 100 km — at the cap
             ("data", "all"),
         ],
     )
@@ -712,7 +712,7 @@ async fn rejects_box_and_polygon_together() {
 
 #[tokio::test]
 async fn rejects_center_without_radius() {
-    let resp = get("/timeseries/bsose", &[("center", "[0,0]")]).await;
+    let resp = get("/timeseries/bsose", &[("center", "0,0")]).await;
     assert_eq!(resp.status(), 400);
 }
 
@@ -734,11 +734,11 @@ async fn rejects_unparseable_start_date() {
 
 #[tokio::test]
 async fn rejects_radius_above_cap() {
-    // BSOSE_CONFIG.max_radius_meters is 5_000_000. Asking for 10_000_000
-    // should be rejected before the cursor opens.
+    // BSOSE_CONFIG.max_radius_meters is 100_000 (100 km). Asking for
+    // 10_000 km should be rejected before the cursor opens.
     let resp = get(
         "/timeseries/bsose",
-        &[("center", "[0.0, 0.0]"), ("radius", "10000000")],
+        &[("center", "0.0,0.0"), ("radius", "10000")],
     )
     .await;
     assert_eq!(resp.status(), 400);
@@ -748,7 +748,7 @@ async fn rejects_radius_above_cap() {
 async fn rejects_non_numeric_radius() {
     let resp = get(
         "/timeseries/bsose",
-        &[("center", "[0.0, 0.0]"), ("radius", "huge")],
+        &[("center", "0.0,0.0"), ("radius", "huge")],
     )
     .await;
     assert_eq!(resp.status(), 400);

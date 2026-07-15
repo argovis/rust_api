@@ -18,6 +18,34 @@ pub fn validlonlat(coords: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
     }).collect()
 }
 
+/// Silently tidy a box's corner pair the way the 2.x API did: if the
+/// latitudes arrive as (north, south) — e.g. box=[[0,10],[10,0]] — swap
+/// them so the first corner is genuinely the southwest one, yielding
+/// [[0,0],[10,10]].
+///
+/// Longitude is deliberately NOT reordered: `sw_lon > ne_lon` is
+/// meaningful (a dateline-crossing box, split downstream into east/west
+/// sub-boxes), so "fixing" it would silently turn an intentional
+/// dateline box into a near-global one. Latitude has no such wrap —
+/// boxes can't cross a pole — so a descending lat pair can only be a
+/// mistake, and swapping it is unambiguous.
+///
+/// Call after `validlonlat` so the comparison sees clipped/wrapped
+/// values. Malformed shapes are passed through untouched; shape
+/// validation happens elsewhere.
+pub fn tidy_box(mut coords: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
+    if coords.len() == 2
+        && coords[0].len() == 2
+        && coords[1].len() == 2
+        && coords[0][1] > coords[1][1]
+    {
+        let sw_lat = coords[1][1];
+        coords[1][1] = coords[0][1];
+        coords[0][1] = sw_lat;
+    }
+    coords
+}
+
 pub fn string2bsondate(date_str: &str) -> Option<BsonDateTime> {
     date_str.parse::<DateTime<Utc>>().ok()
         .map(|dt| BsonDateTime::from_millis(dt.timestamp_millis()))
@@ -155,6 +183,22 @@ pub fn validate_query_params(params: &serde_json::Value) -> Result<(), HttpRespo
         return Err(HttpResponse::BadRequest().json(json!({"error": "'center' and 'radius' should both be defined, or neither should be defined"})));
     }
 
+    // If 'center' is defined, it should be comma-separated 'lon,lat'
+    // (2.x API format — no brackets, e.g. center=0,0).
+    if let Some(center) = params.get("center") {
+        if !is_comma_separated_pair(center.as_str().unwrap_or("")) {
+            return Err(HttpResponse::BadRequest().json(json!({"error": "'center' should be comma-separated as lon,lat, for example center=-20.5,42"})));
+        }
+    }
+
+    // Same 2.x format for 'verticalRange': comma-separated 'lo,hi',
+    // e.g. verticalRange=0,10.
+    if let Some(vertical_range) = params.get("verticalRange") {
+        if !is_comma_separated_pair(vertical_range.as_str().unwrap_or("")) {
+            return Err(HttpResponse::BadRequest().json(json!({"error": "'verticalRange' should be comma-separated as lo,hi, for example verticalRange=0,10"})));
+        }
+    }
+
     // If 'polygon' is defined, its value should be the coordinates of a single-ring polygon
     if let Some(polygon) = params.get("polygon") {
         let polygon_str = polygon.as_str().ok_or_else(|| HttpResponse::BadRequest().json(json!({"error": "'polygon' should be an array of coordinate pairs"})))?;
@@ -200,16 +244,27 @@ pub fn validate_query_params(params: &serde_json::Value) -> Result<(), HttpRespo
     Ok(())
 }
 
+/// True when `s` is exactly two comma-separated finite floats, the 2.x
+/// API's qsp pair format (e.g. `center=-20.5,42`, `verticalRange=0,10`).
+/// Bracketed JSON arrays (the pre-2.x format) fail this check by design.
+fn is_comma_separated_pair(s: &str) -> bool {
+    let parts: Vec<&str> = s.split(',').collect();
+    parts.len() == 2
+        && parts
+            .iter()
+            .all(|p| p.trim().parse::<f64>().map_or(false, f64::is_finite))
+}
+
 /// Universal tokens accepted in the `data=` qsp regardless of which
-/// dataset is being queried. `all` and `except_data_values` control
+/// dataset is being queried. `all` and `except-data-values` control
 /// response shape rather than naming a variable; both are documented
 /// in `api/PAGINATION.md`.
-const UNIVERSAL_DATA_TOKENS: &[&str] = &["all", "except_data_values"];
+const UNIVERSAL_DATA_TOKENS: &[&str] = &["all", "except-data-values"];
 
 /// Validate the contents of the `data=` qsp against the dataset's
 /// `allowed_data_vars`. Each comma-separated token must be one of:
 ///
-///   - a universal token (`all` or `except_data_values`),
+///   - a universal token (`all` or `except-data-values`),
 ///   - a variable name in `config.allowed_data_vars`, or
 ///   - an integer (accepted as a QC filter; the QC system is dataset-
 ///     agnostic so any non-negative integer is allowed at this layer).
@@ -288,6 +343,9 @@ fn unknown_data_token_message(token: &str, config: &DatasetConfig) -> String {
 
 /// Enforce the dataset's `max_radius_meters` for `center + radius` queries.
 ///
+/// The `radius` qsp is expressed in km (2.x API format); the config cap
+/// stays in meters, so we convert before comparing.
+///
 /// `center + radius` is the one geo mode that *isn't* spatially tiled
 /// (Mongo's `$near` handles the bounding internally), so a request with an
 /// unbounded radius could ask for a half-globe disk and return millions of
@@ -328,11 +386,12 @@ pub fn validate_radius_cap(
             })));
         }
     };
-    if radius > config.max_radius_meters {
+    // radius qsp is km; cap is stored in meters
+    if radius * 1000.0 > config.max_radius_meters {
         return Err(HttpResponse::BadRequest().json(json!({
             "error": format!(
-                "radius {} m exceeds the dataset's maximum allowed radius of {} m",
-                radius, config.max_radius_meters
+                "radius {} km exceeds the dataset's maximum allowed radius of {} km",
+                radius, config.max_radius_meters / 1000.0
             )
         })));
     }
@@ -388,6 +447,37 @@ mod tests {
         assert_eq!(out, coords);
     }
 
+    // ---- tidy_box ------------------------------------------------------------
+
+    #[test]
+    fn tidy_box_swaps_reversed_latitudes() {
+        // box=[[0,10],[10,0]] — corners given as NW/SE — becomes SW/NE
+        let out = tidy_box(vec![vec![0.0, 10.0], vec![10.0, 0.0]]);
+        assert_eq!(out, vec![vec![0.0, 0.0], vec![10.0, 10.0]]);
+    }
+
+    #[test]
+    fn tidy_box_leaves_well_ordered_box_unchanged() {
+        let coords = vec![vec![0.0, 0.0], vec![10.0, 10.0]];
+        assert_eq!(tidy_box(coords.clone()), coords);
+    }
+
+    #[test]
+    fn tidy_box_never_touches_longitudes() {
+        // sw_lon > ne_lon is a dateline-crossing box, not a mistake —
+        // the lon pair must survive tidying even when lats also swap.
+        let out = tidy_box(vec![vec![170.0, 20.0], vec![-170.0, 10.0]]);
+        assert_eq!(out, vec![vec![170.0, 10.0], vec![-170.0, 20.0]]);
+    }
+
+    #[test]
+    fn tidy_box_passes_malformed_shapes_through() {
+        let coords = vec![vec![0.0, 10.0]];
+        assert_eq!(tidy_box(coords.clone()), coords);
+        let coords = vec![vec![0.0, 10.0, 5.0], vec![10.0, 0.0]];
+        assert_eq!(tidy_box(coords.clone()), coords);
+    }
+
     // ---- date round-trips ----------------------------------------------------
 
     #[test]
@@ -440,7 +530,7 @@ mod tests {
         let params = json!({
             "polygon": "[[0,0],[1,0],[1,1],[0,0]]",
             "box": "[[0,0],[1,1]]",
-            "center": "[0,0]"
+            "center": "0,0"
         });
         let err = validate_query_params(&params).unwrap_err();
         assert_eq!(err.status(), 400);
@@ -448,7 +538,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_center_without_radius() {
-        let params = json!({"center": "[0,0]"});
+        let params = json!({"center": "0,0"});
         assert!(validate_query_params(&params).is_err());
     }
 
@@ -460,8 +550,63 @@ mod tests {
 
     #[test]
     fn validate_accepts_center_and_radius() {
-        let params = json!({"center": "[0,0]", "radius": "1000"});
+        let params = json!({"center": "0,0", "radius": "1000"});
         assert!(validate_query_params(&params).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_bracketed_center() {
+        // 2.x format is comma-separated lon,lat; the old bracketed JSON
+        // array form should 400 with a format hint rather than 500.
+        let params = json!({"center": "[0,0]", "radius": "1000"});
+        assert!(validate_query_params(&params).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_malformed_center() {
+        for bad in ["0", "0,0,0", "a,b", "0,", ",0", "0,inf"] {
+            let params = json!({"center": bad, "radius": "1000"});
+            assert!(
+                validate_query_params(&params).is_err(),
+                "center '{}' should be rejected",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_center_with_spaces_and_signs() {
+        let params = json!({"center": "-20.5, 42", "radius": "1000"});
+        assert!(validate_query_params(&params).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_comma_separated_vertical_range() {
+        let params = json!({"verticalRange": "0,10"});
+        assert!(validate_query_params(&params).is_ok());
+        // negative bounds are legitimate (e.g. heights above a datum)
+        let params = json!({"verticalRange": "-5,5"});
+        assert!(validate_query_params(&params).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_bracketed_vertical_range() {
+        // 2.x format is comma-separated lo,hi; the old bracketed JSON
+        // array form should 400 with a format hint rather than 500.
+        let params = json!({"verticalRange": "[0,10]"});
+        assert!(validate_query_params(&params).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_malformed_vertical_range() {
+        for bad in ["0", "0,10,20", "a,b", "0,", ",10", "0,inf"] {
+            let params = json!({"verticalRange": bad});
+            assert!(
+                validate_query_params(&params).is_err(),
+                "verticalRange '{}' should be rejected",
+                bad
+            );
+        }
     }
 
     #[test]
@@ -632,7 +777,7 @@ mod tests {
 
     #[test]
     fn validate_data_param_accepts_universal_tokens() {
-        for token in ["all", "except_data_values"] {
+        for token in ["all", "except-data-values"] {
             let params = json!({ "data": token });
             assert!(
                 validate_data_param(&params, &DATA_TEST_CONFIG).is_ok(),
@@ -751,40 +896,41 @@ mod tests {
 
     #[test]
     fn radius_cap_accepts_radius_at_exactly_the_cap() {
-        let params = json!({"center": "[0,0]", "radius": "1000000"});
+        // cap is 1_000_000 m = 1000 km; radius qsp is km
+        let params = json!({"center": "0,0", "radius": "1000"});
         assert!(validate_radius_cap(&params, &RADIUS_TEST_CONFIG).is_ok());
     }
 
     #[test]
     fn radius_cap_accepts_radius_below_cap() {
-        let params = json!({"center": "[0,0]", "radius": "500000"});
+        let params = json!({"center": "0,0", "radius": "500"});
         assert!(validate_radius_cap(&params, &RADIUS_TEST_CONFIG).is_ok());
     }
 
     #[test]
     fn radius_cap_rejects_radius_above_cap() {
-        let params = json!({"center": "[0,0]", "radius": "1000001"});
+        let params = json!({"center": "0,0", "radius": "1000.001"});
         let err = validate_radius_cap(&params, &RADIUS_TEST_CONFIG).unwrap_err();
         assert_eq!(err.status(), 400);
     }
 
     #[test]
     fn radius_cap_rejects_non_numeric_radius() {
-        let params = json!({"center": "[0,0]", "radius": "huge"});
+        let params = json!({"center": "0,0", "radius": "huge"});
         let err = validate_radius_cap(&params, &RADIUS_TEST_CONFIG).unwrap_err();
         assert_eq!(err.status(), 400);
     }
 
     #[test]
     fn radius_cap_rejects_negative_radius() {
-        let params = json!({"center": "[0,0]", "radius": "-1"});
+        let params = json!({"center": "0,0", "radius": "-1"});
         let err = validate_radius_cap(&params, &RADIUS_TEST_CONFIG).unwrap_err();
         assert_eq!(err.status(), 400);
     }
 
     #[test]
     fn radius_cap_rejects_non_finite_radius() {
-        let params = json!({"center": "[0,0]", "radius": "inf"});
+        let params = json!({"center": "0,0", "radius": "inf"});
         let err = validate_radius_cap(&params, &RADIUS_TEST_CONFIG).unwrap_err();
         assert_eq!(err.status(), 400);
     }

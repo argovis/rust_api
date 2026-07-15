@@ -53,8 +53,10 @@ fn polygon_filter(polygon: &str, mut filter: mongodb::bson::Document) -> mongodb
 fn box_filter(boxregion: &str, mut filter: mongodb::bson::Document) -> mongodb::bson::Document {
     let mut box_coordinates: Vec<Vec<f64>> = serde_json::from_str(boxregion).unwrap();
 
-    // coordinate sanitation
-    box_coordinates = helpers::validlonlat(box_coordinates);
+    // coordinate sanitation, then 2.x-style tidying (swap reversed
+    // latitudes so the first corner is genuinely southwest; lon order
+    // is left alone — see helpers::tidy_box)
+    box_coordinates = helpers::tidy_box(helpers::validlonlat(box_coordinates));
 
     // box might cross dateline, need to split into two boxes
     let box_list = if box_coordinates[0][0] > box_coordinates[1][0] {
@@ -84,7 +86,12 @@ fn box_filter(boxregion: &str, mut filter: mongodb::bson::Document) -> mongodb::
 }
 
 fn center_filter(center: &str, radius: f64, mut filter: mongodb::bson::Document) -> mongodb::bson::Document {
-    let center_coordinates: Vec<f64> = serde_json::from_str(center).unwrap();
+    // `center` is comma-separated `lon,lat` (2.x API format, no brackets);
+    // format is validated upstream in helpers::validate_query_params.
+    let center_coordinates: Vec<f64> = center
+        .split(',')
+        .map(|c| c.trim().parse::<f64>().unwrap())
+        .collect();
 
     // coordinate sanitation
     let center_coordinates = helpers::validlonlat(vec![center_coordinates])[0].clone();
@@ -96,7 +103,9 @@ fn center_filter(center: &str, radius: f64, mut filter: mongodb::bson::Document)
                 "type": "Point",
                 "coordinates": center_coordinates
             },
-            "$maxDistance": radius
+            // `radius` arrives in km (2.x API format); Mongo's
+            // $maxDistance wants meters.
+            "$maxDistance": radius * 1000.0
         }
     });
 
@@ -109,7 +118,12 @@ fn id_filter(id: &str, mut filter: mongodb::bson::Document) -> mongodb::bson::Do
 }
 
 fn vertical_range_filter(vertical_range: &str, mut filter: mongodb::bson::Document) -> mongodb::bson::Document {
-    let vertical_range: Vec<f64> = serde_json::from_str(vertical_range).unwrap();
+    // `verticalRange` is comma-separated `lo,hi` (2.x API format, no
+    // brackets); format is validated upstream in helpers::validate_query_params.
+    let vertical_range: Vec<f64> = vertical_range
+        .split(',')
+        .map(|v| v.trim().parse::<f64>().unwrap())
+        .collect();
     filter.insert("level", mongodb::bson::doc! { "$gte": vertical_range[0], "$lt": vertical_range[1] });
     filter
 }
@@ -133,7 +147,7 @@ mod tests {
 
     #[test]
     fn vertical_range_filter_uses_gte_and_lt() {
-        let f = filter_timeseries(json!({"verticalRange": "[5.0, 50.0]"}));
+        let f = filter_timeseries(json!({"verticalRange": "5.0,50.0"}));
         let level = f.get_document("level").unwrap();
         assert!((level.get_f64("$gte").unwrap() - 5.0).abs() < 1e-9);
         assert!((level.get_f64("$lt").unwrap() - 50.0).abs() < 1e-9);
@@ -156,13 +170,14 @@ mod tests {
     #[test]
     fn center_filter_builds_geonear() {
         let f = filter_timeseries(json!({
-            "center": "[10.0, 20.0]",
-            "radius": "5000"
+            "center": "10.0,20.0",
+            "radius": "5"
         }));
         let geo = f.get_document("geolocation").unwrap();
         let near = geo.get_document("$near").unwrap();
         let geometry = near.get_document("$geometry").unwrap();
         assert_eq!(geometry.get_str("type").unwrap(), "Point");
+        // 5 km -> 5000 m for $maxDistance
         assert!((near.get_f64("$maxDistance").unwrap() - 5000.0).abs() < 1e-9);
     }
 
@@ -172,6 +187,24 @@ mod tests {
         let f = filter_timeseries(json!({"box": "[[10,10],[20,20]]"}));
         let or = f.get_array("$or").unwrap();
         assert_eq!(or.len(), 1, "non-crossing box should produce a single $or branch");
+    }
+
+    #[test]
+    fn box_filter_tidies_reversed_latitudes() {
+        // 2.x-style tidying: [[0,10],[10,0]] is treated as [[0,0],[10,10]]
+        let tidied = filter_timeseries(json!({"box": "[[0,10],[10,0]]"}));
+        let ordered = filter_timeseries(json!({"box": "[[0,0],[10,10]]"}));
+        assert_eq!(tidied, ordered);
+    }
+
+    #[test]
+    fn box_filter_tidies_lats_but_still_splits_dateline() {
+        // Reversed lats on a dateline-crossing box: lats get swapped,
+        // lon order is preserved so the box still wraps and splits.
+        let tidied = filter_timeseries(json!({"box": "[[170,20],[-170,10]]"}));
+        let ordered = filter_timeseries(json!({"box": "[[170,10],[-170,20]]"}));
+        assert_eq!(tidied, ordered);
+        assert_eq!(tidied.get_array("$or").unwrap().len(), 2);
     }
 
     #[test]
@@ -186,7 +219,7 @@ mod tests {
     fn id_and_vertical_range_compose() {
         let f = filter_timeseries(json!({
             "id": "doc1",
-            "verticalRange": "[0, 100]"
+            "verticalRange": "0,100"
         }));
         assert_eq!(f.get_str("_id").unwrap(), "doc1");
         assert!(f.get_document("level").is_ok());

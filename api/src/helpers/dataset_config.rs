@@ -183,6 +183,25 @@ pub const COPERNICUSSLA_CONFIG: DatasetConfig = DatasetConfig {
     allowed_data_vars: &["sla", "adt", "ugosa", "ugos", "vgosa", "vgos"],
 };
 
+/// CCMP wind is a sea-surface product: single vertical level modeled as
+/// a one-element levels array of 0.0, same as OI SST and Copernicus SLA.
+/// See the comment on `OISST_LEVELS` for the mechanics.
+pub const CCMPWIND_LEVELS: &[f64] = &[0.0];
+
+/// Configuration for the CCMP wind timeseries dataset.
+///
+/// Surface-only, global coverage. Tile size and radius cap deliberately
+/// match Copernicus SLA / OI SST (5° / 100 km) — same uniformity
+/// argument, same "relax once usage informs us" caveat. Four variables:
+/// the wind vector components, wind speed, and observation count.
+pub const CCMPWIND_CONFIG: DatasetConfig = DatasetConfig {
+    tile_degrees: 5.0,
+    max_radius_meters: 100_000.0, // 100 km — same starting cap as the others
+    levels: CCMPWIND_LEVELS,
+    coverage_bbox: None,
+    allowed_data_vars: &["uwnd", "vwnd", "ws", "nobs"],
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +355,52 @@ mod tests {
         assert_eq!(
             COPERNICUSSLA_CONFIG.allowed_data_vars,
             &["sla", "adt", "ugosa", "ugos", "vgosa", "vgos"]
+        );
+    }
+
+    // ---- CCMP wind config invariants (mirror the Copernicus SLA checks) ----
+
+    #[test]
+    fn ccmpwind_tile_degrees_is_positive_and_divides_a_hemisphere() {
+        assert!(CCMPWIND_CONFIG.tile_degrees > 0.0);
+        assert!(
+            (180.0_f64 % CCMPWIND_CONFIG.tile_degrees).abs() < 1e-9,
+            "tile_degrees should evenly divide 180° for clean global coverage"
+        );
+        assert!(
+            (360.0_f64 % CCMPWIND_CONFIG.tile_degrees).abs() < 1e-9,
+            "tile_degrees should evenly divide 360° for clean global coverage"
+        );
+    }
+
+    #[test]
+    fn ccmpwind_max_radius_is_positive_and_subhemispheric() {
+        assert!(CCMPWIND_CONFIG.max_radius_meters > 0.0);
+        assert!(CCMPWIND_CONFIG.max_radius_meters < 1.0e7);
+    }
+
+    #[test]
+    fn ccmpwind_has_exactly_one_surface_level() {
+        // Surface wind product; the single-element levels array keeps
+        // the tile generator on the no-special-case path (see OI SST).
+        assert_eq!(CCMPWIND_CONFIG.levels.len(), 1);
+        assert!((CCMPWIND_CONFIG.levels[0] - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ccmpwind_has_global_coverage() {
+        // CCMP is a global gridded product; no coverage_bbox skip available.
+        assert!(CCMPWIND_CONFIG.coverage_bbox.is_none());
+    }
+
+    #[test]
+    fn ccmpwind_advertises_all_four_variables() {
+        // Wind vector components, speed, and observation count. If the
+        // upstream product adds or drops a variable this list (and the
+        // meta doc's data_info) must move together.
+        assert_eq!(
+            CCMPWIND_CONFIG.allowed_data_vars,
+            &["uwnd", "vwnd", "ws", "nobs"]
         );
     }
 }

@@ -20,6 +20,18 @@ Every response from the `/timeseries/...` endpoints is a JSON envelope:
 There is no separate "no results" status code: an empty response is
 `200 + {docs: [], next_url: null, ...}`, never `404`.
 
+## Datetime rendering
+
+Every datetime the API **emits** — timeseries axis strings, profile
+timestamps, source dates — is RFC-3339 with a fixed three fractional
+digits: `2020-01-01T00:00:00.000Z`, `1999-08-05T19:03:42.002Z`. This is
+a deliberate normalization over the 2.x API, which emitted whole
+seconds in some places: `...T00:00:00Z` (2.x) and `...T00:00:00.000Z`
+(3.x) denote the same instant, so parity checks against 2.x must
+compare dates *parsed*, not byte-wise. Datetime **inputs**
+(`startDate` / `endDate`) accept RFC-3339 with or without fractional
+seconds, unchanged.
+
 ## How pagination walks
 
 Server-side, each request's spatial parameters define a sequence of

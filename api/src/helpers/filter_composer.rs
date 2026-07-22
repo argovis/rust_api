@@ -7,7 +7,7 @@
 //!   - `tile_generator::generate_tiles` produces a sequence of `TileSpec`s
 //!     describing one page of the result.
 //!   - `dataset_config::DatasetConfig` knows the discrete level values that
-//!     a `level_index` resolves to.
+//!     a `page_index` resolves to.
 //!
 //! This module's job is to translate a `TileSpec` into BSON predicates and
 //! AND them with the user filter. Tile bbox becomes a GeoJSON Polygon on
@@ -26,32 +26,54 @@
 //! query document compact for common cases (id lookups, whole-globe tiles
 //! with no user filter) and only nests when we actually need to.
 //!
-//! Defensive on bounds: an `level_index` past the end of `config.levels` is
+//! Defensive on bounds: an `page_index` past the end of `config.levels` is
 //! a programming error (the tile generator should never emit one), but if
 //! one slips through we drop the level clause silently rather than panic.
 
-use mongodb::bson::{self, doc, Bson, Document};
+use mongodb::bson::{self, doc, Bson, DateTime as BsonDateTime, Document};
 use serde_json::{json, Value};
 
-use super::dataset_config::DatasetConfig;
+use super::dataset_config::{DatasetConfig, PageAxis};
 use super::filters::filter_timeseries;
 use super::tile_generator::TileSpec;
 
-/// Build the Mongo filter document for one page of a paginated request.
+/// Build the Mongo filter document for one page of a paginated request
+/// against a `Levels` dataset (the gridded timeseries handlers' entry
+/// point — behaviour identical to before the page axis was generalized).
+/// `TimeSlabs` handlers call `compose_filter_with_tile_slabs` so the
+/// page index can resolve against the runtime slab list.
 pub fn compose_filter_with_tile(
     params: Value,
     tile: &TileSpec,
     config: &DatasetConfig,
 ) -> Document {
+    compose_filter_with_tile_slabs(params, tile, config, &[])
+}
+
+/// Build the Mongo filter document for one page, supplying the slab-start
+/// list for `TimeSlabs` datasets. Must be the same list the tile
+/// generator emitted `page_index` against (`generate_tiles_with_slabs`),
+/// or the bracket resolution here disagrees with the tile sequence.
+/// Ignored by `Levels` datasets.
+pub fn compose_filter_with_tile_slabs(
+    params: Value,
+    tile: &TileSpec,
+    config: &DatasetConfig,
+    slab_starts: &[BsonDateTime],
+) -> Document {
     let user = filter_timeseries(params);
-    let tile_doc = build_tile_filter(tile, config);
+    let tile_doc = build_tile_filter(tile, config, slab_starts);
     combine_user_and_tile(user, tile_doc)
 }
 
 /// Translate a `TileSpec` into the additional Mongo predicates it imposes
-/// (spatial bounding box, level bracket). Returns an empty `Document` if
+/// (spatial bounding box, page bracket). Returns an empty `Document` if
 /// the tile is fully null (both fields `None`) — e.g. id lookups.
-fn build_tile_filter(tile: &TileSpec, config: &DatasetConfig) -> Document {
+fn build_tile_filter(
+    tile: &TileSpec,
+    config: &DatasetConfig,
+    slab_starts: &[BsonDateTime],
+) -> Document {
     let mut out = Document::new();
 
     if let Some(bbox) = &tile.tile_bbox {
@@ -115,23 +137,38 @@ fn build_tile_filter(tile: &TileSpec, config: &DatasetConfig) -> Document {
         );
     }
 
-    if let Some(i) = tile.level_index {
-        let levels = config.levels;
-        if i < levels.len() {
-            let lower = levels[i];
-            let mut level_clause = doc! { "$gte": lower };
-            if i + 1 < levels.len() {
-                // Half-open bracket: [L_i, L_{i+1}).
-                level_clause.insert("$lt", levels[i + 1]);
-            }
-            // For the final level we omit `$lt`, leaving the bracket as
-            // [L_last, +∞) — anything at or below the configured deepest
-            // level lands in this page.
-            out.insert("level", level_clause);
-        }
+    if let Some(i) = tile.page_index {
+        // Resolve the page index into a half-open bracket over the
+        // dataset's page-axis field. The two arms are isomorphic: bracket
+        // `i` is `[B_i, B_{i+1})`, with `$lt` omitted for the final
+        // bracket so it extends to +∞ (catches anything past the
+        // configured deepest level / the startup-cached latest slab).
+        //
         // i out of bounds: silently drop the clause. The tile generator
-        // shouldn't ever produce this; treating it as "no level filter" is
+        // shouldn't ever produce this; treating it as "no page filter" is
         // the most forgiving recovery if something upstream goes wrong.
+        match &config.page_axis {
+            PageAxis::Levels(levels) => {
+                if i < levels.len() {
+                    let mut level_clause = doc! { "$gte": levels[i] };
+                    if i + 1 < levels.len() {
+                        // Half-open bracket: [L_i, L_{i+1}).
+                        level_clause.insert("$lt", levels[i + 1]);
+                    }
+                    out.insert("level", level_clause);
+                }
+            }
+            PageAxis::TimeSlabs { .. } => {
+                if i < slab_starts.len() {
+                    let mut slab_clause = doc! { "$gte": slab_starts[i] };
+                    if i + 1 < slab_starts.len() {
+                        // Half-open bracket: [T_i, T_{i+1}).
+                        slab_clause.insert("$lt", slab_starts[i + 1]);
+                    }
+                    out.insert("timestamp", slab_clause);
+                }
+            }
+        }
     }
 
     out
@@ -168,7 +205,7 @@ mod tests {
     const TEST_CONFIG: DatasetConfig = DatasetConfig {
         tile_degrees: 10.0,
         max_radius_meters: 1.0e6,
-        levels: &[100.0, 500.0],
+        page_axis: PageAxis::Levels(&[100.0, 500.0]),
         coverage_bbox: None,
         allowed_data_vars: &[],
     };
@@ -176,17 +213,17 @@ mod tests {
     fn null_tile() -> TileSpec {
         TileSpec {
             tile_bbox: None,
-            level_index: None,
+            page_index: None,
         }
     }
 
-    fn full_tile(level_index: usize) -> TileSpec {
+    fn full_tile(page_index: usize) -> TileSpec {
         TileSpec {
             tile_bbox: Some(BoundingBox {
                 sw: [0.0, 0.0],
                 ne: [10.0, 10.0],
             }),
-            level_index: Some(level_index),
+            page_index: Some(page_index),
         }
     }
 
@@ -205,7 +242,7 @@ mod tests {
                 sw: [0.0, 0.0],
                 ne: [10.0, 10.0],
             }),
-            level_index: None,
+            page_index: None,
         };
         let f = compose_filter_with_tile(json!({}), &tile, &TEST_CONFIG);
         // No $and wrapping — empty user filter means we return tile alone.
@@ -220,7 +257,7 @@ mod tests {
     fn empty_params_with_level_only_returns_level_directly() {
         let tile = TileSpec {
             tile_bbox: None,
-            level_index: Some(0),
+            page_index: Some(0),
         };
         let f = compose_filter_with_tile(json!({}), &tile, &TEST_CONFIG);
         let level = f.get_document("level").unwrap();
@@ -279,7 +316,7 @@ mod tests {
             json!({"verticalRange": "0.0,1000.0"}),
             &TileSpec {
                 tile_bbox: None,
-                level_index: Some(0),
+                page_index: Some(0),
             },
             &TEST_CONFIG,
         );
@@ -308,7 +345,7 @@ mod tests {
             json!({}),
             &TileSpec {
                 tile_bbox: None,
-                level_index: Some(TEST_CONFIG.levels.len() - 1),
+                page_index: Some(TEST_CONFIG.levels().len() - 1),
             },
             &TEST_CONFIG,
         );
@@ -320,15 +357,15 @@ mod tests {
         );
     }
 
-    // ---- defensive: out-of-bounds level_index ------------------------------
+    // ---- defensive: out-of-bounds page_index ------------------------------
 
     #[test]
-    fn out_of_bounds_level_index_drops_level_clause() {
+    fn out_of_bounds_page_index_drops_level_clause() {
         let f = compose_filter_with_tile(
             json!({}),
             &TileSpec {
                 tile_bbox: None,
-                level_index: Some(TEST_CONFIG.levels.len() + 5),
+                page_index: Some(TEST_CONFIG.levels().len() + 5),
             },
             &TEST_CONFIG,
         );
@@ -361,7 +398,7 @@ mod tests {
                 sw: [0.0, 0.0],
                 ne: [10.0, 10.0],
             }),
-            level_index: None,
+            page_index: None,
         };
         let f = compose_filter_with_tile(json!({}), &tile, &TEST_CONFIG);
         let (ne_lon, ne_lat) = ne_of_composed(&f);
@@ -379,7 +416,7 @@ mod tests {
                 sw: [170.0, 0.0],
                 ne: [180.0, 10.0],
             }),
-            level_index: None,
+            page_index: None,
         };
         let f = compose_filter_with_tile(json!({}), &tile, &TEST_CONFIG);
         let (ne_lon, ne_lat) = ne_of_composed(&f);
@@ -395,7 +432,7 @@ mod tests {
                 sw: [0.0, 80.0],
                 ne: [10.0, 90.0],
             }),
-            level_index: None,
+            page_index: None,
         };
         let f = compose_filter_with_tile(json!({}), &tile, &TEST_CONFIG);
         let (ne_lon, ne_lat) = ne_of_composed(&f);
@@ -412,7 +449,7 @@ mod tests {
                 sw: [170.0, 80.0],
                 ne: [180.0, 90.0],
             }),
-            level_index: None,
+            page_index: None,
         };
         let f = compose_filter_with_tile(json!({}), &tile, &TEST_CONFIG);
         let (ne_lon, ne_lat) = ne_of_composed(&f);
@@ -427,7 +464,7 @@ mod tests {
                 sw: [-10.0, -5.0],
                 ne: [20.0, 15.0],
             }),
-            level_index: None,
+            page_index: None,
         };
         let f = compose_filter_with_tile(json!({}), &tile, &TEST_CONFIG);
         let geo = f.get_document("geolocation").unwrap();
@@ -468,5 +505,111 @@ mod tests {
         let nw = ring[3].as_array().unwrap();
         assert!((nw[0].as_f64().unwrap() - -10.0).abs() < 1e-12);
         assert!((nw[1].as_f64().unwrap() - ne_lat).abs() < 1e-12);
+    }
+
+    // ---- TimeSlabs page axis -------------------------------------------------
+
+    use crate::helpers::helpers::string2bsondate;
+    use mongodb::bson::Bson as BsonValue;
+
+    /// In situ style config: yearly slabs, no levels.
+    const SLAB_TEST_CONFIG: DatasetConfig = DatasetConfig {
+        tile_degrees: 10.0,
+        max_radius_meters: 1.0e6,
+        page_axis: PageAxis::TimeSlabs { width_days: 365 },
+        coverage_bbox: None,
+        allowed_data_vars: &[],
+    };
+
+    fn slabs() -> Vec<BsonDateTime> {
+        ["2019-01-01T00:00:00Z", "2020-01-01T00:00:00Z", "2021-01-01T00:00:00Z"]
+            .iter()
+            .map(|s| string2bsondate(s).expect("test date should parse"))
+            .collect()
+    }
+
+    #[test]
+    fn timeslab_page_index_becomes_timestamp_bracket() {
+        let s = slabs();
+        let f = compose_filter_with_tile_slabs(
+            json!({}),
+            &TileSpec {
+                tile_bbox: None,
+                page_index: Some(1),
+            },
+            &SLAB_TEST_CONFIG,
+            &s,
+        );
+        let ts = f.get_document("timestamp").unwrap();
+        assert_eq!(ts.get("$gte"), Some(&BsonValue::DateTime(s[1])));
+        assert_eq!(ts.get("$lt"), Some(&BsonValue::DateTime(s[2])));
+        // No level clause for a TimeSlabs dataset.
+        assert!(f.get_document("level").is_err());
+    }
+
+    #[test]
+    fn final_timeslab_omits_upper_bound() {
+        let s = slabs();
+        let f = compose_filter_with_tile_slabs(
+            json!({}),
+            &TileSpec {
+                tile_bbox: None,
+                page_index: Some(s.len() - 1),
+            },
+            &SLAB_TEST_CONFIG,
+            &s,
+        );
+        let ts = f.get_document("timestamp").unwrap();
+        assert_eq!(ts.get("$gte"), Some(&BsonValue::DateTime(s[2])));
+        assert!(
+            ts.get("$lt").is_none(),
+            "final slab should have no $lt — bracket extends to +∞"
+        );
+    }
+
+    #[test]
+    fn out_of_bounds_slab_index_drops_timestamp_clause() {
+        let s = slabs();
+        let f = compose_filter_with_tile_slabs(
+            json!({}),
+            &TileSpec {
+                tile_bbox: None,
+                page_index: Some(s.len() + 5),
+            },
+            &SLAB_TEST_CONFIG,
+            &s,
+        );
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn timeslab_bracket_composes_with_tile_bbox() {
+        let s = slabs();
+        let f = compose_filter_with_tile_slabs(
+            json!({}),
+            &full_tile(0),
+            &SLAB_TEST_CONFIG,
+            &s,
+        );
+        // Empty user filter → both clauses at top level, no $and.
+        assert!(f.get_array("$and").is_err());
+        assert!(f.get_document("geolocation").is_ok());
+        assert!(f.get_document("timestamp").is_ok());
+    }
+
+    #[test]
+    fn levels_datasets_ignore_slab_list_in_composer() {
+        // Passing a slab list alongside a Levels config must not change
+        // the emitted filter — the level bracket comes from config.
+        let with = compose_filter_with_tile_slabs(
+            json!({}),
+            &full_tile(0),
+            &TEST_CONFIG,
+            &slabs(),
+        );
+        let without = compose_filter_with_tile(json!({}), &full_tile(0), &TEST_CONFIG);
+        assert_eq!(with, without);
+        assert!(with.get_document("level").is_ok());
+        assert!(with.get_document("timestamp").is_err());
     }
 }

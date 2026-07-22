@@ -1,8 +1,9 @@
 //! Per-dataset configuration governing request-size limits.
 //!
 //! This is the seam where pagination decisions hang off the dataset
-//! identity. `tile_degrees` drives spatial tile generation; `levels`
-//! defines the discrete depth pages within each spatial tile;
+//! identity. `tile_degrees` drives spatial tile generation; `page_axis`
+//! defines the inner page dimension within each spatial tile (discrete
+//! depth levels for grids, time slabs for in situ data);
 //! `max_radius_meters` caps `center + radius` queries (which go through
 //! MongoDB `$near` and aren't paginated, so the cap is the only thing
 //! preventing a runaway disk-of-most-of-the-globe); `coverage_bbox`
@@ -27,6 +28,55 @@ use mongodb::bson::DateTime as BsonDateTime;
 use super::geometry::BoundingBox;
 use super::schema::DataInfo;
 
+/// The dataset's second pagination axis — the "inner" page dimension
+/// crossed with spatial tiles.
+///
+/// For the gridded timeseries datasets this is the discrete vertical
+/// `Levels` axis: page `i` within a spatial tile is the depth bracket
+/// `[L_i, L_{i+1})` (final bracket open-ended). For in situ point
+/// observations (Argo profiles) there is no per-doc `level` field to
+/// page on — each doc is a whole water column at one (point, time) —
+/// so the page axis is `TimeSlabs`: page `i` is the time bracket
+/// `[T_i, T_{i+1})` over the doc's scalar `timestamp` (final bracket
+/// open-ended, mirroring levels).
+///
+/// The two arms are deliberately isomorphic: a page index resolves to a
+/// half-open bracket over a scalar field, and everything downstream
+/// (tile crossing, probe-forward, `next_url`) is arm-agnostic. The only
+/// asymmetry is *where the bracket boundaries live*: levels are static
+/// config, but slab boundaries depend on the dataset's time span, which
+/// is only known at runtime (loaded at startup). So `TimeSlabs` carries
+/// just the slab width; the actual slab-start list is computed by
+/// `tile_generator::time_slab_starts` and threaded through the
+/// `*_with_slabs` entry points. The plain `generate_tiles` /
+/// `compose_filter_with_tile` signatures — the ones the grid handlers
+/// call — don't take slabs and are byte-for-byte the old behaviour.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PageAxis {
+    /// Discrete vertical levels, strictly increasing, shallowest first.
+    /// Page `i` ⇒ `level: { $gte: L_i, $lt: L_{i+1} }` (no `$lt` for
+    /// the deepest level).
+    Levels(&'static [f64]),
+    /// Fixed-width time slabs over the doc's scalar `timestamp`.
+    /// Page `i` ⇒ `timestamp: { $gte: T_i, $lt: T_{i+1} }` (no `$lt`
+    /// for the final slab). Width is in days — calendar-agnostic
+    /// arithmetic on epoch millis; slab boundaries are aesthetic, not
+    /// semantic, so day-based math keeps the generator pure and simple.
+    TimeSlabs { width_days: i64 },
+}
+
+impl PageAxis {
+    /// The level values when this axis is `Levels`, or an empty slice
+    /// otherwise. Exists so config invariants and tests can keep
+    /// reading "the levels" without matching on the enum everywhere.
+    pub fn levels(&self) -> &'static [f64] {
+        match self {
+            PageAxis::Levels(l) => l,
+            PageAxis::TimeSlabs { .. } => &[],
+        }
+    }
+}
+
 /// Per-dataset request-size policy.
 ///
 /// `tile_degrees`: edge length (degrees of longitude and latitude) of one
@@ -39,11 +89,14 @@ use super::schema::DataInfo;
 /// Mongo's `$near` enforces its own bound; we cap the bound so a
 /// malicious or naive caller can't ask for a half-globe disk.
 ///
-/// `levels`: the discrete vertical levels the dataset is sampled at, in
-/// strictly increasing order (shallowest first). Pagination treats each
-/// level as a separate page within a spatial tile. Datasets without a
-/// vertical dimension can pass a single-element slice (effectively a
-/// single "level" per tile).
+/// `page_axis`: the dataset's inner pagination dimension (see
+/// `PageAxis`). Grids use `Levels(...)` — the discrete vertical levels
+/// the dataset is sampled at, in strictly increasing order (shallowest
+/// first); pagination treats each level as a separate page within a
+/// spatial tile, and datasets without a vertical dimension pass a
+/// single-element slice (effectively a single "level" per tile). In
+/// situ datasets use `TimeSlabs { width_days }` and page through time
+/// brackets instead.
 ///
 /// `coverage_bbox`: optional rectangle the dataset's data is known to
 /// live inside. The tile generator drops any spatial tile that doesn't
@@ -62,9 +115,19 @@ use super::schema::DataInfo;
 pub struct DatasetConfig {
     pub tile_degrees: f64,
     pub max_radius_meters: f64,
-    pub levels: &'static [f64],
+    pub page_axis: PageAxis,
     pub coverage_bbox: Option<BoundingBox>,
     pub allowed_data_vars: &'static [&'static str],
+}
+
+impl DatasetConfig {
+    /// Convenience passthrough to `PageAxis::levels()` — the level
+    /// values for `Levels` datasets, empty for `TimeSlabs`. Keeps the
+    /// pre-`PageAxis` call sites (`config.levels` → `config.levels()`)
+    /// reading naturally.
+    pub fn levels(&self) -> &'static [f64] {
+        self.page_axis.levels()
+    }
 }
 
 /// Per-dataset identity + Mongo client + startup-loaded metadata, built
@@ -128,7 +191,7 @@ pub const BSOSE_LEVELS: &[f64] = &[2.1, 6.7, 12.15, 18.55, 26.25, 35.25, 45.0, 5
 pub const BSOSE_CONFIG: DatasetConfig = DatasetConfig {
     tile_degrees: 5.0,
     max_radius_meters: 100_000.0, // 100 km — bump if users complain
-    levels: BSOSE_LEVELS,
+    page_axis: PageAxis::Levels(BSOSE_LEVELS),
     coverage_bbox: Some(BoundingBox {
         sw: [-180.0, -90.0],
         ne: [180.0, -30.0],
@@ -157,7 +220,7 @@ pub const OISST_LEVELS: &[f64] = &[0.0];
 pub const OISST_CONFIG: DatasetConfig = DatasetConfig {
     tile_degrees: 5.0,
     max_radius_meters: 100_000.0, // 100 km — relax once usage informs us
-    levels: OISST_LEVELS,
+    page_axis: PageAxis::Levels(OISST_LEVELS),
     coverage_bbox: None,
     allowed_data_vars: &["sst"],
 };
@@ -178,7 +241,7 @@ pub const COPERNICUSSLA_LEVELS: &[f64] = &[0.0];
 pub const COPERNICUSSLA_CONFIG: DatasetConfig = DatasetConfig {
     tile_degrees: 5.0,
     max_radius_meters: 100_000.0, // 100 km — same starting cap as OI SST
-    levels: COPERNICUSSLA_LEVELS,
+    page_axis: PageAxis::Levels(COPERNICUSSLA_LEVELS),
     coverage_bbox: None,
     allowed_data_vars: &["sla", "adt", "ugosa", "ugos", "vgosa", "vgos"],
 };
@@ -197,7 +260,7 @@ pub const CCMPWIND_LEVELS: &[f64] = &[0.0];
 pub const CCMPWIND_CONFIG: DatasetConfig = DatasetConfig {
     tile_degrees: 5.0,
     max_radius_meters: 100_000.0, // 100 km — same starting cap as the others
-    levels: CCMPWIND_LEVELS,
+    page_axis: PageAxis::Levels(CCMPWIND_LEVELS),
     coverage_bbox: None,
     allowed_data_vars: &["uwnd", "vwnd", "ws", "nobs"],
 };
@@ -237,7 +300,7 @@ mod tests {
         // Pagination treats each level as a page; an empty level list would
         // produce a dataset with zero pages, which is almost certainly a
         // misconfiguration rather than an intentional state.
-        assert!(!BSOSE_CONFIG.levels.is_empty());
+        assert!(!BSOSE_CONFIG.levels().is_empty());
     }
 
     #[test]
@@ -245,7 +308,7 @@ mod tests {
         // The tile generator will rely on level order to map a level index
         // to a (lower, upper) depth bracket. If two levels collide or the
         // sequence reverses, that mapping is ambiguous.
-        for w in BSOSE_CONFIG.levels.windows(2) {
+        for w in BSOSE_CONFIG.levels().windows(2) {
             assert!(
                 w[0] < w[1],
                 "levels must be strictly increasing; found {} not < {}",
@@ -260,7 +323,7 @@ mod tests {
         // Depth is conventionally positive-downward in oceanographic data;
         // a negative value would indicate a sign-convention bug we'd want
         // to catch early.
-        for &d in BSOSE_CONFIG.levels {
+        for &d in BSOSE_CONFIG.levels() {
             assert!(d >= 0.0, "level depths should be non-negative; got {}", d);
         }
     }
@@ -291,7 +354,7 @@ mod tests {
         // Even a single-level dataset must have a one-element levels
         // array so the tile generator emits one tile per spatial cell.
         // An empty list would produce zero pages.
-        assert!(!OISST_CONFIG.levels.is_empty());
+        assert!(!OISST_CONFIG.levels().is_empty());
     }
 
     #[test]
@@ -301,8 +364,8 @@ mod tests {
         // composer code path work without special-casing "no vertical
         // dimension". If this ever changes, we should pause and think
         // about what multi-level OI SST would mean physically.
-        assert_eq!(OISST_CONFIG.levels.len(), 1);
-        assert!((OISST_CONFIG.levels[0] - 0.0).abs() < 1e-9);
+        assert_eq!(OISST_CONFIG.levels().len(), 1);
+        assert!((OISST_CONFIG.levels()[0] - 0.0).abs() < 1e-9);
     }
 
     #[test]
@@ -337,8 +400,8 @@ mod tests {
         // Sea level anomaly is by construction a surface product; the
         // single-element levels array keeps the tile generator on the
         // no-special-case path (see OI SST).
-        assert_eq!(COPERNICUSSLA_CONFIG.levels.len(), 1);
-        assert!((COPERNICUSSLA_CONFIG.levels[0] - 0.0).abs() < 1e-9);
+        assert_eq!(COPERNICUSSLA_CONFIG.levels().len(), 1);
+        assert!((COPERNICUSSLA_CONFIG.levels()[0] - 0.0).abs() < 1e-9);
     }
 
     #[test]
@@ -383,8 +446,8 @@ mod tests {
     fn ccmpwind_has_exactly_one_surface_level() {
         // Surface wind product; the single-element levels array keeps
         // the tile generator on the no-special-case path (see OI SST).
-        assert_eq!(CCMPWIND_CONFIG.levels.len(), 1);
-        assert!((CCMPWIND_CONFIG.levels[0] - 0.0).abs() < 1e-9);
+        assert_eq!(CCMPWIND_CONFIG.levels().len(), 1);
+        assert!((CCMPWIND_CONFIG.levels()[0] - 0.0).abs() < 1e-9);
     }
 
     #[test]

@@ -51,11 +51,24 @@ pub fn string2bsondate(date_str: &str) -> Option<BsonDateTime> {
         .map(|dt| BsonDateTime::from_millis(dt.timestamp_millis()))
 }
 
+/// THE datetime rendering for everything this API emits: RFC-3339 with a
+/// *fixed* three fractional digits (`1999-08-05T19:03:42.002Z`,
+/// `2020-06-15T12:34:56.000Z`). Grid timeseries axes, profile
+/// timestamps, source dates — one format, everywhere, forever.
+///
+/// This is a deliberate, sanctioned normalization over 2.x, which
+/// emitted whole seconds for grid axes: `...T00:00:00Z` (2.x) and
+/// `...T00:00:00.000Z` (3.x) are the same instant, and parity checks
+/// against 2.x should compare dates *parsed*, not byte-wise. The
+/// fixed-width fraction (rather than omit-when-zero) matches JS
+/// `Date.toISOString()` and keeps output byte-stable — clients never
+/// see mixed formats. `string2bsondate` parses every rendering (with or
+/// without millis), so values round-trip exactly.
 pub fn bsondate2string(date: &BsonDateTime) -> String {
     let millis = date.timestamp_millis();
     let datetime = DateTime::<Utc>::from_timestamp(millis / 1000, (millis % 1000) as u32 * 1_000_000);
     match datetime {
-        Some(dt) => dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        Some(dt) => dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
         None => String::from("Invalid timestamp"),
     }
 }
@@ -401,6 +414,7 @@ pub fn validate_radius_cap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helpers::dataset_config::PageAxis;
     use serde_json::json;
 
     // ---- validlonlat ---------------------------------------------------------
@@ -482,15 +496,41 @@ mod tests {
 
     #[test]
     fn string_to_bson_to_string_round_trips() {
+        // Rendering normalizes to fixed-millis, so a whole-second input
+        // comes back with `.000` appended — same instant, wider string.
         let s = "2020-06-15T12:34:56Z";
         let d = string2bsondate(s).expect("should parse");
-        let back = bsondate2string(&d);
-        assert_eq!(back, s);
+        assert_eq!(bsondate2string(&d), "2020-06-15T12:34:56.000Z");
+        // Semantic round trip is exact.
+        assert_eq!(string2bsondate(&bsondate2string(&d)), Some(d));
     }
 
     #[test]
     fn string2bsondate_rejects_garbage() {
         assert!(string2bsondate("not a date").is_none());
+    }
+
+    #[test]
+    fn bsondate2string_pads_whole_seconds_to_three_digits() {
+        // Fixed-width millis: a whole-second value renders `.000`, so
+        // responses never mix formats (JS toISOString convention).
+        let d = string2bsondate("2020-06-15T12:34:56Z").unwrap();
+        assert_eq!(bsondate2string(&d), "2020-06-15T12:34:56.000Z");
+    }
+
+    #[test]
+    fn bsondate2string_preserves_real_millis() {
+        let d = string2bsondate("1999-08-05T19:03:42.002Z").unwrap();
+        assert_eq!(bsondate2string(&d), "1999-08-05T19:03:42.002Z");
+    }
+
+    #[test]
+    fn rendering_round_trips_exactly() {
+        for s in ["1999-08-05T19:03:42.002Z", "2020-06-15T12:34:56.000Z"] {
+            let d = string2bsondate(s).unwrap();
+            let back = string2bsondate(&bsondate2string(&d)).unwrap();
+            assert_eq!(d, back, "round trip must be exact for {}", s);
+        }
     }
 
     // ---- create_response -----------------------------------------------------
@@ -752,7 +792,7 @@ mod tests {
     const RADIUS_TEST_CONFIG: DatasetConfig = DatasetConfig {
         tile_degrees: 10.0,
         max_radius_meters: 1_000_000.0, // 1000 km
-        levels: &[0.0],
+        page_axis: PageAxis::Levels(&[0.0]),
         coverage_bbox: None,
         allowed_data_vars: &[],
     };
@@ -762,7 +802,7 @@ mod tests {
     const DATA_TEST_CONFIG: DatasetConfig = DatasetConfig {
         tile_degrees: 10.0,
         max_radius_meters: 1_000_000.0,
-        levels: &[0.0],
+        page_axis: PageAxis::Levels(&[0.0]),
         coverage_bbox: None,
         allowed_data_vars: &["THETA", "SALT"],
     };

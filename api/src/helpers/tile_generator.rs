@@ -1,15 +1,28 @@
-//! Pure-function tile generator for paginated geo+depth queries.
+//! Pure-function tile generator for paginated geo + page-axis queries.
 //!
 //! Given the user's query params and a per-dataset config, produce the
 //! ordered sequence of `TileSpec`s that pagination will walk through. Each
 //! `TileSpec` carries an optional grid-aligned bounding box (the spatial
-//! page boundary) and an optional level index (the depth page).
+//! page boundary) and an optional page index into the dataset's inner
+//! pagination axis (`PageAxis`): a depth level for the gridded datasets,
+//! a time slab for in situ datasets.
 //!
-//! Iteration order is **spatial outer, level inner**: for each spatial tile,
-//! all dataset levels are emitted before moving to the next spatial tile.
-//! This means a client paginating linearly sees the full water column at
-//! one location before getting any data from the next location — friendlier
-//! for vertical-profile analysis than horizontal-slab analysis.
+//! Iteration order is **spatial outer, page inner**: for each spatial tile,
+//! all pages are emitted before moving to the next spatial tile. For grids
+//! (levels) a client paginating linearly sees the full water column at
+//! one location before getting any data from the next location —
+//! friendlier for vertical-profile analysis than horizontal-slab analysis.
+//! For in situ datasets (time slabs) the same ordering yields the full
+//! chronology at one location before moving on.
+//!
+//! Grid handlers call `generate_tiles(params, config)`, which behaves
+//! exactly as it did before the page axis was generalized. In situ
+//! handlers call `generate_tiles_with_slabs(params, config, slab_starts)`,
+//! passing the slab-start list computed at startup from the dataset's
+//! time span (see `time_slab_starts`). The slab list lives outside
+//! `DatasetConfig` because it depends on runtime state (the span is read
+//! from Mongo); the page *indices* emitted here always index into the
+//! same list the filter composer receives, so the two stay in agreement.
 //!
 //! The tiles are *grid-aligned* multiples of `config.tile_degrees`. We do
 //! NOT clip tiles to the user's box or polygon: the user's geo filter stays
@@ -30,28 +43,70 @@
 //! hemisphere may still over-tile — the unwrapping is intentionally
 //! simple-minded and assumes the polygon has at most one crossing.
 
+use mongodb::bson::DateTime as BsonDateTime;
 use serde_json::Value;
 
-use super::dataset_config::DatasetConfig;
+use super::dataset_config::{DatasetConfig, PageAxis};
 use super::geometry::BoundingBox;
-use super::helpers::{tidy_box, validlonlat};
+use super::helpers::{string2bsondate, tidy_box, validlonlat};
 
 /// One unit of pagination. Both fields are `Option` because some query
 /// shapes naturally suppress one or the other:
 ///
-///   - `id` lookups have no spatial or level constraint beyond the id
+///   - `id` lookups have no spatial or page constraint beyond the id
 ///     itself, so both fields are `None`.
-///   - `center + radius` is level-paginated but not spatially tiled, so
-///     `tile_bbox` is `None` and `level_index` walks the dataset's levels.
+///   - `center + radius` is page-paginated but not spatially tiled, so
+///     `tile_bbox` is `None` and `page_index` walks the dataset's page
+///     axis (levels or time slabs).
 ///   - polygon / box / whole-globe requests produce a full grid of
-///     `Some(bbox) + Some(level_index)` tiles.
+///     `Some(bbox) + Some(page_index)` tiles.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TileSpec {
     pub tile_bbox: Option<BoundingBox>,
-    pub level_index: Option<usize>,
+    pub page_index: Option<usize>,
 }
 
-/// Produce the ordered tile sequence for one request.
+/// The resolved page dimension for one request: which page indices to
+/// cross with the spatial tiles, plus whether the axis itself is
+/// degenerate (zero pages configured — distinct from "the user's date
+/// window clipped the slab range to empty", which must produce *zero*
+/// tiles, not unbounded ones).
+struct PagePlan {
+    range: std::ops::Range<usize>,
+    axis_is_empty: bool,
+}
+
+impl PagePlan {
+    fn resolve(
+        params: &Value,
+        config: &DatasetConfig,
+        slab_starts: &[BsonDateTime],
+    ) -> PagePlan {
+        match &config.page_axis {
+            PageAxis::Levels(levels) => PagePlan {
+                range: 0..levels.len(),
+                axis_is_empty: levels.is_empty(),
+            },
+            PageAxis::TimeSlabs { .. } => PagePlan {
+                // Clip the slab range to the user's date window: slabs
+                // wholly outside [startDate, endDate) can't contain
+                // matching docs, so we don't generate (or probe) them.
+                // Indices remain indices into the *full* slab list — the
+                // filter composer receives the same list, so page_index
+                // resolution stays consistent.
+                range: clip_slab_range(params, slab_starts),
+                axis_is_empty: slab_starts.is_empty(),
+            },
+        }
+    }
+}
+
+/// Produce the ordered tile sequence for one request against a `Levels`
+/// dataset. This is the gridded timeseries handlers' entry point, and
+/// its behaviour is identical to before the page axis was generalized.
+/// In situ (`TimeSlabs`) handlers call `generate_tiles_with_slabs`
+/// instead — calling this on a `TimeSlabs` dataset degenerates to the
+/// empty-axis defensive path (no slab list to page over).
 ///
 /// Precondition: the caller has already validated `params` via
 /// `helpers::validate_query_params`, so polygon strings are parseable, box
@@ -59,49 +114,131 @@ pub struct TileSpec {
 /// is defensive about parse failures (returns an empty vec) but does not
 /// re-validate semantics.
 pub fn generate_tiles(params: &Value, config: &DatasetConfig) -> Vec<TileSpec> {
+    generate_tiles_with_slabs(params, config, &[])
+}
+
+/// Produce the ordered tile sequence for one request, supplying the
+/// slab-start list for `TimeSlabs` datasets. `slab_starts` is ignored by
+/// `Levels` datasets; for `TimeSlabs` it must be the same list the
+/// filter composer will resolve `page_index` against (computed once at
+/// startup via `time_slab_starts` and cached on the dataset's source).
+pub fn generate_tiles_with_slabs(
+    params: &Value,
+    config: &DatasetConfig,
+    slab_starts: &[BsonDateTime],
+) -> Vec<TileSpec> {
     // id wins over everything else: it's a primary-key lookup, no tiling
     // adds value. One TileSpec with no extra constraints.
     if params.get("id").is_some() {
         return vec![TileSpec {
             tile_bbox: None,
-            level_index: None,
+            page_index: None,
         }];
     }
 
-    // center + radius: level-only pagination. The `$near` query is bounded
+    let pages = PagePlan::resolve(params, config, slab_starts);
+
+    // center + radius: page-only pagination. The `$near` query is bounded
     // by `max_radius_meters` (enforced in helpers::validate_radius_cap),
     // so we don't tile it spatially.
     if params.get("center").is_some() {
-        return level_only_tiles(config);
+        return page_only_tiles(&pages);
     }
 
     // polygon: tile the polygon's naive bbox. The polygon itself remains in
     // the Mongo filter; Mongo computes (polygon ∩ tile_bbox) per page.
     if let Some(polygon) = params.get("polygon").and_then(|v| v.as_str()) {
-        return polygon_tiles(polygon, config);
+        return polygon_tiles(polygon, config, &pages);
     }
 
     // box: tile the box, splitting at the antimeridian if needed.
     if let Some(boxregion) = params.get("box").and_then(|v| v.as_str()) {
-        return box_tiles(boxregion, config);
+        return box_tiles(boxregion, config, &pages);
     }
 
     // no spatial filter: tile the whole globe.
-    whole_globe_tiles(config)
+    whole_globe_tiles(config, &pages)
+}
+
+/// Generate the slab-start list for a `TimeSlabs` dataset from its time
+/// span. Starts at `earliest` and steps by `width_days` until the start
+/// passes `latest`. Mirrors the levels convention: slab `i` covers
+/// `[starts[i], starts[i+1])`, and the *final* slab is open-ended
+/// (`[starts[last], +∞)`) so docs past the startup-cached `latest` —
+/// e.g. data ingested after the API booted — still land on a page.
+///
+/// Intended to run once at startup (the span comes from Mongo); the
+/// result is cached on the dataset's source struct and threaded into
+/// `generate_tiles_with_slabs` / `compose_filter_with_tile_slabs` per
+/// request. Degenerate inputs (non-positive width, reversed span)
+/// produce an empty list, which downstream treats as the empty axis.
+pub fn time_slab_starts(
+    earliest: BsonDateTime,
+    latest: BsonDateTime,
+    width_days: i64,
+) -> Vec<BsonDateTime> {
+    if width_days <= 0 || latest.timestamp_millis() < earliest.timestamp_millis() {
+        return Vec::new();
+    }
+    let width_ms = width_days * 86_400_000;
+    let mut out = Vec::new();
+    let mut t = earliest.timestamp_millis();
+    while t <= latest.timestamp_millis() {
+        out.push(BsonDateTime::from_millis(t));
+        t += width_ms;
+    }
+    out
+}
+
+/// Restrict the slab index range to slabs that can intersect the user's
+/// `[startDate, endDate)` window. No dates → the full range. The final
+/// slab is open-ended, so it always intersects any window that isn't
+/// entirely before it. Unparseable dates are ignored here (validation
+/// has already rejected them upstream with a 400).
+fn clip_slab_range(params: &Value, slab_starts: &[BsonDateTime]) -> std::ops::Range<usize> {
+    let n = slab_starts.len();
+    let start = params
+        .get("startDate")
+        .and_then(|v| v.as_str())
+        .and_then(string2bsondate);
+    let end = params
+        .get("endDate")
+        .and_then(|v| v.as_str())
+        .and_then(string2bsondate);
+
+    // First slab whose (exclusive) end is after the window start. The
+    // final slab qualifies unconditionally (open-ended).
+    let lo = match start {
+        None => 0,
+        Some(sd) => (0..n)
+            .position(|i| i + 1 >= n || slab_starts[i + 1] > sd)
+            .unwrap_or(n),
+    };
+    // First slab whose start is at/after the window end — everything
+    // from there on is excluded (the window is half-open, so a slab
+    // starting exactly at endDate contains no in-window instants).
+    let hi = match end {
+        None => n,
+        Some(ed) => (0..n).position(|i| slab_starts[i] >= ed).unwrap_or(n),
+    };
+
+    lo..hi.max(lo)
 }
 
 // ---------------------------------------------------------------------------
 
-fn level_only_tiles(config: &DatasetConfig) -> Vec<TileSpec> {
-    (0..config.levels.len())
+fn page_only_tiles(pages: &PagePlan) -> Vec<TileSpec> {
+    pages
+        .range
+        .clone()
         .map(|i| TileSpec {
             tile_bbox: None,
-            level_index: Some(i),
+            page_index: Some(i),
         })
         .collect()
 }
 
-fn whole_globe_tiles(config: &DatasetConfig) -> Vec<TileSpec> {
+fn whole_globe_tiles(config: &DatasetConfig, pages: &PagePlan) -> Vec<TileSpec> {
     let spatial = grid_aligned_tiles(
         BoundingBox {
             sw: [-180.0, -90.0],
@@ -109,10 +246,10 @@ fn whole_globe_tiles(config: &DatasetConfig) -> Vec<TileSpec> {
         },
         config.tile_degrees,
     );
-    cross_levels(apply_coverage(spatial, config), config)
+    cross_pages(apply_coverage(spatial, config), pages)
 }
 
-fn box_tiles(boxregion: &str, config: &DatasetConfig) -> Vec<TileSpec> {
+fn box_tiles(boxregion: &str, config: &DatasetConfig, pages: &PagePlan) -> Vec<TileSpec> {
     let parsed: Vec<Vec<f64>> = match serde_json::from_str(boxregion) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
@@ -156,10 +293,10 @@ fn box_tiles(boxregion: &str, config: &DatasetConfig) -> Vec<TileSpec> {
         let bbox = pad_bbox_for_tiling(bbox, 0.0, 0.0, config.tile_degrees);
         tiles.extend(grid_aligned_tiles(bbox, config.tile_degrees));
     }
-    cross_levels(apply_coverage(tiles, config), config)
+    cross_pages(apply_coverage(tiles, config), pages)
 }
 
-fn polygon_tiles(polygon: &str, config: &DatasetConfig) -> Vec<TileSpec> {
+fn polygon_tiles(polygon: &str, config: &DatasetConfig, pages: &PagePlan) -> Vec<TileSpec> {
     let coords: Vec<Vec<f64>> = match serde_json::from_str(polygon) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
@@ -183,7 +320,7 @@ fn polygon_tiles(polygon: &str, config: &DatasetConfig) -> Vec<TileSpec> {
         let bbox = pad_bbox_for_tiling(bbox, south_pad, north_pad, config.tile_degrees);
         spatial.extend(grid_aligned_tiles(bbox, config.tile_degrees));
     }
-    cross_levels(apply_coverage(spatial, config), config)
+    cross_pages(apply_coverage(spatial, config), pages)
 }
 
 /// Drop tiles that don't overlap the dataset's known coverage region.
@@ -452,25 +589,35 @@ fn grid_aligned_tiles(bbox: BoundingBox, tile_degrees: f64) -> Vec<BoundingBox> 
     out
 }
 
-/// Cross a list of spatial tiles with the dataset's levels in
-/// spatial-outer / level-inner order.
-fn cross_levels(spatial: Vec<BoundingBox>, config: &DatasetConfig) -> Vec<TileSpec> {
-    let n_levels = config.levels.len();
-    let mut out = Vec::with_capacity(spatial.len() * n_levels.max(1));
+/// Cross a list of spatial tiles with the request's page-index range in
+/// spatial-outer / page-inner order.
+///
+/// Two distinct "no pages" situations, with different outputs:
+///
+///   - `pages.axis_is_empty` — the dataset's page axis has zero entries
+///     (a zero-level config, or a `TimeSlabs` dataset with no slab list).
+///     Defensive: shouldn't pass config validation, but if it happens we
+///     still emit one unconstrained spec per spatial cell so the request
+///     returns *something*.
+///   - `pages.range` is empty but the axis is not — the user's date
+///     window clipped every slab away. That's a legitimate "no data can
+///     match" outcome: emit *zero* specs, so the handler falls through
+///     to the empty response. Emitting unconstrained specs here would
+///     serve unbounded pages, which is exactly what the axis exists to
+///     prevent.
+fn cross_pages(spatial: Vec<BoundingBox>, pages: &PagePlan) -> Vec<TileSpec> {
+    let mut out = Vec::with_capacity(spatial.len() * pages.range.len().max(1));
     for bbox in spatial {
-        if n_levels == 0 {
-            // Defensive: a dataset with zero levels shouldn't pass our
-            // config tests, but if it did we'd still emit one tile per
-            // spatial cell so the request returns *something*.
+        if pages.axis_is_empty {
             out.push(TileSpec {
                 tile_bbox: Some(bbox),
-                level_index: None,
+                page_index: None,
             });
         } else {
-            for i in 0..n_levels {
+            for i in pages.range.clone() {
                 out.push(TileSpec {
                     tile_bbox: Some(bbox.clone()),
-                    level_index: Some(i),
+                    page_index: Some(i),
                 });
             }
         }
@@ -490,7 +637,7 @@ mod tests {
     const TEST_CONFIG: DatasetConfig = DatasetConfig {
         tile_degrees: 10.0,
         max_radius_meters: 1.0e6,
-        levels: &[0.0, 100.0],
+        page_axis: PageAxis::Levels(&[0.0, 100.0]),
         coverage_bbox: None,
         allowed_data_vars: &[],
     };
@@ -504,7 +651,7 @@ mod tests {
             tiles,
             vec![TileSpec {
                 tile_bbox: None,
-                level_index: None
+                page_index: None
             }]
         );
     }
@@ -528,10 +675,10 @@ mod tests {
             &json!({"center": "0,0", "radius": "100"}),
             &TEST_CONFIG,
         );
-        assert_eq!(tiles.len(), TEST_CONFIG.levels.len());
+        assert_eq!(tiles.len(), TEST_CONFIG.levels().len());
         for (i, t) in tiles.iter().enumerate() {
             assert_eq!(t.tile_bbox, None, "no spatial tile for center+radius");
-            assert_eq!(t.level_index, Some(i), "level pages in order");
+            assert_eq!(t.page_index, Some(i), "level pages in order");
         }
     }
 
@@ -541,7 +688,7 @@ mod tests {
     fn empty_params_tile_whole_globe() {
         let tiles = generate_tiles(&json!({}), &TEST_CONFIG);
         // 18 lat rows × 36 lon cols × 2 levels = 1296
-        assert_eq!(tiles.len(), 18 * 36 * TEST_CONFIG.levels.len());
+        assert_eq!(tiles.len(), 18 * 36 * TEST_CONFIG.levels().len());
     }
 
     #[test]
@@ -554,7 +701,7 @@ mod tests {
                     sw: [-180.0, -90.0],
                     ne: [-170.0, -80.0],
                 }),
-                level_index: Some(0),
+                page_index: Some(0),
             }
         );
     }
@@ -570,7 +717,7 @@ mod tests {
                     sw: [170.0, 80.0],
                     ne: [180.0, 90.0],
                 }),
-                level_index: Some(TEST_CONFIG.levels.len() - 1),
+                page_index: Some(TEST_CONFIG.levels().len() - 1),
             }
         );
     }
@@ -584,10 +731,10 @@ mod tests {
         // its ownership row) = 4 spatial tiles × 2 levels = 8 specs, in
         // order: (tile0, lvl0), (tile0, lvl1), (tile1, lvl0), ...
         assert_eq!(tiles.len(), 8);
-        assert_eq!(tiles[0].level_index, Some(0));
-        assert_eq!(tiles[1].level_index, Some(1));
-        assert_eq!(tiles[2].level_index, Some(0));
-        assert_eq!(tiles[3].level_index, Some(1));
+        assert_eq!(tiles[0].page_index, Some(0));
+        assert_eq!(tiles[1].page_index, Some(1));
+        assert_eq!(tiles[2].page_index, Some(0));
+        assert_eq!(tiles[3].page_index, Some(1));
         // Same spatial tile for indices 0,1; same for 2,3; different
         // between the pairs.
         assert_eq!(tiles[0].tile_bbox, tiles[1].tile_bbox);
@@ -603,7 +750,7 @@ mod tests {
         // 2 spatial tiles: the cell itself plus the ownership row above
         // its grid-aligned north edge (docs at exactly lat 10 belong to
         // the row starting at 10, per half-open membership).
-        assert_eq!(tiles.len(), 2 * TEST_CONFIG.levels.len());
+        assert_eq!(tiles.len(), 2 * TEST_CONFIG.levels().len());
         assert_eq!(
             tiles[0].tile_bbox,
             Some(BoundingBox {
@@ -632,7 +779,7 @@ mod tests {
             &json!({"box": "[[3.5,7.2],[24.8,19.1]]"}),
             &TEST_CONFIG,
         );
-        assert_eq!(tiles.len(), 6 * TEST_CONFIG.levels.len());
+        assert_eq!(tiles.len(), 6 * TEST_CONFIG.levels().len());
 
         // First spatial tile should be the SW grid cell [0..10, 0..10].
         // Tiles are NOT clipped to the user box — the user box stays in the
@@ -667,7 +814,7 @@ mod tests {
         // Two sub-boxes; each gains a row below (NH south bound pads
         // down by the tile-edge sag) and the ownership row above the
         // grid-aligned north edge: 3 rows × 1 col × 2 bands = 6 spatial.
-        assert_eq!(tiles.len(), 6 * TEST_CONFIG.levels.len());
+        assert_eq!(tiles.len(), 6 * TEST_CONFIG.levels().len());
 
         let bboxes: Vec<_> = tiles.iter().map(|t| t.tile_bbox.clone()).collect();
         // East band tile
@@ -702,7 +849,7 @@ mod tests {
         // NH south bound at lat 10 pads down past the grid line (tile-
         // edge sag), the north bound pads up by the polygon-edge sag +
         // ownership pad past lat 20. 3 rows × 1 col = 3 spatial tiles.
-        assert_eq!(tiles.len(), 3 * TEST_CONFIG.levels.len());
+        assert_eq!(tiles.len(), 3 * TEST_CONFIG.levels().len());
         assert_eq!(
             tiles[0].tile_bbox,
             Some(BoundingBox {
@@ -722,7 +869,7 @@ mod tests {
             &TEST_CONFIG,
         );
         // Bbox tile count: 3 cols (0,10,20) × 2 rows (0,10) = 6 cells.
-        assert_eq!(tiles.len(), 6 * TEST_CONFIG.levels.len());
+        assert_eq!(tiles.len(), 6 * TEST_CONFIG.levels().len());
     }
 
     #[test]
@@ -744,7 +891,7 @@ mod tests {
 
         // 2 spatial sub-bboxes × 2 rows each (the top edge at lat 10
         // sags + ownership pad → the row above is generated) × 2 levels.
-        assert_eq!(tiles.len(), 2 * 2 * TEST_CONFIG.levels.len());
+        assert_eq!(tiles.len(), 2 * 2 * TEST_CONFIG.levels().len());
 
         let bboxes: Vec<_> = tiles.iter().map(|t| t.tile_bbox.clone()).collect();
         assert!(bboxes.contains(&Some(BoundingBox {
@@ -766,7 +913,7 @@ mod tests {
         );
         // 2 rows: the ownership/sag pad past the grid-aligned top edge
         // at lat 10 generates the row above.
-        assert_eq!(tiles.len(), 2 * TEST_CONFIG.levels.len());
+        assert_eq!(tiles.len(), 2 * TEST_CONFIG.levels().len());
         assert_eq!(
             tiles[0].tile_bbox,
             Some(BoundingBox {
@@ -784,7 +931,7 @@ mod tests {
             &TEST_CONFIG,
         );
         // 2 rows, same shape as the east-of-dateline case above.
-        assert_eq!(tiles.len(), 2 * TEST_CONFIG.levels.len());
+        assert_eq!(tiles.len(), 2 * TEST_CONFIG.levels().len());
         assert_eq!(
             tiles[0].tile_bbox,
             Some(BoundingBox {
@@ -847,7 +994,7 @@ mod tests {
             "equatorward sliver row at -50 should be generated"
         );
         // 3 rows (−70, −60, −50) × 8 cols (−40..30) × 2 levels.
-        assert_eq!(tiles.len(), 24 * TEST_CONFIG.levels.len());
+        assert_eq!(tiles.len(), 24 * TEST_CONFIG.levels().len());
     }
 
     #[test]
@@ -871,7 +1018,7 @@ mod tests {
             .map(|b| b.sw[1])
             .fold(f64::INFINITY, f64::min);
         assert_eq!(min_sw_lat, -60.0);
-        assert_eq!(tiles.len(), 4 * TEST_CONFIG.levels.len());
+        assert_eq!(tiles.len(), 4 * TEST_CONFIG.levels().len());
     }
 
     #[test]
@@ -894,7 +1041,7 @@ mod tests {
     const COVERAGE_TEST_CONFIG: DatasetConfig = DatasetConfig {
         tile_degrees: 10.0,
         max_radius_meters: 1.0e6,
-        levels: &[0.0, 100.0],
+        page_axis: PageAxis::Levels(&[0.0, 100.0]),
         coverage_bbox: Some(BoundingBox {
             sw: [-180.0, -90.0],
             ne: [180.0, -30.0],
@@ -922,7 +1069,7 @@ mod tests {
         // overlaps the coverage [-90,-30]). Row sw_lat=-30 is also kept
         // by the permissive overlap test (sw_lat=-30 == ne_lat of cov).
         // So 7 rows × 36 cols × 2 levels = 504.
-        assert_eq!(tiles.len(), 7 * 36 * COVERAGE_TEST_CONFIG.levels.len());
+        assert_eq!(tiles.len(), 7 * 36 * COVERAGE_TEST_CONFIG.levels().len());
     }
 
     #[test]
@@ -948,7 +1095,7 @@ mod tests {
         // Sanity: the TEST_CONFIG (coverage_bbox: None) still produces
         // the full 648-tile whole-globe sequence we asserted elsewhere.
         let tiles = generate_tiles(&json!({}), &TEST_CONFIG);
-        assert_eq!(tiles.len(), 18 * 36 * TEST_CONFIG.levels.len());
+        assert_eq!(tiles.len(), 18 * 36 * TEST_CONFIG.levels().len());
     }
 
     #[test]
@@ -1011,7 +1158,7 @@ mod tests {
         // row appears on top.
         assert_eq!(
             tiles.len(),
-            2 * 2 * crate::helpers::dataset_config::BSOSE_CONFIG.levels.len()
+            2 * 2 * crate::helpers::dataset_config::BSOSE_CONFIG.levels().len()
         );
 
         let bboxes: Vec<_> = tiles.iter().map(|t| t.tile_bbox.clone()).collect();
@@ -1060,7 +1207,7 @@ mod tests {
         );
         assert_eq!(
             tiles.len(),
-            2 * crate::helpers::dataset_config::BSOSE_CONFIG.levels.len()
+            2 * crate::helpers::dataset_config::BSOSE_CONFIG.levels().len()
         );
 
         let bboxes: Vec<_> = tiles.iter().map(|t| t.tile_bbox.clone()).collect();
@@ -1125,7 +1272,7 @@ mod tests {
         const EMPTY_LEVELS_CONFIG: DatasetConfig = DatasetConfig {
             tile_degrees: 10.0,
             max_radius_meters: 1.0e6,
-            levels: &[],
+            page_axis: PageAxis::Levels(&[]),
             coverage_bbox: None,
             allowed_data_vars: &[],
         };
@@ -1136,7 +1283,192 @@ mod tests {
         // 2 spatial tiles (cell + ownership row above the grid-aligned
         // north edge), one spec each.
         assert_eq!(tiles.len(), 2);
-        assert_eq!(tiles[0].level_index, None);
-        assert_eq!(tiles[1].level_index, None);
+        assert_eq!(tiles[0].page_index, None);
+        assert_eq!(tiles[1].page_index, None);
+    }
+
+    // ---- TimeSlabs page axis -------------------------------------------------
+
+    /// In situ style config: no levels, yearly time slabs, global coverage.
+    const SLAB_TEST_CONFIG: DatasetConfig = DatasetConfig {
+        tile_degrees: 10.0,
+        max_radius_meters: 1.0e6,
+        page_axis: PageAxis::TimeSlabs { width_days: 365 },
+        coverage_bbox: None,
+        allowed_data_vars: &[],
+    };
+
+    fn bd(s: &str) -> BsonDateTime {
+        string2bsondate(s).expect("test date should parse")
+    }
+
+    /// Three yearly slabs starting 2019-01-01: [s0, s1), [s1, s2), [s2, ∞).
+    fn three_slabs() -> Vec<BsonDateTime> {
+        time_slab_starts(bd("2019-01-01T00:00:00Z"), bd("2021-06-01T00:00:00Z"), 365)
+    }
+
+    #[test]
+    fn time_slab_starts_steps_by_width_and_covers_span() {
+        let starts = three_slabs();
+        // 2019-01-01 + 365d = 2019-12-31 + 365d = 2020-12-30; the next
+        // step (2021-12-30) is past `latest`, so three starts total.
+        assert_eq!(starts.len(), 3);
+        assert_eq!(starts[0], bd("2019-01-01T00:00:00Z"));
+        assert_eq!(
+            starts[1].timestamp_millis() - starts[0].timestamp_millis(),
+            365 * 86_400_000
+        );
+        // Every start is at or before `latest` (the final open-ended slab
+        // covers the remainder).
+        assert!(starts[2] <= bd("2021-06-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn time_slab_starts_degenerate_inputs_yield_empty() {
+        let e = bd("2020-01-01T00:00:00Z");
+        let l = bd("2021-01-01T00:00:00Z");
+        assert!(time_slab_starts(e, l, 0).is_empty(), "zero width");
+        assert!(time_slab_starts(e, l, -7).is_empty(), "negative width");
+        assert!(time_slab_starts(l, e, 365).is_empty(), "reversed span");
+    }
+
+    #[test]
+    fn time_slab_starts_single_instant_span_yields_one_slab() {
+        let t = bd("2020-01-01T00:00:00Z");
+        let starts = time_slab_starts(t, t, 365);
+        assert_eq!(starts, vec![t]);
+    }
+
+    #[test]
+    fn timeslabs_box_query_is_spatial_outer_slab_inner() {
+        let tiles = generate_tiles_with_slabs(
+            &json!({"box": "[[0,0],[20,10]]"}),
+            &SLAB_TEST_CONFIG,
+            &three_slabs(),
+        );
+        // Same spatial layout as the Levels version of this query
+        // (4 spatial tiles), crossed with 3 slabs instead of levels.
+        assert_eq!(tiles.len(), 4 * 3);
+        assert_eq!(tiles[0].page_index, Some(0));
+        assert_eq!(tiles[1].page_index, Some(1));
+        assert_eq!(tiles[2].page_index, Some(2));
+        assert_eq!(tiles[3].page_index, Some(0));
+        assert_eq!(tiles[0].tile_bbox, tiles[2].tile_bbox);
+        assert_ne!(tiles[0].tile_bbox, tiles[3].tile_bbox);
+    }
+
+    #[test]
+    fn timeslabs_center_radius_is_slab_only() {
+        let tiles = generate_tiles_with_slabs(
+            &json!({"center": "0,0", "radius": "100"}),
+            &SLAB_TEST_CONFIG,
+            &three_slabs(),
+        );
+        assert_eq!(tiles.len(), 3);
+        for (i, t) in tiles.iter().enumerate() {
+            assert_eq!(t.tile_bbox, None, "no spatial tile for center+radius");
+            assert_eq!(t.page_index, Some(i), "slab pages in order");
+        }
+    }
+
+    #[test]
+    fn timeslabs_id_short_circuits_to_single_null_tile() {
+        let tiles = generate_tiles_with_slabs(
+            &json!({"id": "13857_068"}),
+            &SLAB_TEST_CONFIG,
+            &three_slabs(),
+        );
+        assert_eq!(
+            tiles,
+            vec![TileSpec {
+                tile_bbox: None,
+                page_index: None
+            }]
+        );
+    }
+
+    #[test]
+    fn timeslabs_date_window_clips_slab_range_but_keeps_indices() {
+        // Window entirely inside slab 1: [2020-02-01, 2020-06-01).
+        let tiles = generate_tiles_with_slabs(
+            &json!({
+                "box": "[[0,0],[10,10]]",
+                "startDate": "2020-02-01T00:00:00Z",
+                "endDate":   "2020-06-01T00:00:00Z",
+            }),
+            &SLAB_TEST_CONFIG,
+            &three_slabs(),
+        );
+        // 2 spatial tiles (cell + ownership row) × 1 surviving slab.
+        assert_eq!(tiles.len(), 2);
+        for t in &tiles {
+            // Index 1 — into the FULL slab list, so the composer
+            // resolves the same bracket the generator meant.
+            assert_eq!(t.page_index, Some(1));
+        }
+    }
+
+    #[test]
+    fn timeslabs_window_past_final_slab_start_hits_open_ended_slab() {
+        // Window starts after every slab start: only the final,
+        // open-ended slab can contain matching docs.
+        let tiles = generate_tiles_with_slabs(
+            &json!({
+                "box": "[[0,0],[10,10]]",
+                "startDate": "2024-01-01T00:00:00Z",
+            }),
+            &SLAB_TEST_CONFIG,
+            &three_slabs(),
+        );
+        assert_eq!(tiles.len(), 2);
+        for t in &tiles {
+            assert_eq!(t.page_index, Some(2), "final slab is open-ended");
+        }
+    }
+
+    #[test]
+    fn timeslabs_window_before_first_slab_yields_zero_tiles() {
+        // Window ends before the dataset's earliest slab: no slab can
+        // match, and crucially we emit ZERO tiles rather than falling
+        // into the defensive unconstrained-page path.
+        let tiles = generate_tiles_with_slabs(
+            &json!({
+                "box": "[[0,0],[10,10]]",
+                "endDate": "2018-01-01T00:00:00Z",
+            }),
+            &SLAB_TEST_CONFIG,
+            &three_slabs(),
+        );
+        assert!(
+            tiles.is_empty(),
+            "window before all slabs should produce no tiles, got {:?}",
+            tiles
+        );
+    }
+
+    #[test]
+    fn timeslabs_empty_slab_list_still_emits_per_spatial_tile() {
+        // Degenerate axis (no slab list) mirrors the empty-levels
+        // defensive path: one unconstrained spec per spatial cell.
+        let tiles = generate_tiles_with_slabs(
+            &json!({"box": "[[0,0],[10,10]]"}),
+            &SLAB_TEST_CONFIG,
+            &[],
+        );
+        assert_eq!(tiles.len(), 2);
+        assert!(tiles.iter().all(|t| t.page_index.is_none()));
+    }
+
+    #[test]
+    fn levels_datasets_ignore_slab_list() {
+        // Passing a slab list to a Levels dataset must not perturb the
+        // grid behaviour — same output as the no-slab entry point.
+        let with = generate_tiles_with_slabs(
+            &json!({"box": "[[0,0],[10,10]]"}),
+            &TEST_CONFIG,
+            &three_slabs(),
+        );
+        let without = generate_tiles(&json!({"box": "[[0,0],[10,10]]"}), &TEST_CONFIG);
+        assert_eq!(with, without);
     }
 }

@@ -226,6 +226,9 @@ mod tests {
         page_axis: PageAxis::Levels(&[100.0, 500.0]),
         coverage_bbox: None,
         allowed_data_vars: &[],
+        data_var_modifiers: &[],
+        data_var_companion: None,
+        data_var_negation: false,
     };
 
     fn null_tile() -> TileSpec {
@@ -537,6 +540,9 @@ mod tests {
         page_axis: PageAxis::TimeSlabs { width_days: 365 },
         coverage_bbox: None,
         allowed_data_vars: &[],
+        data_var_modifiers: &[],
+        data_var_companion: None,
+        data_var_negation: false,
     };
 
     fn slabs() -> Vec<BsonDateTime> {

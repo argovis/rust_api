@@ -640,6 +640,9 @@ mod tests {
         page_axis: PageAxis::Levels(&[0.0, 100.0]),
         coverage_bbox: None,
         allowed_data_vars: &[],
+        data_var_modifiers: &[],
+        data_var_companion: None,
+        data_var_negation: false,
     };
 
     // ---- top-level dispatch --------------------------------------------------
@@ -1047,6 +1050,9 @@ mod tests {
             ne: [180.0, -30.0],
         }),
         allowed_data_vars: &[],
+        data_var_modifiers: &[],
+        data_var_companion: None,
+        data_var_negation: false,
     };
 
     #[test]
@@ -1275,6 +1281,9 @@ mod tests {
             page_axis: PageAxis::Levels(&[]),
             coverage_bbox: None,
             allowed_data_vars: &[],
+            data_var_modifiers: &[],
+            data_var_companion: None,
+            data_var_negation: false,
         };
         let tiles = generate_tiles(
             &json!({"box": "[[0,0],[10,10]]"}),
@@ -1296,6 +1305,9 @@ mod tests {
         page_axis: PageAxis::TimeSlabs { width_days: 365 },
         coverage_bbox: None,
         allowed_data_vars: &[],
+        data_var_modifiers: &[],
+        data_var_companion: None,
+        data_var_negation: false,
     };
 
     fn bd(s: &str) -> BsonDateTime {

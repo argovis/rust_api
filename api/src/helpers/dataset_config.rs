@@ -106,18 +106,38 @@ impl PageAxis {
 /// rectangle is treated as inclusive on its edges; a doc lying exactly
 /// on the coverage boundary is preserved.
 ///
-/// `allowed_data_vars`: the per-dataset variable names accepted in the
-/// `data=` qsp. Used by `validate_data_param` to reject typos (and to
-/// power the "did you mean" suggestion). Does not include the universal
-/// tokens (`all`, `except-data-values`) or integer QC filters —
-/// those are accepted regardless of dataset and handled by the
+/// `allowed_data_vars`: the per-dataset *base* variable names accepted
+/// in the `data=` qsp. Used by `validate_data_param` to reject typos
+/// (and to power the "did you mean" suggestion). Does not include the
+/// universal tokens (`all`, `except-data-values`) or integer QC filters
+/// — those are accepted regardless of dataset and handled by the
 /// validator directly.
+///
+/// `data_var_modifiers` / `data_var_companion`: the dataset's token
+/// *grammar* on top of the base names. A valid variable token is
+/// `base[modifier][companion]` — e.g. Argo's `doxy_med_argoqc` =
+/// base `doxy` + modifier `_med` + companion `_argoqc`, per the 2.x
+/// validator pattern. The validator strips one optional companion, then
+/// one optional modifier, then looks the base up in
+/// `allowed_data_vars`. Datasets without suffixed variables (all the
+/// grids) declare `&[]` / `None` and get exact-match behaviour,
+/// unchanged.
+///
+/// `data_var_negation`: whether `data=` tokens may carry a `~` prefix
+/// (e.g. `data=salinity,~doxy`) — a *profile-level presence filter*:
+/// keep only docs that do NOT list the negated variable in their
+/// `data_info`. Meaningful for heterogeneous in situ collections (core
+/// vs BGC floats); meaningless for grids, where every doc carries the
+/// same variables — grids declare `false` and `~` tokens are rejected.
 pub struct DatasetConfig {
     pub tile_degrees: f64,
     pub max_radius_meters: f64,
     pub page_axis: PageAxis,
     pub coverage_bbox: Option<BoundingBox>,
     pub allowed_data_vars: &'static [&'static str],
+    pub data_var_modifiers: &'static [&'static str],
+    pub data_var_companion: Option<&'static str>,
+    pub data_var_negation: bool,
 }
 
 impl DatasetConfig {
@@ -197,6 +217,9 @@ pub const BSOSE_CONFIG: DatasetConfig = DatasetConfig {
         ne: [180.0, -30.0],
     }),
     allowed_data_vars: &["THETA", "SALT"],
+    data_var_modifiers: &[],
+    data_var_companion: None,
+    data_var_negation: false,
 };
 
 /// OI SST has a single vertical level (the sea surface). We model it as
@@ -223,6 +246,9 @@ pub const OISST_CONFIG: DatasetConfig = DatasetConfig {
     page_axis: PageAxis::Levels(OISST_LEVELS),
     coverage_bbox: None,
     allowed_data_vars: &["sst"],
+    data_var_modifiers: &[],
+    data_var_companion: None,
+    data_var_negation: false,
 };
 
 /// Copernicus SLA is a sea-surface product: like OI SST, a single
@@ -244,6 +270,9 @@ pub const COPERNICUSSLA_CONFIG: DatasetConfig = DatasetConfig {
     page_axis: PageAxis::Levels(COPERNICUSSLA_LEVELS),
     coverage_bbox: None,
     allowed_data_vars: &["sla", "adt", "ugosa", "ugos", "vgosa", "vgos"],
+    data_var_modifiers: &[],
+    data_var_companion: None,
+    data_var_negation: false,
 };
 
 /// CCMP wind is a sea-surface product: single vertical level modeled as
@@ -263,6 +292,9 @@ pub const CCMPWIND_CONFIG: DatasetConfig = DatasetConfig {
     page_axis: PageAxis::Levels(CCMPWIND_LEVELS),
     coverage_bbox: None,
     allowed_data_vars: &["uwnd", "vwnd", "ws", "nobs"],
+    data_var_modifiers: &[],
+    data_var_companion: None,
+    data_var_negation: false,
 };
 
 #[cfg(test)]
@@ -509,68 +541,83 @@ mod tests {
     }
 
     #[test]
-    fn argo_vocabulary_is_core_plus_companions() {
-        // The structural invariants of the vocabulary, not its exact
-        // contents (which track the upstream data-keys list): core
-        // variables present, and every variable paired with its
-        // `_argoqc` companion.
+    fn argo_vocabulary_is_bases_only_with_suffix_grammar() {
+        // Structural invariants: core variables present, the list holds
+        // *base* names only (suffixed forms come from the token grammar,
+        // not enumeration), and the grammar fields carry the 2.x
+        // pattern's suffixes.
         for core in ["pressure", "temperature", "salinity"] {
             assert!(ARGO_CONFIG.allowed_data_vars.contains(&core));
         }
         for var in ARGO_CONFIG.allowed_data_vars {
-            if !var.ends_with("_argoqc") {
-                let companion = format!("{}_argoqc", var);
-                assert!(
-                    ARGO_CONFIG.allowed_data_vars.iter().any(|v| *v == companion),
-                    "variable '{}' is missing its '{}' companion",
-                    var,
-                    companion
-                );
-            }
+            assert!(
+                !var.ends_with("_argoqc") && !var.ends_with("_std") && !var.ends_with("_med"),
+                "'{}' looks suffixed — the vocabulary should hold bases only",
+                var
+            );
         }
+        assert_eq!(ARGO_CONFIG.data_var_modifiers, &["_std", "_med"]);
+        assert_eq!(ARGO_CONFIG.data_var_companion, Some("_argoqc"));
+        assert!(ARGO_CONFIG.data_var_negation, "~ negation is a 2.x argo feature");
+        // And the grids stay exact-match, no negation.
+        assert!(BSOSE_CONFIG.data_var_modifiers.is_empty());
+        assert_eq!(BSOSE_CONFIG.data_var_companion, None);
+        assert!(!BSOSE_CONFIG.data_var_negation);
     }
 }
 
 // argo (profile family) ///////////////////////////////////////////////////////
 
-/// Variable names accepted in `/argo`'s `data=` qsp.
+/// Base variable names accepted in `/argo`'s `data=` qsp — transcribed
+/// from the 2.x validator's `argo_data_keys` pattern, which is the
+/// authority on the vocabulary. A full token is
+/// `base[_std|_med][_argoqc]` (see `data_var_modifiers` /
+/// `data_var_companion` on `ARGO_CONFIG`): the suffix grammar lives in
+/// config, so this list stays bases-only — adding a variable is one
+/// line. No single Argo doc carries all of these (core vs BGC vs deep
+/// differ per float); a validated-but-absent variable simply drops the
+/// doc downstream, per the drop-on-empty rule.
 ///
-/// **Seeded from the Argovis 2.x data-keys vocabulary — verify against
-/// the ingestion pipeline before relying on it.** Core (pressure,
-/// temperature, salinity) plus the BGC variables, each paired with its
-/// `_argoqc` companion so an explicit companion request (e.g.
-/// `data=temperature,temperature_argoqc`) validates. No single Argo doc
-/// carries all of these (core vs BGC vs deep differ per float); a
-/// validated-but-absent variable simply drops the doc downstream, per
-/// the drop-on-empty rule. Kept as one flat const so updating the
-/// vocabulary is a one-line-per-variable edit.
+/// Not yet carried over from the 2.x pattern: the `~` negation prefix
+/// (semantics to be pinned down before implementing — see
+/// ARGO-DESIGN.md open questions), and 2.x's integer tokens being
+/// non-negative only (`[0-9]+`) where our shared validator accepts any
+/// signed integer, a harmless superset.
 pub const ARGO_VARS: &[&str] = &[
-    "pressure", "pressure_argoqc",
-    "temperature", "temperature_argoqc",
-    "salinity", "salinity_argoqc",
-    "bbp470", "bbp470_argoqc",
-    "bbp532", "bbp532_argoqc",
-    "bbp700", "bbp700_argoqc",
-    "cdom", "cdom_argoqc",
-    "chla", "chla_argoqc",
-    "cp660", "cp660_argoqc",
-    "down_irradiance380", "down_irradiance380_argoqc",
-    "down_irradiance412", "down_irradiance412_argoqc",
-    "down_irradiance442", "down_irradiance442_argoqc",
-    "down_irradiance443", "down_irradiance443_argoqc",
-    "down_irradiance490", "down_irradiance490_argoqc",
-    "down_irradiance555", "down_irradiance555_argoqc",
-    "down_irradiance665", "down_irradiance665_argoqc",
-    "down_irradiance670", "down_irradiance670_argoqc",
-    "downwelling_par", "downwelling_par_argoqc",
-    "doxy", "doxy_argoqc",
-    "nitrate", "nitrate_argoqc",
-    "ph_in_situ_total", "ph_in_situ_total_argoqc",
-    "turbidity", "turbidity_argoqc",
-    "up_radiance412", "up_radiance412_argoqc",
-    "up_radiance443", "up_radiance443_argoqc",
-    "up_radiance490", "up_radiance490_argoqc",
-    "up_radiance555", "up_radiance555_argoqc",
+    "bbp470",
+    "bbp532",
+    "bbp700",
+    "bbp700_2",
+    "bisulfide",
+    "cdom",
+    "chla",
+    "cndc",
+    "cndx",
+    "cp660",
+    "down_irradiance380",
+    "down_irradiance412",
+    "down_irradiance442",
+    "down_irradiance443",
+    "down_irradiance490",
+    "down_irradiance555",
+    "down_irradiance670",
+    "downwelling_par",
+    "doxy",
+    "doxy2",
+    "doxy3",
+    "molar_doxy",
+    "nitrate",
+    "ph_in_situ_total",
+    "pressure",
+    "salinity",
+    "salinity_sfile",
+    "temperature",
+    "temperature_sfile",
+    "turbidity",
+    "up_radiance412",
+    "up_radiance443",
+    "up_radiance490",
+    "up_radiance555",
 ];
 
 /// Configuration for the Argo profile dataset.
@@ -589,6 +636,9 @@ pub const ARGO_CONFIG: DatasetConfig = DatasetConfig {
     page_axis: PageAxis::TimeSlabs { width_days: 365 },
     coverage_bbox: None,
     allowed_data_vars: ARGO_VARS,
+    data_var_modifiers: &["_std", "_med"],
+    data_var_companion: Some("_argoqc"),
+    data_var_negation: true,
 };
 
 /// Per-dataset identity + Mongo client + startup-loaded state for the

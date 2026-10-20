@@ -274,6 +274,34 @@ fn is_comma_separated_pair(s: &str) -> bool {
 /// in `api/PAGINATION.md`.
 const UNIVERSAL_DATA_TOKENS: &[&str] = &["all", "except-data-values"];
 
+/// Strip the dataset's declared token suffixes off a `data=` token:
+/// one optional companion (outermost, e.g. `_argoqc`), then one
+/// optional modifier (e.g. `_std` / `_med`), returning the candidate
+/// base name. Mirrors the 2.x validator pattern's
+/// `base(_std|_med)?(_argoqc)?` ordering — a suffix in the wrong order
+/// (e.g. `doxy_argoqc_std`) deliberately fails to strip cleanly and is
+/// rejected. Datasets that declare no suffixes get the token back
+/// unchanged (exact matching, the grids' behaviour).
+fn strip_data_suffixes<'a>(token: &'a str, config: &DatasetConfig) -> &'a str {
+    let t = match config.data_var_companion {
+        Some(c) => token.strip_suffix(c).unwrap_or(token),
+        None => token,
+    };
+    config
+        .data_var_modifiers
+        .iter()
+        .find_map(|m| t.strip_suffix(m))
+        .unwrap_or(t)
+}
+
+/// True when `token` matches the dataset's variable grammar:
+/// `base[modifier][companion]` with the base in `allowed_data_vars`.
+fn matches_data_vocabulary(token: &str, config: &DatasetConfig) -> bool {
+    config
+        .allowed_data_vars
+        .contains(&strip_data_suffixes(token, config))
+}
+
 /// Validate the contents of the `data=` qsp against the dataset's
 /// `allowed_data_vars`. Each comma-separated token must be one of:
 ///
@@ -307,13 +335,42 @@ pub fn validate_data_param(
                 "error": "'data' qsp contains an empty token (likely a leading, trailing, or doubled comma)"
             })));
         }
+        // `~variable` is a profile-level presence NEGATION (keep only
+        // docs that don't carry the variable), accepted only where the
+        // dataset opts in. A negation selects profiles rather than
+        // requesting columns, so it deliberately does NOT set
+        // `has_variable` — integer QC filters still need a positive
+        // variable to act on.
+        if let Some(negated) = token.strip_prefix('~') {
+            if !config.data_var_negation {
+                return Err(HttpResponse::BadRequest().json(json!({
+                    "error": format!(
+                        "'data' token '{}': negation (~) is not supported for this dataset",
+                        token
+                    )
+                })));
+            }
+            if UNIVERSAL_DATA_TOKENS.contains(&negated) || negated.parse::<i64>().is_ok() {
+                return Err(HttpResponse::BadRequest().json(json!({
+                    "error": format!(
+                        "'data' token '{}': only variable names can be negated",
+                        token
+                    )
+                })));
+            }
+            if matches_data_vocabulary(negated, config) {
+                continue;
+            }
+            let msg = unknown_data_token_message(negated, config);
+            return Err(HttpResponse::BadRequest().json(json!({"error": msg})));
+        }
         if UNIVERSAL_DATA_TOKENS.contains(&token) {
             if token == "all" {
                 has_variable = true;
             }
             continue;
         }
-        if config.allowed_data_vars.contains(&token) {
+        if matches_data_vocabulary(token, config) {
             has_variable = true;
             continue;
         }
@@ -342,17 +399,18 @@ fn unknown_data_token_message(token: &str, config: &DatasetConfig) -> String {
     // dataset variable names). Integer QC filters aren't suggestible
     // — the user either types one correctly or they don't.
     //
-    // Distance is computed case-insensitively so a user typing `theta`
-    // or `Theta` still gets pointed at `THETA`. Validation itself is
-    // case-sensitive (the user is asked to fix their request), but the
-    // suggestion should be forgiving.
+    // Distance is computed against the *base* form of the typo (suffixes
+    // stripped per the dataset's grammar), case-insensitively, so a user
+    // typing `doxi_argoqc` still gets pointed at `doxy`. Validation
+    // itself is case-sensitive (the user is asked to fix their request),
+    // but the suggestion should be forgiving.
     let candidates: Vec<&str> = UNIVERSAL_DATA_TOKENS
         .iter()
         .copied()
         .chain(config.allowed_data_vars.iter().copied())
         .collect();
 
-    let token_lower = token.to_lowercase();
+    let token_lower = strip_data_suffixes(token, config).to_lowercase();
     let suggestion = candidates
         .iter()
         .map(|c| (*c, edit_distance(&token_lower, &c.to_lowercase())))
@@ -814,6 +872,9 @@ mod tests {
         page_axis: PageAxis::Levels(&[0.0]),
         coverage_bbox: None,
         allowed_data_vars: &[],
+        data_var_modifiers: &[],
+        data_var_companion: None,
+        data_var_negation: false,
     };
 
     /// Test config with a couple of allowed variable names, used by
@@ -824,6 +885,9 @@ mod tests {
         page_axis: PageAxis::Levels(&[0.0]),
         coverage_bbox: None,
         allowed_data_vars: &["THETA", "SALT"],
+        data_var_modifiers: &[],
+        data_var_companion: None,
+        data_var_negation: false,
     };
 
     // ---- validate_data_param --------------------------------------------------
@@ -885,6 +949,138 @@ mod tests {
             let err = validate_data_param(&params, &DATA_TEST_CONFIG).unwrap_err();
             assert_eq!(err.status(), 400, "'{}' should be rejected", raw);
         }
+    }
+
+    // ---- suffix grammar (profile-family token shapes) --------------------------
+
+    /// Argo-shaped grammar config: bases plus `_std`/`_med` modifiers and
+    /// the `_argoqc` companion, per the 2.x validator pattern.
+    const GRAMMAR_TEST_CONFIG: DatasetConfig = DatasetConfig {
+        tile_degrees: 10.0,
+        max_radius_meters: 1_000_000.0,
+        page_axis: PageAxis::Levels(&[0.0]),
+        coverage_bbox: None,
+        allowed_data_vars: &["doxy", "pressure"],
+        data_var_modifiers: &["_std", "_med"],
+        data_var_companion: Some("_argoqc"),
+        data_var_negation: true,
+    };
+
+    #[test]
+    fn grammar_accepts_all_suffix_combinations() {
+        // base(_std|_med)?(_argoqc)? — every combination of the optional
+        // suffixes validates.
+        for token in [
+            "doxy",
+            "doxy_std",
+            "doxy_med",
+            "doxy_argoqc",
+            "doxy_std_argoqc",
+            "doxy_med_argoqc",
+        ] {
+            let params = json!({ "data": token });
+            assert!(
+                validate_data_param(&params, &GRAMMAR_TEST_CONFIG).is_ok(),
+                "token '{}' should be accepted",
+                token
+            );
+        }
+    }
+
+    #[test]
+    fn grammar_rejects_wrong_suffix_order_and_unknown_bases() {
+        for token in [
+            "doxy_argoqc_std", // companion must be outermost
+            "doxy_std_med",    // at most one modifier
+            "chla",            // base not in this config's vocabulary
+            "chla_argoqc",     // suffixing an unknown base doesn't help
+            "_argoqc",         // suffix with no base
+        ] {
+            let params = json!({ "data": token });
+            assert!(
+                validate_data_param(&params, &GRAMMAR_TEST_CONFIG).is_err(),
+                "token '{}' should be rejected",
+                token
+            );
+        }
+    }
+
+    #[test]
+    fn grammar_suffixed_token_counts_as_a_variable_for_integer_pairing() {
+        // A suffixed variable satisfies the "integers need a variable"
+        // rule just like a bare one.
+        let params = json!({ "data": "doxy_argoqc,1" });
+        assert!(validate_data_param(&params, &GRAMMAR_TEST_CONFIG).is_ok());
+    }
+
+    #[test]
+    fn grammar_grids_stay_exact_match() {
+        // A grid config declares no suffixes, so suffixed forms of its
+        // variables are rejected — the grammar is opt-in per dataset.
+        let params = json!({ "data": "THETA_argoqc" });
+        assert!(validate_data_param(&params, &DATA_TEST_CONFIG).is_err());
+    }
+
+    #[test]
+    fn grammar_suggestion_strips_suffixes_before_matching() {
+        // A typo'd base inside a suffixed token still earns a suggestion
+        // pointing at the base name.
+        let msg = unknown_data_token_message("doxi_argoqc", &GRAMMAR_TEST_CONFIG);
+        assert!(
+            msg.contains("Did you mean 'doxy'"),
+            "suggestion missing in: {}",
+            msg
+        );
+    }
+
+    // ---- ~ negation validation --------------------------------------------------
+
+    #[test]
+    fn negation_accepts_valid_variable_tokens() {
+        for raw in ["~doxy", "~doxy_std_argoqc", "pressure,~doxy", "all,~doxy"] {
+            let params = json!({ "data": raw });
+            assert!(
+                validate_data_param(&params, &GRAMMAR_TEST_CONFIG).is_ok(),
+                "'{}' should be accepted",
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn negation_rejects_non_variable_and_unknown_targets() {
+        // NB: GRAMMAR_TEST_CONFIG's vocabulary is just doxy + pressure —
+        // 'frobnicate' stands in for any base outside the dataset's
+        // vocabulary (on the real ARGO_CONFIG, every ARGO_VARS base is
+        // negatable). Matches the 2.x pattern, where ~ wraps the same
+        // alternation of known names.
+        for raw in ["~all", "~except-data-values", "~1", "~frobnicate", "~~doxy"] {
+            let params = json!({ "data": raw });
+            assert!(
+                validate_data_param(&params, &GRAMMAR_TEST_CONFIG).is_err(),
+                "'{}' should be rejected",
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn negation_does_not_satisfy_integer_pairing() {
+        // A negation selects profiles; it is not a variable for integer
+        // QC filters to act on. `data=~doxy,1` is still a QC filter with
+        // nothing to filter.
+        let params = json!({ "data": "~doxy,1" });
+        let err = validate_data_param(&params, &GRAMMAR_TEST_CONFIG).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn negation_is_rejected_where_not_opted_in() {
+        // Grid configs don't declare negation support; ~ tokens 400 even
+        // on an otherwise-valid variable.
+        let params = json!({ "data": "~THETA" });
+        let err = validate_data_param(&params, &DATA_TEST_CONFIG).unwrap_err();
+        assert_eq!(err.status(), 400);
     }
 
     #[test]

@@ -260,6 +260,11 @@ pub fn timeseries_stub<T: schema::IsTimeseries>(result: &T) -> schema::Timeserie
 ///     the equivalent request without them.
 ///   - `data_info` is per-doc only; there is no meta-level cache, so no
 ///     precedence rule and no cache parameter.
+///   - `~variable` tokens (2.x negation) are profile-level presence
+///     filters: a doc whose `data_info` lists a negated variable is
+///     dropped. They select profiles, never columns — and an
+///     only-negations request degrades to the slim listing once the
+///     selection is done.
 ///
 /// Response-shape rules match the grids exactly:
 ///
@@ -279,8 +284,36 @@ pub fn transform_profile<T: schema::IsProfile>(
         .map(|s| s.split(',').map(|s| s.to_string()).collect())
         .unwrap_or_default();
 
+    // `~variable` tokens are profile-level presence NEGATIONS: keep only
+    // docs whose data_info does NOT list the variable (e.g.
+    // `data=salinity,~doxy` → docs with salinity and without doxy).
+    // They're extracted first because they apply to every response shape
+    // — including `all` and the only-negations slim listing below — and
+    // contribute nothing to column selection. A doc with no data_info
+    // lists nothing, so it trivially lacks every negated variable and
+    // passes.
+    let negations: Vec<String> = data
+        .iter()
+        .filter_map(|t| t.strip_prefix('~').map(|n| n.to_string()))
+        .collect();
+    data.retain(|t| !t.starts_with('~'));
+
+    if !negations.is_empty() {
+        if let Some(di) = doc.data_info() {
+            if negations
+                .iter()
+                .any(|n| di.0.iter().any(|name| name == n))
+            {
+                return None; // doc carries a negated variable — drop.
+            }
+        }
+    }
+
     // Same 2.x normalization as the grids: a lone `except-data-values`
-    // is "clear the values of… nothing" — treat as absent `data=`.
+    // is "clear the values of… nothing" — treat as absent `data=`. With
+    // negations extracted, an only-negations request (`data=~doxy`)
+    // lands here too: the negations have done their selecting, and with
+    // no positive tokens the response is the slim listing.
     if data.len() == 1 && data[0] == "except-data-values" {
         data = Vec::new();
     }
@@ -1211,6 +1244,72 @@ mod tests {
         let info = out.data_info().unwrap();
         assert_eq!(info.0, vec!["temperature".to_string()]);
         assert_eq!(out.data().len(), 1);
+    }
+
+    // ---- ~ negation (profile-level presence filters) ---------------------------
+
+    #[test]
+    fn profile_negation_drops_docs_carrying_the_variable() {
+        // argo4 carries temperature → a ~temperature request drops it,
+        // regardless of the positive tokens also matching.
+        let out = transform_profile(&json!({"data": "pressure,~temperature"}), argo4());
+        assert!(out.is_none(), "doc listing a negated variable must drop");
+    }
+
+    #[test]
+    fn profile_negation_passes_docs_lacking_the_variable() {
+        // argo4 has no doxy → ~doxy passes, positive selection proceeds.
+        let mut out = transform_profile(&json!({"data": "temperature,~doxy"}), argo4())
+            .expect("doxy-less doc should survive ~doxy");
+        let info = out.data_info().unwrap();
+        assert!(info.0.contains(&"temperature".to_string()));
+    }
+
+    #[test]
+    fn profile_only_negations_give_slim_listing() {
+        // data=~doxy alone: the negation does the selecting; with no
+        // positive tokens the response is the slim listing.
+        let mut out = transform_profile(&json!({"data": "~doxy"}), argo4())
+            .expect("doxy-less doc survives an only-negation request");
+        assert!(out.data().is_empty());
+        assert!(out.data_info().is_none());
+        // And a doc that HAS doxy is dropped by the same request.
+        let with_doxy = make_argo(
+            "p3",
+            vec![vec![Some(1.0)], vec![Some(2.0)]],
+            &["pressure", "doxy"],
+        );
+        assert!(transform_profile(&json!({"data": "~doxy"}), with_doxy).is_none());
+    }
+
+    #[test]
+    fn profile_negation_composes_with_all() {
+        // Full columns of profiles lacking the negated variable.
+        let mut out = transform_profile(&json!({"data": "all,~doxy"}), argo4())
+            .expect("doxy-less doc survives all,~doxy");
+        assert_eq!(out.data().len(), 4, "all four columns kept");
+    }
+
+    #[test]
+    fn profile_negation_matches_names_exactly() {
+        // ~doxy must not exclude a doc that carries only doxy2.
+        let doc = make_argo(
+            "p4",
+            vec![vec![Some(1.0)], vec![Some(2.0)]],
+            &["pressure", "doxy2"],
+        );
+        let out = transform_profile(&json!({"data": "pressure,~doxy"}), doc);
+        assert!(out.is_some(), "doxy2 is not doxy — exact-name negation only");
+    }
+
+    #[test]
+    fn profile_negation_with_no_data_info_passes() {
+        // A doc with no data_info lists nothing, so it trivially lacks
+        // every negated variable.
+        let mut doc = argo4();
+        doc.data_info = None;
+        let out = transform_profile(&json!({"data": "all,~doxy"}), doc);
+        assert!(out.is_some(), "no data_info -> nothing listed -> negation passes");
     }
 
     #[test]

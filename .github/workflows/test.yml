@@ -29,6 +29,7 @@ jobs:
       # signal. Both point at the same Mongo container in CI; in production
       # each dataset is typically deployed against its own Mongo.
       MONGODB_URI: mongodb://localhost:27017
+      MONGODB_URI_ARGO: mongodb://localhost:27017
       MONGODB_URI_BSOSE: mongodb://localhost:27017
       MONGODB_URI_NOAAOISST: mongodb://localhost:27017
       API_URL: http://localhost:8080

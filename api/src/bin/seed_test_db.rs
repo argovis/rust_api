@@ -6,12 +6,13 @@
 //     MONGODB_URI=mongodb://localhost:27017 cargo run --bin seed_test_db
 //
 // What it does:
-//   * drops the `argo.bsose`, `argo.noaaOIsst`, and `argo.timeseriesMeta`
-//     collections
+//   * drops the `argo.bsose`, `argo.noaaOIsst`, `argo.timeseriesMeta`,
+//     `argo.argo`, and `argo.argoMeta` collections
 //   * loads the JSON fixtures embedded at compile time
 //   * converts ISO-8601 strings in known date fields to BSON DateTimes
 //   * inserts the resulting documents
-//   * creates a 2dsphere index on `geolocation` for each data collection
+//   * creates a 2dsphere index on `geolocation` for each data collection,
+//     plus a `timestamp` index on `argo` (slab brackets + startup span)
 //
 // Date fields in the fixtures are written as ISO-8601 strings to keep the
 // JSON readable; the seeder converts them to BSON DateTimes here, since
@@ -28,6 +29,8 @@ const TIMESERIES_META_FIXTURE: &str =
     include_str!("../../fixtures/timeseriesMeta.json");
 const BSOSE_FIXTURE: &str = include_str!("../../fixtures/bsose.json");
 const NOAA_OISST_FIXTURE: &str = include_str!("../../fixtures/noaaOIsst.json");
+const ARGO_FIXTURE: &str = include_str!("../../fixtures/argo.json");
+const ARGO_META_FIXTURE: &str = include_str!("../../fixtures/argoMeta.json");
 
 const DB_NAME: &str = "argo";
 
@@ -63,6 +66,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .create_index(geo_index, None)
             .await?;
     }
+
+    // Argo profiles: the in situ data collection. `timestamp` is the
+    // per-doc scalar the TimeSlabs page axis brackets, so it's converted
+    // to a real BSON DateTime and indexed (the API's startup span query
+    // and every slab bracket ride that index). The 2dsphere index is
+    // required, as for the grids ($near refuses to plan without it).
+    seed_collection(&db, "argo", ARGO_FIXTURE, &["timestamp", "date_updated_argovis"]).await?;
+    for keys in [
+        bson::doc! { "geolocation": "2dsphere" },
+        bson::doc! { "timestamp": 1 },
+    ] {
+        let index = IndexModel::builder().keys(keys).build();
+        db.collection::<Document>("argo")
+            .create_index(index, None)
+            .await?;
+    }
+
+    // Per-platform Argo metadata: `_id` lookups only (batchmeta's `$in`),
+    // served by the default _id index — no extra indexes, no date fields.
+    seed_collection(&db, "argoMeta", ARGO_META_FIXTURE, &[]).await?;
 
     println!("Seed complete: {} populated.", DB_NAME);
     Ok(())

@@ -1,0 +1,36 @@
+[
+  {
+    "_id": "13857_m0",
+    "data_type": "oceanicProfile",
+    "data_center": "AO",
+    "instrument": "profiling_float",
+    "pi_name": ["BOB MOLINARI"],
+    "platform": "13857",
+    "platform_type": "PALACE",
+    "fleetmonitoring": "https://fleetmonitoring.euro-argo.eu/float/13857",
+    "oceanops": "https://www.ocean-ops.org/board/wa/Platform?ref=13857",
+    "positioning_system": "ARGOS",
+    "wmo_inst_type": "845"
+  },
+  {
+    "_id": "2901500_m0",
+    "data_type": "oceanicProfile",
+    "data_center": "IN",
+    "instrument": "profiling_float",
+    "platform": "2901500",
+    "platform_type": "APEX",
+    "positioning_system": "GPS",
+    "wmo_inst_type": "846"
+  },
+  {
+    "_id": "4902911_m0",
+    "data_type": "oceanicProfile",
+    "data_center": "AO",
+    "instrument": "profiling_float",
+    "pi_name": ["EXAMPLE PI"],
+    "platform": "4902911",
+    "platform_type": "NAVIS_EBR",
+    "positioning_system": "GPS",
+    "wmo_inst_type": "869"
+  }
+]

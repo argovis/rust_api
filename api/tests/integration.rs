@@ -8,7 +8,8 @@
 //   * The API has been (re)started AFTER the seed, so it caches the
 //     right `timeseriesMeta` documents at startup.
 //   * The API process has per-dataset Mongo URIs set: at minimum
-//     `MONGODB_URI_BSOSE`, and `MONGODB_URI_NOAAOISST` if OI SST tests
+//     `MONGODB_URI_BSOSE` and `MONGODB_URI_ARGO` (the /argo tests below
+//     need the latter), and `MONGODB_URI_NOAAOISST` if OI SST tests
 //     are enabled. A dataset whose env var is unset is simply not
 //     served by that deployment.
 //   * `API_URL` points at the running API (default
@@ -751,5 +752,204 @@ async fn rejects_non_numeric_radius() {
         &[("center", "0.0,0.0"), ("radius", "huge")],
     )
     .await;
+    assert_eq!(resp.status(), 400);
+}
+
+// ---------------------------------------------------------------------------
+// /argo (profile family)
+// ---------------------------------------------------------------------------
+//
+// Seeded fixtures (fixtures/argo.json): four profiles designed to exercise
+// the TimeSlabs page axis. Slab width is 365 days anchored at the earliest
+// timestamp (1999-08-05), so:
+//
+//   13857_068    (-26.257, 3.427)  1999-08-05  — atlantic tile, slab 0
+//   13857_069    (-26.1,   3.5)    1999-08-15  — same tile, same slab
+//   2901500_001  (-26.8,   3.1)    2015-03-10  — same tile, slab 15
+//   4902911_142  (152.3,  -40.2)   2015-06-01  — pacific tile (BGC: +doxy)
+//
+// The atlantic box below covers the first three; the pacific box covers
+// the BGC float. Requires MONGODB_URI_ARGO on the API process.
+
+const ATLANTIC_BOX: &str = "[[-29,1],[-25.5,4]]";
+const PACIFIC_BOX: &str = "[[150,-42],[154,-38]]";
+
+/// Collect the _id of every doc (object-shaped responses only), sorted.
+fn sorted_ids(docs: &[Value]) -> Vec<String> {
+    let mut ids: Vec<String> = docs
+        .iter()
+        .map(|d| d["_id"].as_str().expect("doc should have a string _id").to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn argo_id_lookup_returns_slim_doc_with_ms_timestamp() {
+    let body = get_envelope("/argo", &[("id", "13857_068")]).await;
+    let docs = body["docs"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    let doc = docs[0].as_object().unwrap();
+    assert_eq!(doc["_id"], "13857_068");
+    // The one end-to-end check on datetime rendering: fixed three-digit
+    // millis, straight off a real BSON DateTime in Mongo.
+    assert_eq!(doc["timestamp"], "1999-08-05T19:03:42.002Z");
+    assert_eq!(doc["metadata"], serde_json::json!(["13857_m0"]));
+    // Slim listing: no data= means no data and no data_info keys at all.
+    assert!(!doc.contains_key("data"));
+    assert!(!doc.contains_key("data_info"));
+    // id lookup is single-page.
+    assert!(body["next_url"].is_null());
+}
+
+#[tokio::test]
+async fn argo_data_selection_brings_pressure_and_companions() {
+    let body = get_envelope("/argo", &[("id", "13857_068"), ("data", "temperature")]).await;
+    let docs = body["docs"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    // Pressure (+ QC) pinned first, then the requested variable (+ QC).
+    assert_eq!(
+        docs[0]["data_info"][0],
+        serde_json::json!(["pressure", "pressure_argoqc", "temperature", "temperature_argoqc"])
+    );
+    let data = docs[0]["data"].as_array().unwrap();
+    assert_eq!(data.len(), 4);
+    // The null temperature cell survives as JSON null.
+    assert!(data[2][1].is_null());
+    assert_eq!(data[2][0], 28.021);
+}
+
+#[tokio::test]
+async fn argo_box_with_date_window_clips_to_one_slab_page() {
+    // Window covers 1999 only: slabs 1.. are clipped away before any
+    // probing, so the request is a single page with the two 1999 docs.
+    let body = get_envelope(
+        "/argo",
+        &[
+            ("box", ATLANTIC_BOX),
+            ("startDate", "1999-01-01T00:00:00Z"),
+            ("endDate", "2000-01-01T00:00:00Z"),
+            ("data", "all"),
+        ],
+    )
+    .await;
+    let docs = body["docs"].as_array().unwrap();
+    assert_eq!(sorted_ids(docs), vec!["13857_068", "13857_069"]);
+    assert!(
+        body["next_url"].is_null(),
+        "window clipped the slab range to one page, got {:?}",
+        body["next_url"]
+    );
+}
+
+#[tokio::test]
+async fn argo_slab_pagination_walks_chronologically_within_a_tile() {
+    // No date window: the atlantic tile spans slabs 0..15. Page one is
+    // slab 0 (the two 1999 profiles); following next_url probes forward
+    // through the empty middle slabs and serves slab 15 (the 2015
+    // profile); after that, no further pages.
+    let page1 = get_envelope("/argo", &[("box", ATLANTIC_BOX)]).await;
+    assert_eq!(
+        sorted_ids(page1["docs"].as_array().unwrap()),
+        vec!["13857_068", "13857_069"],
+        "first page is the earliest slab"
+    );
+    let next = page1["next_url"].as_str().expect("more slabs should remain");
+
+    let url = format!("{}{}", common::api_url(), next);
+    let page2: Value = client()
+        .get(&url)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("GET {} failed:\n  {}", url, render_error(&e)))
+        .json()
+        .await
+        .expect("page 2 should be JSON");
+    assert_eq!(
+        sorted_ids(page2["docs"].as_array().unwrap()),
+        vec!["2901500_001"],
+        "second page is the 2015 slab of the same tile"
+    );
+    assert!(page2["next_url"].is_null(), "no non-empty tiles remain");
+}
+
+#[tokio::test]
+async fn argo_negation_filters_profiles_by_presence() {
+    // The pacific float carries doxy: a ~doxy request must exclude it…
+    let docs = get_paged(
+        "/argo",
+        &[("box", PACIFIC_BOX), ("data", "pressure,~doxy")],
+    )
+    .await;
+    assert!(docs.is_empty(), "~doxy must drop the BGC float, got {:?}", docs);
+
+    // …while a positive doxy request returns it, companions and all.
+    let docs = get_paged("/argo", &[("box", PACIFIC_BOX), ("data", "doxy")]).await;
+    assert_eq!(sorted_ids(&docs), vec!["4902911_142"]);
+    assert_eq!(
+        docs[0]["data_info"][0],
+        serde_json::json!(["pressure", "pressure_argoqc", "doxy", "doxy_argoqc"])
+    );
+}
+
+#[tokio::test]
+async fn argo_compression_minimal_returns_profile_stubs() {
+    let body = get_envelope(
+        "/argo",
+        &[("id", "13857_068"), ("compression", "minimal")],
+    )
+    .await;
+    let docs = body["docs"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    let stub = docs[0].as_array().expect("minimal stub is a 5-element array");
+    assert_eq!(stub.len(), 5);
+    assert_eq!(stub[0], "13857_068");
+    assert_eq!(stub[3], "1999-08-05T19:03:42.002Z", "timestamp in the level slot");
+    assert_eq!(stub[4], serde_json::json!(["13857_m0"]));
+}
+
+#[tokio::test]
+async fn argo_batchmeta_returns_platform_docs_across_pages() {
+    // Two pages (slab 0, slab 15) referencing two distinct platforms.
+    let docs = get_paged("/argo", &[("box", ATLANTIC_BOX), ("batchmeta", "true")]).await;
+    assert_eq!(sorted_ids(&docs), vec!["13857_m0", "2901500_m0"]);
+    assert_eq!(docs.iter().find(|d| d["_id"] == "13857_m0").unwrap()["platform"], "13857");
+}
+
+#[tokio::test]
+async fn argo_center_radius_pages_through_slabs_and_enforces_cap() {
+    // 100 km disk around the atlantic cluster: all three profiles, across
+    // two slab pages.
+    let docs = get_paged(
+        "/argo",
+        &[("center", "-26.3,3.4"), ("radius", "100")],
+    )
+    .await;
+    assert_eq!(
+        sorted_ids(&docs),
+        vec!["13857_068", "13857_069", "2901500_001"]
+    );
+
+    // The profile cap is 500 km; beyond it is a 400.
+    let resp = get("/argo", &[("center", "-26.3,3.4"), ("radius", "600")]).await;
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn argo_vertical_range_is_rejected_until_phase_2() {
+    let resp = get("/argo", &[("id", "13857_068"), ("verticalRange", "0,100")]).await;
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn argo_bare_integer_data_is_rejected() {
+    let resp = get("/argo", &[("id", "13857_068"), ("data", "1")]).await;
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn grid_routes_reject_negation() {
+    // Negation is a profile-family feature; grids don't opt in.
+    let resp = get("/timeseries/bsose", &[("data", "~THETA")]).await;
     assert_eq!(resp.status(), 400);
 }

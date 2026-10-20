@@ -491,18 +491,6 @@ where
     if let Err(response) = helpers::validate_query_params(&params) {
         return response;
     }
-    // `verticalRange` row-slicing for profiles is phase 2 (it's a
-    // transform over the doc's own pressure column, not a Mongo filter).
-    // Until it lands, reject loudly rather than silently returning full
-    // water columns the caller asked to have trimmed. When the qsp
-    // whitelist migrates into DatasetConfig (phase 3, when /argo grows
-    // params the grids don't have), this check folds into it.
-    if params.get("verticalRange").is_some() {
-        return HttpResponse::BadRequest().json(json!({
-            "error": "'verticalRange' is not yet supported on this route; \
-                      remove it to receive full water columns"
-        }));
-    }
     if let Err(response) = helpers::validate_radius_cap(&params, config) {
         return response;
     }

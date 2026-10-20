@@ -936,9 +936,62 @@ async fn argo_center_radius_pages_through_slabs_and_enforces_cap() {
 }
 
 #[tokio::test]
-async fn argo_vertical_range_is_rejected_until_phase_2() {
-    let resp = get("/argo", &[("id", "13857_068"), ("verticalRange", "0,100")]).await;
-    assert_eq!(resp.status(), 400);
+async fn argo_vertical_range_slices_levels_and_selects_docs() {
+    // 13857_068 pressures are [11.9, 17.0, 22.1]: a [15, 100) window
+    // keeps the deeper two levels, sliced in lockstep.
+    let body = get_envelope(
+        "/argo",
+        &[("id", "13857_068"), ("data", "all"), ("verticalRange", "15,100")],
+    )
+    .await;
+    let docs = body["docs"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["data"][0], serde_json::json!([17.0, 22.1]));
+    // Temperature slices in lockstep — the null cell rides at row 0 of
+    // the window ([28.021, null, 27.969] → [null, 27.969]).
+    assert_eq!(docs[0]["data"][2], serde_json::json!([null, 27.969]));
+
+    // And it SELECTS: a window below the profile excludes the doc even
+    // from a slim listing.
+    let body = get_envelope(
+        "/argo",
+        &[("id", "13857_068"), ("verticalRange", "1000,2000")],
+    )
+    .await;
+    assert_eq!(body["docs"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn argo_qc_filter_suppresses_failing_levels() {
+    // 13857_068's temperature QC is 2 at every level: QC set {2} keeps
+    // all rows, QC set {1,3} drops the doc.
+    let body = get_envelope(
+        "/argo",
+        &[("id", "13857_068"), ("data", "temperature,2")],
+    )
+    .await;
+    let docs = body["docs"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["data"][0].as_array().unwrap().len(), 3);
+
+    let body = get_envelope(
+        "/argo",
+        &[("id", "13857_068"), ("data", "temperature,1,3")],
+    )
+    .await;
+    assert_eq!(body["docs"].as_array().unwrap().len(), 0, "no level passes QC 1/3");
+
+    // The BGC float's doxy QC is [1, 3]: both levels pass {1,3}, one
+    // passes {1} — and the pressure column slices in lockstep.
+    let body = get_envelope(
+        "/argo",
+        &[("id", "4902911_142"), ("data", "doxy,1")],
+    )
+    .await;
+    let docs = body["docs"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["data"][0], serde_json::json!([6.0]), "pressure of the sole passing level");
+    assert_eq!(docs[0]["data"][2], serde_json::json!([220.5]));
 }
 
 #[tokio::test]

@@ -254,10 +254,11 @@ pub fn timeseries_stub<T: schema::IsTimeseries>(result: &T) -> schema::Timeserie
 ///     time is a scalar Mongo field, so date windowing is a query
 ///     predicate composed upstream, not a transform. Date params in
 ///     `params` are simply irrelevant here.
-///   - `verticalRange` row slicing and integer-token QC filtering are
-///     phase 2. Integer tokens in `data=` are accepted by validation
-///     and **ignored** here for now — they select the same columns as
-///     the equivalent request without them.
+///   - `verticalRange` and integer QC tokens are a per-level *row*
+///     pass (see `filter_profile_levels`): rows outside the pressure
+///     window, or failing the QC set for every requested variable
+///     (AND across variables, 2.x), are removed from all columns in
+///     lockstep; a doc with no surviving rows drops entirely.
 ///   - `data_info` is per-doc only; there is no meta-level cache, so no
 ///     precedence rule and no cache parameter.
 ///   - `~variable` tokens (2.x negation) are profile-level presence
@@ -309,6 +310,71 @@ pub fn transform_profile<T: schema::IsProfile>(
         }
     }
 
+    // ---- per-level (row) filtering --------------------------------------
+    //
+    // `verticalRange` and integer QC tokens both select *levels* within
+    // the doc, so they run as one row pass, before any column decisions:
+    //
+    //   - early because they are SELECTION: a profile with no levels in
+    //     the requested window (or none passing QC) must not appear in
+    //     the response at all — not even as a slim listing — mirroring
+    //     the grids, where verticalRange filters docs in Mongo
+    //     regardless of `data=`;
+    //   - on the raw doc because the pass needs columns the user may not
+    //     have requested (the pressure column, the `_argoqc` companions),
+    //     resolved against the doc's own data_info.
+    //
+    // A doc with zero surviving rows drops unconditionally — including
+    // under `except-data-values`, which exempts *requested-empty data*,
+    // never an empty level window (same rule as the grids' collapsed
+    // time window).
+    let vertical_range: Option<(f64, f64)> = params
+        .get("verticalRange")
+        .and_then(|v| v.as_str())
+        .and_then(|s| {
+            // Format validated upstream (comma-separated pair).
+            let parts: Vec<f64> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+            (parts.len() == 2).then(|| (parts[0], parts[1]))
+        });
+    let qc_set: Vec<i64> = data
+        .iter()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    if vertical_range.is_some() || !qc_set.is_empty() {
+        // The variables whose QC must pass: the user's named tokens, or —
+        // for `data=all,<int>` — every variable in the doc that has a QC
+        // companion (the literal reading of "all": the QC bar applies
+        // across the board).
+        let qc_vars: Vec<String> = if qc_set.is_empty() {
+            Vec::new()
+        } else if data.iter().any(|t| t == "all") {
+            match doc.data_info() {
+                Some(di) => di
+                    .0
+                    .iter()
+                    .filter(|n| {
+                        !n.ends_with("_argoqc")
+                            && di.0.iter().any(|m| *m == format!("{}_argoqc", n))
+                    })
+                    .cloned()
+                    .collect(),
+                None => Vec::new(),
+            }
+        } else {
+            data.iter()
+                .filter(|t| {
+                    *t != "all"
+                        && *t != "except-data-values"
+                        && t.parse::<i64>().is_err()
+                })
+                .cloned()
+                .collect()
+        };
+        if !filter_profile_levels(vertical_range, &qc_set, &qc_vars, &mut doc) {
+            return None;
+        }
+    }
+
     // Same 2.x normalization as the grids: a lone `except-data-values`
     // is "clear the values of… nothing" — treat as absent `data=`. With
     // negations extracted, an only-negations request (`data=~doxy`)
@@ -324,10 +390,9 @@ pub fn transform_profile<T: schema::IsProfile>(
         return Some(doc);
     }
 
-    // Integer tokens are QC filters — phase 2. Strip them here so the
-    // column-selection pass below sees only universal tokens and
-    // variable names; when QC filtering lands it becomes a row-selection
-    // pass between slicing and the drop-on-empty check.
+    // Integer tokens were consumed by the row pass above; strip them so
+    // the column-selection pass sees only universal tokens and variable
+    // names.
     let named: Vec<String> = data
         .iter()
         .filter(|t| t.parse::<i64>().is_err())
@@ -465,6 +530,107 @@ pub fn slice_profile_data<T: schema::IsProfile>(
     }
 
     Some(doc)
+}
+
+/// The per-level row pass: apply `verticalRange` and the QC integer set
+/// to a profile's data matrix, in place. Returns `false` when the doc
+/// should be dropped (no surviving rows, or a filter that cannot be
+/// evaluated).
+///
+/// A row (level) survives iff:
+///
+///   - its pressure lies in `[lo, hi)` when `vertical_range` is set
+///     (half-open, like every bracket in this API). A `null` pressure
+///     cell can't be placed in the window, so the row fails;
+///   - for EVERY variable in `qc_vars`, the variable's `_argoqc`
+///     companion value at that row is in `qc_set` (the 2.x AND rule:
+///     `data=temperature,salinity,1,3` keeps levels where both
+///     variables' QC is 1 or 3; callers wanting OR make separate
+///     requests). A `null` QC cell is not in any set — the row fails.
+///
+/// Strictness choices (deliberate, flagged in ARGO-DESIGN.md):
+///
+///   - `verticalRange` on a doc with no pressure column is
+///     unevaluable → drop the doc rather than guess;
+///   - a QC filter on a variable with no `_argoqc` companion (or a
+///     variable the doc doesn't carry) is unevaluable → drop. No
+///     evidence is not a pass.
+///
+/// Surviving rows are retained across ALL columns in lockstep —
+/// pressure, values, QC, requested or not — so the doc stays
+/// row-consistent for whatever column selection follows.
+pub fn filter_profile_levels<T: schema::IsProfile>(
+    vertical_range: Option<(f64, f64)>,
+    qc_set: &[i64],
+    qc_vars: &[String],
+    doc: &mut T,
+) -> bool {
+    let info = match doc.data_info() {
+        Some(di) if !di.0.is_empty() => di,
+        // No data_info: no way to find pressure or QC columns. If any
+        // row filter was requested, the doc is unevaluable.
+        _ => return vertical_range.is_none() && (qc_set.is_empty() || qc_vars.is_empty()),
+    };
+    let col_of = |name: &str| info.0.iter().position(|n| n == name);
+
+    let pressure_col = match vertical_range {
+        None => None,
+        Some(_) => match col_of(VERTICAL_COORDINATE) {
+            Some(i) => Some(i),
+            None => return false, // verticalRange without pressure: unevaluable.
+        },
+    };
+
+    let mut qc_cols: Vec<usize> = Vec::new();
+    if !qc_set.is_empty() {
+        for var in qc_vars {
+            match col_of(&format!("{}_argoqc", var)) {
+                Some(i) => qc_cols.push(i),
+                None => return false, // QC filter without a QC column: unevaluable.
+            }
+        }
+    }
+
+    let n_rows = doc.data().iter().map(|c| c.len()).max().unwrap_or(0);
+    let cell = |doc: &mut T, col: usize, row: usize| -> Option<f64> {
+        doc.data().get(col).and_then(|c| c.get(row)).copied().flatten()
+    };
+
+    let keep: Vec<bool> = (0..n_rows)
+        .map(|row| {
+            if let (Some(pc), Some((lo, hi))) = (pressure_col, vertical_range) {
+                match cell(doc, pc, row) {
+                    Some(p) if p >= lo && p < hi => {}
+                    _ => return false, // out of window, or null pressure.
+                }
+            }
+            for &qc in &qc_cols {
+                match cell(doc, qc, row) {
+                    Some(v) if qc_set.iter().any(|&k| v == k as f64) => {}
+                    _ => return false, // failing or null QC.
+                }
+            }
+            true
+        })
+        .collect();
+
+    if !keep.iter().any(|&k| k) {
+        return false; // no surviving levels — drop the doc.
+    }
+
+    let filtered: Vec<Vec<Option<f64>>> = doc
+        .data()
+        .iter()
+        .map(|col| {
+            col.iter()
+                .enumerate()
+                .filter(|(i, _)| keep.get(*i).copied().unwrap_or(false))
+                .map(|(_, v)| *v)
+                .collect()
+        })
+        .collect();
+    doc.set_data(filtered);
+    true
 }
 
 #[cfg(test)]
@@ -1179,16 +1345,205 @@ mod tests {
         assert!(out.is_none(), "no requested columns resolved -> row dropped");
     }
 
+    // ---- per-level filtering: QC integer tokens --------------------------------
+
     #[test]
-    fn profile_integer_tokens_are_ignored_phase1() {
-        // QC filtering is phase 2: `data=temperature,1,3` must select the
-        // same columns as `data=temperature` and suppress nothing yet.
-        let mut with_qc = transform_profile(&json!({"data": "temperature,1,3"}), argo4())
-            .expect("doc survives");
-        let mut without = transform_profile(&json!({"data": "temperature"}), argo4())
-            .expect("doc survives");
-        assert_eq!(with_qc.data(), without.data());
-        assert_eq!(with_qc.data_info(), without.data_info());
+    fn profile_qc_filter_keeps_passing_levels() {
+        // argo4's temperature QC is 2 at every level: data=temperature,2
+        // keeps all three rows; data=temperature,1,3 keeps none → drop.
+        let mut out = transform_profile(&json!({"data": "temperature,2"}), argo4())
+            .expect("all levels pass QC 2");
+        assert_eq!(out.data()[0].len(), 3, "all rows survive");
+        assert!(
+            transform_profile(&json!({"data": "temperature,1,3"}), argo4()).is_none(),
+            "no level has QC 1 or 3 — doc drops"
+        );
+    }
+
+    #[test]
+    fn profile_qc_filter_selects_level_subset() {
+        // temperature QC [1, 2, 1]: data=temperature,1 keeps rows 0 and 2,
+        // sliced in lockstep across every column, pressure included.
+        let doc = make_argo(
+            "pqc",
+            vec![
+                vec![Some(10.0), Some(20.0), Some(30.0)],
+                vec![Some(1.0), Some(1.0), Some(1.0)],
+                vec![Some(5.0), Some(6.0), Some(7.0)],
+                vec![Some(1.0), Some(2.0), Some(1.0)],
+            ],
+            &["pressure", "pressure_argoqc", "temperature", "temperature_argoqc"],
+        );
+        let mut out = transform_profile(&json!({"data": "temperature,1"}), doc)
+            .expect("two levels pass");
+        assert_eq!(out.data()[0], vec![Some(10.0), Some(30.0)], "pressure in lockstep");
+        assert_eq!(out.data()[2], vec![Some(5.0), Some(7.0)], "temperature subset");
+        assert_eq!(out.data()[3], vec![Some(1.0), Some(1.0)], "surviving QC values");
+    }
+
+    #[test]
+    fn profile_qc_filter_is_and_across_requested_variables() {
+        // temperature passes rows {0,1}; salinity passes rows {1,2}. The
+        // 2.x AND rule keeps only row 1.
+        let doc = make_argo(
+            "pand",
+            vec![
+                vec![Some(10.0), Some(20.0), Some(30.0)],         // pressure
+                vec![Some(1.0), Some(1.0), Some(1.0)],            // pressure_argoqc
+                vec![Some(5.0), Some(6.0), Some(7.0)],            // temperature
+                vec![Some(1.0), Some(1.0), Some(2.0)],            // temperature_argoqc
+                vec![Some(35.0), Some(35.1), Some(35.2)],         // salinity
+                vec![Some(2.0), Some(1.0), Some(1.0)],            // salinity_argoqc
+            ],
+            &["pressure", "pressure_argoqc", "temperature", "temperature_argoqc", "salinity", "salinity_argoqc"],
+        );
+        let mut out = transform_profile(
+            &json!({"data": "temperature,salinity,1"}),
+            doc,
+        )
+        .expect("one level passes both");
+        assert_eq!(out.data()[0], vec![Some(20.0)], "only the row passing BOTH survives");
+    }
+
+    #[test]
+    fn profile_qc_filter_null_qc_fails_the_row() {
+        let doc = make_argo(
+            "pnull",
+            vec![
+                vec![Some(10.0), Some(20.0)],
+                vec![Some(1.0), Some(1.0)],
+                vec![Some(5.0), Some(6.0)],
+                vec![None, Some(1.0)], // null QC at row 0
+            ],
+            &["pressure", "pressure_argoqc", "temperature", "temperature_argoqc"],
+        );
+        let mut out = transform_profile(&json!({"data": "temperature,1"}), doc)
+            .expect("row 1 passes");
+        assert_eq!(out.data()[0], vec![Some(20.0)], "null QC is not in any set");
+    }
+
+    #[test]
+    fn profile_qc_filter_without_companion_drops_doc() {
+        // Strictness rule: a QC filter on a variable with no _argoqc
+        // column is unevaluable — no evidence is not a pass.
+        let doc = make_argo(
+            "pnoqc",
+            vec![vec![Some(10.0)], vec![Some(5.0)]],
+            &["pressure", "temperature"],
+        );
+        assert!(transform_profile(&json!({"data": "temperature,1"}), doc).is_none());
+    }
+
+    #[test]
+    fn profile_qc_filter_with_all_spans_every_companioned_variable() {
+        // data=all,2: the QC bar applies to every variable that has a
+        // companion. argo4's QC is 2 everywhere → survives in full;
+        // data=all,1 → drops.
+        let mut out = transform_profile(&json!({"data": "all,2"}), argo4())
+            .expect("every companioned variable passes QC 2");
+        assert_eq!(out.data().len(), 4);
+        assert_eq!(out.data()[0].len(), 3);
+        assert!(transform_profile(&json!({"data": "all,1"}), argo4()).is_none());
+    }
+
+    // ---- per-level filtering: verticalRange ------------------------------------
+
+    #[test]
+    fn profile_vertical_range_slices_rows_half_open() {
+        // argo4 pressures [11.9, 17.0, 22.1]: window [11.9, 22.1) keeps
+        // rows 0 and 1 — inclusive low, exclusive high.
+        let mut out = transform_profile(
+            &json!({"data": "all", "verticalRange": "11.9,22.1"}),
+            argo4(),
+        )
+        .expect("two levels in window");
+        assert_eq!(out.data()[0], vec![Some(11.9), Some(17.0)]);
+        assert_eq!(out.data()[2], vec![Some(28.021), None], "lockstep incl. null cell");
+    }
+
+    #[test]
+    fn profile_vertical_range_selects_even_without_data_qsp() {
+        // verticalRange is SELECTION: it filters docs for the slim
+        // listing too, like the grids' Mongo-level level filter.
+        let mut out = transform_profile(&json!({"verticalRange": "0,15"}), argo4())
+            .expect("one level in window -> doc selected");
+        assert!(out.data().is_empty(), "still a slim listing");
+        assert!(out.data_info().is_none());
+        assert!(
+            transform_profile(&json!({"verticalRange": "1000,2000"}), argo4()).is_none(),
+            "no levels in window -> doc excluded from the listing"
+        );
+    }
+
+    #[test]
+    fn profile_vertical_range_null_pressure_fails_the_row() {
+        let doc = make_argo(
+            "pvnull",
+            vec![
+                vec![Some(10.0), None],
+                vec![Some(1.0), Some(1.0)],
+                vec![Some(5.0), Some(6.0)],
+                vec![Some(1.0), Some(1.0)],
+            ],
+            &["pressure", "pressure_argoqc", "temperature", "temperature_argoqc"],
+        );
+        let mut out = transform_profile(
+            &json!({"data": "all", "verticalRange": "0,100"}),
+            doc,
+        )
+        .expect("row 0 survives");
+        assert_eq!(out.data()[0], vec![Some(10.0)], "null pressure can't be placed");
+    }
+
+    #[test]
+    fn profile_vertical_range_without_pressure_column_drops_doc() {
+        let doc = make_argo("pnop", vec![vec![Some(5.0)]], &["temperature"]);
+        assert!(
+            transform_profile(&json!({"data": "all", "verticalRange": "0,100"}), doc).is_none(),
+            "verticalRange on a pressure-less doc is unevaluable"
+        );
+    }
+
+    #[test]
+    fn profile_vertical_range_composes_with_qc() {
+        // Window keeps rows {1,2}; QC 1 keeps rows {0,1} → row 1 only.
+        let doc = make_argo(
+            "pvq",
+            vec![
+                vec![Some(10.0), Some(20.0), Some(30.0)],
+                vec![Some(1.0), Some(1.0), Some(1.0)],
+                vec![Some(5.0), Some(6.0), Some(7.0)],
+                vec![Some(1.0), Some(1.0), Some(2.0)],
+            ],
+            &["pressure", "pressure_argoqc", "temperature", "temperature_argoqc"],
+        );
+        let mut out = transform_profile(
+            &json!({"data": "temperature,1", "verticalRange": "15,100"}),
+            doc,
+        )
+        .expect("one level passes both filters");
+        assert_eq!(out.data()[0], vec![Some(20.0)]);
+    }
+
+    #[test]
+    fn profile_empty_row_window_drops_despite_except_data_values() {
+        // except-data-values exempts requested-empty DATA, never an empty
+        // level window — schema-only for a window the doc doesn't cover
+        // is meaningless (same rule as the grids' collapsed time window).
+        let out = transform_profile(
+            &json!({"data": "temperature,except-data-values", "verticalRange": "1000,2000"}),
+            argo4(),
+        );
+        assert!(out.is_none());
+        // But with a satisfiable window, except-data-values still works:
+        // row-filtered data_info rides along, data cleared.
+        let mut out = transform_profile(
+            &json!({"data": "temperature,except-data-values", "verticalRange": "0,15"}),
+            argo4(),
+        )
+        .expect("one level in window");
+        assert!(out.data().is_empty());
+        assert!(out.data_info().is_some());
     }
 
     #[test]

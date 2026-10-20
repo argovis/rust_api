@@ -295,6 +295,12 @@ pub fn validate_data_param(
         None => return Ok(()),
     };
 
+    // Track what kinds of tokens appear: integer QC filters only mean
+    // something when there's a variable (or `all`) to filter, so a list
+    // with integers and no variable is rejected after the loop.
+    let mut has_integer = false;
+    let mut has_variable = false;
+
     for token in raw.split(',') {
         if token.is_empty() {
             return Err(HttpResponse::BadRequest().json(json!({
@@ -302,18 +308,31 @@ pub fn validate_data_param(
             })));
         }
         if UNIVERSAL_DATA_TOKENS.contains(&token) {
+            if token == "all" {
+                has_variable = true;
+            }
             continue;
         }
         if config.allowed_data_vars.contains(&token) {
+            has_variable = true;
             continue;
         }
         // Integer QC filter (any signed integer; the QC layer
         // interprets the value, this layer just gate-keeps the shape).
         if token.parse::<i64>().is_ok() {
+            has_integer = true;
             continue;
         }
         let msg = unknown_data_token_message(token, config);
         return Err(HttpResponse::BadRequest().json(json!({"error": msg})));
+    }
+
+    // `data=1` (or `data=1,except-data-values`) is nonsense — a QC
+    // filter with nothing to filter. 2.x rejected it and so do we.
+    if has_integer && !has_variable {
+        return Err(HttpResponse::BadRequest().json(json!({
+            "error": "'data' contains integer QC filters but no variable to filter: pair integers with at least one variable name (or 'all'), e.g. data=temperature,1"
+        })));
     }
     Ok(())
 }
@@ -840,16 +859,31 @@ mod tests {
     }
 
     #[test]
-    fn validate_data_param_accepts_integer_qc_filters() {
-        // Any signed integer should pass; the QC layer (downstream)
-        // interprets the actual value.
+    fn validate_data_param_accepts_integer_qc_filters_alongside_a_variable() {
+        // Integers are QC filters — meaningful only with a variable (or
+        // `all`) to filter. Paired, any signed integer passes; the QC
+        // layer (downstream) interprets the actual value.
         for token in ["0", "1", "42", "-1", "9999"] {
-            let params = json!({ "data": token });
+            let params = json!({ "data": format!("THETA,{}", token) });
             assert!(
                 validate_data_param(&params, &DATA_TEST_CONFIG).is_ok(),
-                "integer token '{}' should be accepted",
+                "integer token '{}' alongside a variable should be accepted",
                 token
             );
+        }
+        let params = json!({ "data": "all,3" });
+        assert!(validate_data_param(&params, &DATA_TEST_CONFIG).is_ok());
+    }
+
+    #[test]
+    fn validate_data_param_rejects_bare_integer_qc_filters() {
+        // `data=1` is a QC filter with nothing to filter — nonsense that
+        // 2.x rejected, and so do we. `except-data-values` names no
+        // variable either, so it doesn't rescue the list.
+        for raw in ["1", "1,3", "-1", "1,except-data-values"] {
+            let params = json!({ "data": raw });
+            let err = validate_data_param(&params, &DATA_TEST_CONFIG).unwrap_err();
+            assert_eq!(err.status(), 400, "'{}' should be rejected", raw);
         }
     }
 

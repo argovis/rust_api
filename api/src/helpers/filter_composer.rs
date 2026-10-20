@@ -34,7 +34,7 @@ use mongodb::bson::{self, doc, Bson, DateTime as BsonDateTime, Document};
 use serde_json::{json, Value};
 
 use super::dataset_config::{DatasetConfig, PageAxis};
-use super::filters::filter_timeseries;
+use super::filters::{filter_profile, filter_timeseries};
 use super::tile_generator::TileSpec;
 
 /// Build the Mongo filter document for one page of a paginated request
@@ -62,6 +62,24 @@ pub fn compose_filter_with_tile_slabs(
     slab_starts: &[BsonDateTime],
 ) -> Document {
     let user = filter_timeseries(params);
+    let tile_doc = build_tile_filter(tile, config, slab_starts);
+    combine_user_and_tile(user, tile_doc)
+}
+
+/// Build the Mongo filter document for one page of a paginated request
+/// against a *profile* dataset. Same tile mechanics as the timeseries
+/// composers — the only difference is the user-filter builder:
+/// `filters::filter_profile` (dates → `timestamp` predicate, no
+/// `verticalRange` → `level` clause) instead of `filter_timeseries`.
+/// `slab_starts` must be the same list the tile generator emitted
+/// `page_index` against.
+pub fn compose_profile_filter_with_tile_slabs(
+    params: Value,
+    tile: &TileSpec,
+    config: &DatasetConfig,
+    slab_starts: &[BsonDateTime],
+) -> Document {
+    let user = filter_profile(params);
     let tile_doc = build_tile_filter(tile, config, slab_starts);
     combine_user_and_tile(user, tile_doc)
 }
@@ -611,5 +629,81 @@ mod tests {
         assert_eq!(with, without);
         assert!(with.get_document("level").is_ok());
         assert!(with.get_document("timestamp").is_err());
+    }
+
+    // ---- profile composer ------------------------------------------------------
+
+    #[test]
+    fn profile_composer_combines_user_dates_and_slab_bracket() {
+        // User dates land as a `timestamp` predicate in the USER filter;
+        // the slab bracket is a second `timestamp` predicate from the
+        // TILE filter. Both must survive, $and-combined — Mongo
+        // intersects them, exactly like verticalRange + level bracket on
+        // the grids.
+        let s = slabs();
+        let f = compose_profile_filter_with_tile_slabs(
+            json!({"startDate": "2020-03-01T00:00:00Z"}),
+            &TileSpec {
+                tile_bbox: None,
+                page_index: Some(1),
+            },
+            &SLAB_TEST_CONFIG,
+            &s,
+        );
+        let parts = f.get_array("$and").expect("should be $and-wrapped");
+        assert_eq!(parts.len(), 2);
+        let p0 = parts[0].as_document().unwrap();
+        let p1 = parts[1].as_document().unwrap();
+        assert!(
+            p0.get_document("timestamp").is_ok() && p1.get_document("timestamp").is_ok(),
+            "both user window and slab bracket constrain timestamp"
+        );
+    }
+
+    #[test]
+    fn profile_composer_geo_only_matches_timeseries_composer() {
+        // With no dates and no verticalRange in play, the two composers
+        // must agree on a pure-geo request against the same tile.
+        let profile = compose_profile_filter_with_tile_slabs(
+            json!({"box": "[[5.0, 5.0], [15.0, 15.0]]"}),
+            &TileSpec {
+                tile_bbox: Some(BoundingBox {
+                    sw: [0.0, 0.0],
+                    ne: [10.0, 10.0],
+                }),
+                page_index: None,
+            },
+            &SLAB_TEST_CONFIG,
+            &slabs(),
+        );
+        let grid = compose_filter_with_tile(
+            json!({"box": "[[5.0, 5.0], [15.0, 15.0]]"}),
+            &TileSpec {
+                tile_bbox: Some(BoundingBox {
+                    sw: [0.0, 0.0],
+                    ne: [10.0, 10.0],
+                }),
+                page_index: None,
+            },
+            &TEST_CONFIG,
+        );
+        assert_eq!(profile, grid);
+    }
+
+    #[test]
+    fn profile_composer_ignores_vertical_range() {
+        // The handler 400s verticalRange for profiles; if it slipped
+        // through anyway, the composer must not emit a `level` clause.
+        let f = compose_profile_filter_with_tile_slabs(
+            json!({"verticalRange": "0,100"}),
+            &TileSpec {
+                tile_bbox: None,
+                page_index: Some(0),
+            },
+            &SLAB_TEST_CONFIG,
+            &slabs(),
+        );
+        assert!(f.get_document("level").is_err());
+        assert!(f.get_document("timestamp").is_ok(), "slab bracket still applies");
     }
 }

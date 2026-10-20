@@ -34,6 +34,65 @@ pub fn filter_timeseries(params: serde_json::Value) -> mongodb::bson::Document {
     return filter;
 }
 
+/// Build the *user* Mongo filter for a profile-family request — the
+/// sibling of `filter_timeseries`, with the two swaps ARGO-DESIGN.md
+/// calls out:
+///
+///   - `startDate` / `endDate` become a Mongo predicate on the doc's
+///     scalar `timestamp` (`$gte` / `$lt`, half-open like everything
+///     else). For grids, dates are a transform over the shared time
+///     axis; for profiles they're selection, full stop.
+///   - no `verticalRange` → `level` clause: profiles have no scalar
+///     `level` field. (`verticalRange` row-slicing is a phase-2
+///     transform; until then the profile handler rejects the param.)
+///
+/// The geo filters (id / polygon / box / center+radius) are the exact
+/// same builders the grids use — profile docs carry the same GeoJSON
+/// `geolocation` shape and 2dsphere index.
+pub fn filter_profile(params: serde_json::Value) -> mongodb::bson::Document {
+    let polygon = params.get("polygon").map(|p| p.as_str().unwrap());
+    let boxregion = params.get("box").map(|p| p.as_str().unwrap());
+    let center = params.get("center").map(|p| p.as_str().unwrap());
+    let radius = params.get("radius").map(|d| d.as_str().unwrap().parse::<f64>().unwrap());
+    let id = params.get("id").map(|p| p.as_str().unwrap());
+    let start_date = params
+        .get("startDate")
+        .and_then(|v| v.as_str())
+        .and_then(helpers::string2bsondate);
+    let end_date = params
+        .get("endDate")
+        .and_then(|v| v.as_str())
+        .and_then(helpers::string2bsondate);
+
+    let mut filter = mongodb::bson::doc! {};
+    if let Some(id) = id {
+        filter = id_filter(id, filter);
+    }
+    if let Some(polygon) = polygon {
+        filter = polygon_filter(polygon, filter);
+    }
+    if let Some(boxregion) = boxregion {
+        filter = box_filter(boxregion, filter);
+    }
+    if let (Some(center), Some(radius)) = (center, radius) {
+        filter = center_filter(center, radius, filter);
+    }
+    if start_date.is_some() || end_date.is_some() {
+        let mut ts_clause = mongodb::bson::Document::new();
+        if let Some(sd) = start_date {
+            ts_clause.insert("$gte", sd);
+        }
+        if let Some(ed) = end_date {
+            // Exclusive upper bound — the window is [startDate, endDate),
+            // matching slab brackets and the grids' slice semantics.
+            ts_clause.insert("$lt", ed);
+        }
+        filter.insert("timestamp", ts_clause);
+    }
+
+    filter
+}
+
 fn polygon_filter(polygon: &str, mut filter: mongodb::bson::Document) -> mongodb::bson::Document {
     let mut polygon_coordinates: Vec<Vec<f64>> = serde_json::from_str(polygon).unwrap();
 
@@ -223,5 +282,89 @@ mod tests {
         }));
         assert_eq!(f.get_str("_id").unwrap(), "doc1");
         assert!(f.get_document("level").is_ok());
+    }
+
+    // ---- filter_profile --------------------------------------------------------
+
+    use crate::helpers::helpers::string2bsondate;
+    use mongodb::bson::Bson;
+
+    #[test]
+    fn profile_empty_params_produce_empty_filter() {
+        let f = filter_profile(json!({}));
+        assert_eq!(f.len(), 0);
+    }
+
+    #[test]
+    fn profile_geo_filters_match_timeseries_exactly() {
+        // The geo builders are shared code; a geo-only query must produce
+        // byte-identical filters for both families.
+        for params in [
+            json!({"id": "13857_068"}),
+            json!({"polygon": "[[0,0],[10,0],[10,10],[0,10],[0,0]]"}),
+            json!({"box": "[[10,10],[20,20]]"}),
+            json!({"center": "10.0,20.0", "radius": "5"}),
+        ] {
+            assert_eq!(
+                filter_profile(params.clone()),
+                filter_timeseries(params.clone()),
+                "geo-only filters must agree for {:?}",
+                params
+            );
+        }
+    }
+
+    #[test]
+    fn profile_dates_become_timestamp_predicate() {
+        let f = filter_profile(json!({
+            "startDate": "2020-01-01T00:00:00Z",
+            "endDate":   "2021-01-01T00:00:00Z",
+        }));
+        let ts = f.get_document("timestamp").unwrap();
+        assert_eq!(
+            ts.get("$gte"),
+            Some(&Bson::DateTime(string2bsondate("2020-01-01T00:00:00Z").unwrap()))
+        );
+        assert_eq!(
+            ts.get("$lt"),
+            Some(&Bson::DateTime(string2bsondate("2021-01-01T00:00:00Z").unwrap())),
+            "endDate is the exclusive upper bound"
+        );
+    }
+
+    #[test]
+    fn profile_start_date_alone_is_open_ended_above() {
+        let f = filter_profile(json!({"startDate": "2020-01-01T00:00:00Z"}));
+        let ts = f.get_document("timestamp").unwrap();
+        assert!(ts.get("$gte").is_some());
+        assert!(ts.get("$lt").is_none());
+    }
+
+    #[test]
+    fn profile_end_date_alone_is_open_ended_below() {
+        let f = filter_profile(json!({"endDate": "2021-01-01T00:00:00Z"}));
+        let ts = f.get_document("timestamp").unwrap();
+        assert!(ts.get("$gte").is_none());
+        assert!(ts.get("$lt").is_some());
+    }
+
+    #[test]
+    fn profile_filter_never_emits_level_clause() {
+        // Even if verticalRange sneaks into the params (the handler
+        // rejects it upstream), filter_profile must not reference a
+        // `level` field profiles don't have.
+        let f = filter_profile(json!({"verticalRange": "0,100"}));
+        assert!(f.get_document("level").is_err());
+        assert!(f.is_empty(), "verticalRange is simply not this function's business");
+    }
+
+    #[test]
+    fn profile_dates_compose_with_geo() {
+        let f = filter_profile(json!({
+            "box": "[[10,10],[20,20]]",
+            "startDate": "2020-01-01T00:00:00Z",
+        }));
+        assert!(f.get_array("$or").is_ok(), "box clause present");
+        assert!(f.get_document("timestamp").is_ok(), "timestamp clause present");
     }
 }

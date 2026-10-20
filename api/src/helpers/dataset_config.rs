@@ -466,4 +466,149 @@ mod tests {
             &["uwnd", "vwnd", "ws", "nobs"]
         );
     }
+
+    // ---- Argo config invariants ---------------------------------------------
+
+    #[test]
+    fn argo_tile_degrees_is_positive_and_divides_a_hemisphere() {
+        assert!(ARGO_CONFIG.tile_degrees > 0.0);
+        assert!(
+            (180.0_f64 % ARGO_CONFIG.tile_degrees).abs() < 1e-9,
+            "tile_degrees should evenly divide 180° for clean global coverage"
+        );
+        assert!(
+            (360.0_f64 % ARGO_CONFIG.tile_degrees).abs() < 1e-9,
+            "tile_degrees should evenly divide 360° for clean global coverage"
+        );
+    }
+
+    #[test]
+    fn argo_max_radius_is_positive_and_subhemispheric() {
+        assert!(ARGO_CONFIG.max_radius_meters > 0.0);
+        assert!(ARGO_CONFIG.max_radius_meters < 1.0e7);
+        // Deliberately larger than the grids' cap — sparse in situ data.
+        assert!(ARGO_CONFIG.max_radius_meters > BSOSE_CONFIG.max_radius_meters);
+    }
+
+    #[test]
+    fn argo_page_axis_is_yearly_time_slabs() {
+        match ARGO_CONFIG.page_axis {
+            PageAxis::TimeSlabs { width_days } => {
+                assert!(width_days > 0, "slab width must be positive");
+                assert_eq!(width_days, 365, "yearly slabs per ARGO-DESIGN.md");
+            }
+            PageAxis::Levels(_) => panic!("Argo pages through time, not levels"),
+        }
+        // And therefore no level values to bracket.
+        assert!(ARGO_CONFIG.levels().is_empty());
+    }
+
+    #[test]
+    fn argo_has_global_coverage() {
+        assert!(ARGO_CONFIG.coverage_bbox.is_none(), "floats drift everywhere");
+    }
+
+    #[test]
+    fn argo_vocabulary_is_core_plus_companions() {
+        // The structural invariants of the vocabulary, not its exact
+        // contents (which track the upstream data-keys list): core
+        // variables present, and every variable paired with its
+        // `_argoqc` companion.
+        for core in ["pressure", "temperature", "salinity"] {
+            assert!(ARGO_CONFIG.allowed_data_vars.contains(&core));
+        }
+        for var in ARGO_CONFIG.allowed_data_vars {
+            if !var.ends_with("_argoqc") {
+                let companion = format!("{}_argoqc", var);
+                assert!(
+                    ARGO_CONFIG.allowed_data_vars.iter().any(|v| *v == companion),
+                    "variable '{}' is missing its '{}' companion",
+                    var,
+                    companion
+                );
+            }
+        }
+    }
+}
+
+// argo (profile family) ///////////////////////////////////////////////////////
+
+/// Variable names accepted in `/argo`'s `data=` qsp.
+///
+/// **Seeded from the Argovis 2.x data-keys vocabulary — verify against
+/// the ingestion pipeline before relying on it.** Core (pressure,
+/// temperature, salinity) plus the BGC variables, each paired with its
+/// `_argoqc` companion so an explicit companion request (e.g.
+/// `data=temperature,temperature_argoqc`) validates. No single Argo doc
+/// carries all of these (core vs BGC vs deep differ per float); a
+/// validated-but-absent variable simply drops the doc downstream, per
+/// the drop-on-empty rule. Kept as one flat const so updating the
+/// vocabulary is a one-line-per-variable edit.
+pub const ARGO_VARS: &[&str] = &[
+    "pressure", "pressure_argoqc",
+    "temperature", "temperature_argoqc",
+    "salinity", "salinity_argoqc",
+    "bbp470", "bbp470_argoqc",
+    "bbp532", "bbp532_argoqc",
+    "bbp700", "bbp700_argoqc",
+    "cdom", "cdom_argoqc",
+    "chla", "chla_argoqc",
+    "cp660", "cp660_argoqc",
+    "down_irradiance380", "down_irradiance380_argoqc",
+    "down_irradiance412", "down_irradiance412_argoqc",
+    "down_irradiance442", "down_irradiance442_argoqc",
+    "down_irradiance443", "down_irradiance443_argoqc",
+    "down_irradiance490", "down_irradiance490_argoqc",
+    "down_irradiance555", "down_irradiance555_argoqc",
+    "down_irradiance665", "down_irradiance665_argoqc",
+    "down_irradiance670", "down_irradiance670_argoqc",
+    "downwelling_par", "downwelling_par_argoqc",
+    "doxy", "doxy_argoqc",
+    "nitrate", "nitrate_argoqc",
+    "ph_in_situ_total", "ph_in_situ_total_argoqc",
+    "turbidity", "turbidity_argoqc",
+    "up_radiance412", "up_radiance412_argoqc",
+    "up_radiance443", "up_radiance443_argoqc",
+    "up_radiance490", "up_radiance490_argoqc",
+    "up_radiance555", "up_radiance555_argoqc",
+];
+
+/// Configuration for the Argo profile dataset.
+///
+/// 5° tiles match the grids (uniformity); the page axis is yearly time
+/// slabs (ARGO-DESIGN.md sizing: ~50–100 profiles per tile-year on
+/// average — revisit with real per-tile-slab counts). The radius cap is
+/// 500 km, deliberately larger than the grids' 100 km: Argo is sparse
+/// (one profile per ~3°/10 days), so a small disk often catches
+/// nothing, and the time-slab page axis bounds per-page cost in a way
+/// the unpaginated 2.x `$near` couldn't. `coverage_bbox: None` — floats
+/// drift everywhere.
+pub const ARGO_CONFIG: DatasetConfig = DatasetConfig {
+    tile_degrees: 5.0,
+    max_radius_meters: 500_000.0, // 500 km — sparse in situ data needs reach
+    page_axis: PageAxis::TimeSlabs { width_days: 365 },
+    coverage_bbox: None,
+    allowed_data_vars: ARGO_VARS,
+};
+
+/// Per-dataset identity + Mongo client + startup-loaded state for the
+/// *profile* family — the sibling of `DatasetSource` with the family's
+/// own startup cache. Where a grid caches its meta doc's time axis and
+/// `data_info` default, a profile dataset has neither (no single meta
+/// doc, per-doc `data_info`); what it caches instead is the slab-start
+/// list for the `TimeSlabs` page axis, computed once at startup from
+/// the collection's `[earliest, latest]` timestamp span via
+/// `tile_generator::time_slab_starts`.
+///
+/// Same `Clone` rationale as `DatasetSource`: handlers copy it out of a
+/// `Lazy<Mutex<Option<_>>>` static at the top of each request so the
+/// mutex is never held across `.await`. The clone is cheap — the client
+/// is Arc-backed and the slab list is a few hundred datetimes at most.
+#[derive(Clone)]
+pub struct ProfileSource {
+    pub client: mongodb::Client,
+    pub db_name: &'static str,
+    pub collection: &'static str,
+    pub meta_collection: &'static str,
+    pub slab_starts: Vec<BsonDateTime>,
 }

@@ -77,6 +77,52 @@ impl PageAxis {
     }
 }
 
+/// Query-string parameters recognised by the gridded `/timeseries/*`
+/// endpoints. Unknown qsp names are rejected with a 400 + "did you
+/// mean" suggestion (see `helpers::validate_query_params`). Keep in
+/// sync with the table in `api/PAGINATION.md`.
+pub const GRID_QSP: &[&str] = &[
+    "id",
+    "box",
+    "polygon",
+    "center",
+    "radius",
+    "verticalRange",
+    "startDate",
+    "endDate",
+    "data",
+    "compression",
+    "batchmeta",
+    "tile_index",
+];
+
+/// Query-string parameters recognised by `/argo` — the grid set plus the
+/// profile family's own: `platform` (all profiles of one float, bypasses
+/// tiling), `source` (pipeline-tag filters, `~`-negatable), and
+/// `mostrecent` (N most recent matching profiles, bypasses tiling).
+pub const ARGO_QSP: &[&str] = &[
+    "id",
+    "box",
+    "polygon",
+    "center",
+    "radius",
+    "verticalRange",
+    "startDate",
+    "endDate",
+    "data",
+    "compression",
+    "batchmeta",
+    "tile_index",
+    "platform",
+    "source",
+    "mostrecent",
+];
+
+/// The `source` tags `/argo` accepts (upstream pipeline provenance, the
+/// `source[].source` arrays on the docs). Positive tokens require the
+/// tag; `~`-prefixed tokens require its absence.
+pub const ARGO_SOURCES: &[&str] = &["argo_core", "argo_bgc", "argo_deep"];
+
 /// Per-dataset request-size policy.
 ///
 /// `tile_degrees`: edge length (degrees of longitude and latitude) of one
@@ -138,6 +184,14 @@ pub struct DatasetConfig {
     pub data_var_modifiers: &'static [&'static str],
     pub data_var_companion: Option<&'static str>,
     pub data_var_negation: bool,
+    /// The query-string parameter names this dataset's route accepts
+    /// (GRID_QSP for the grids, ARGO_QSP for /argo). Unknown names 400
+    /// with a suggestion computed against this list.
+    pub allowed_qsp: &'static [&'static str],
+    /// The `source=` tags this dataset accepts (empty for datasets
+    /// without a `source` qsp — the whitelist rejects the param before
+    /// token validation matters).
+    pub allowed_sources: &'static [&'static str],
 }
 
 impl DatasetConfig {
@@ -220,6 +274,8 @@ pub const BSOSE_CONFIG: DatasetConfig = DatasetConfig {
     data_var_modifiers: &[],
     data_var_companion: None,
     data_var_negation: false,
+    allowed_qsp: GRID_QSP,
+    allowed_sources: &[],
 };
 
 /// OI SST has a single vertical level (the sea surface). We model it as
@@ -249,6 +305,8 @@ pub const OISST_CONFIG: DatasetConfig = DatasetConfig {
     data_var_modifiers: &[],
     data_var_companion: None,
     data_var_negation: false,
+    allowed_qsp: GRID_QSP,
+    allowed_sources: &[],
 };
 
 /// Copernicus SLA is a sea-surface product: like OI SST, a single
@@ -273,6 +331,8 @@ pub const COPERNICUSSLA_CONFIG: DatasetConfig = DatasetConfig {
     data_var_modifiers: &[],
     data_var_companion: None,
     data_var_negation: false,
+    allowed_qsp: GRID_QSP,
+    allowed_sources: &[],
 };
 
 /// CCMP wind is a sea-surface product: single vertical level modeled as
@@ -295,6 +355,8 @@ pub const CCMPWIND_CONFIG: DatasetConfig = DatasetConfig {
     data_var_modifiers: &[],
     data_var_companion: None,
     data_var_negation: false,
+    allowed_qsp: GRID_QSP,
+    allowed_sources: &[],
 };
 
 #[cfg(test)]
@@ -639,6 +701,8 @@ pub const ARGO_CONFIG: DatasetConfig = DatasetConfig {
     data_var_modifiers: &["_std", "_med"],
     data_var_companion: Some("_argoqc"),
     data_var_negation: true,
+    allowed_qsp: ARGO_QSP,
+    allowed_sources: ARGO_SOURCES,
 };
 
 /// Per-dataset identity + Mongo client + startup-loaded state for the

@@ -1006,3 +1006,63 @@ async fn grid_routes_reject_negation() {
     let resp = get("/timeseries/bsose", &[("data", "~THETA")]).await;
     assert_eq!(resp.status(), 400);
 }
+
+#[tokio::test]
+async fn argo_platform_returns_all_float_profiles_in_one_page() {
+    // platform bypasses tiling: both of float 13857's profiles arrive on
+    // a single page regardless of slab geometry.
+    let body = get_envelope("/argo", &[("platform", "13857")]).await;
+    assert_eq!(
+        sorted_ids(body["docs"].as_array().unwrap()),
+        vec!["13857_068", "13857_069"]
+    );
+    assert!(body["next_url"].is_null(), "platform mode is single-page");
+
+    // And the grids reject the param outright (per-dataset whitelist).
+    let resp = get("/timeseries/bsose", &[("platform", "13857")]).await;
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn argo_source_filters_require_and_exclude_tags() {
+    // 13857_069 carries no source field at all: a positive tag requires
+    // presence, so only 13857_068 and 2901500_001 match argo_core in the
+    // atlantic box.
+    let docs = get_paged("/argo", &[("box", ATLANTIC_BOX), ("source", "argo_core")]).await;
+    assert_eq!(sorted_ids(&docs), vec!["13857_068", "2901500_001"]);
+
+    // The pacific float is core+bgc: ~argo_bgc excludes it…
+    let docs = get_paged("/argo", &[("box", PACIFIC_BOX), ("source", "~argo_bgc")]).await;
+    assert!(docs.is_empty(), "~argo_bgc must exclude the BGC float");
+
+    // …and a positive argo_bgc selects it.
+    let docs = get_paged("/argo", &[("box", PACIFIC_BOX), ("source", "argo_bgc")]).await;
+    assert_eq!(sorted_ids(&docs), vec!["4902911_142"]);
+}
+
+#[tokio::test]
+async fn argo_mostrecent_returns_newest_n_sorted_descending() {
+    let body = get_envelope("/argo", &[("mostrecent", "2")]).await;
+    let docs = body["docs"].as_array().unwrap();
+    let ids: Vec<&str> = docs.iter().map(|d| d["_id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids,
+        vec!["4902911_142", "2901500_001"],
+        "newest first: 2015-06 then 2015-03"
+    );
+    assert!(body["next_url"].is_null(), "mostrecent mode is single-page");
+
+    // Composes with filters: most recent core-only profile.
+    let body = get_envelope(
+        "/argo",
+        &[("mostrecent", "1"), ("source", "~argo_bgc")],
+    )
+    .await;
+    let docs = body["docs"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["_id"], "2901500_001");
+
+    // Over the cap is a 400.
+    let resp = get("/argo", &[("mostrecent", "1001")]).await;
+    assert_eq!(resp.status(), 400);
+}

@@ -114,9 +114,12 @@ antimeridian / north-pole docs aren't lost.
 
 ## Validation errors (HTTP 400)
 
-- Any query parameter not on the whitelist above. Unknown names are
-  rejected so typos (e.g. `start_Date` instead of `startDate`) fail
-  loudly instead of being silently ignored. When the typo is close to
+- Any query parameter not on the route's whitelist (per-dataset:
+  `DatasetConfig::allowed_qsp` — the table above is the grid set;
+  `/argo` additionally accepts `platform`, `source`, and `mostrecent`,
+  documented in ARGO-DESIGN.md). Unknown names are rejected so typos
+  (e.g. `start_Date` instead of `startDate`) fail loudly instead of
+  being silently ignored. When the typo is close to
   a real param name, the error message includes a "did you mean ..."
   suggestion.
 - Any token inside the `data=` list that isn't one of: the dataset's

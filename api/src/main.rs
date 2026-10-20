@@ -214,7 +214,7 @@ where
     let path = req.path().to_string();
 
     // ---- validation ---------------------------------------------------
-    if let Err(response) = helpers::validate_query_params(&params) {
+    if let Err(response) = helpers::validate_query_params(&params, config) {
         return response;
     }
     if let Err(response) = helpers::validate_radius_cap(&params, config) {
@@ -488,7 +488,7 @@ where
     let path = req.path().to_string();
 
     // ---- validation ---------------------------------------------------
-    if let Err(response) = helpers::validate_query_params(&params) {
+    if let Err(response) = helpers::validate_query_params(&params, config) {
         return response;
     }
     if let Err(response) = helpers::validate_radius_cap(&params, config) {
@@ -523,6 +523,15 @@ where
 
     let is_minimal = matches!(compression.as_deref(), Some("minimal"));
 
+    // `mostrecent=N`: serve the N most recent matching profiles —
+    // sort by timestamp descending, limit N. Bypasses tiling (the tile
+    // generator emits a single passthrough tile when it's set), so N is
+    // the response-size bound; validation caps it.
+    let mostrecent: Option<i64> = params
+        .get("mostrecent")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
+
     // ---- probe-forward loop -------------------------------------------
     //
     // Same contract as the grids: serve at most one non-empty tile per
@@ -535,7 +544,13 @@ where
             config,
             &slab_starts,
         );
-        let options = FindOptions::builder().build();
+        let options = match mostrecent {
+            Some(n) => FindOptions::builder()
+                .sort(mongodb::bson::doc! { "timestamp": -1 })
+                .limit(n)
+                .build(),
+            None => FindOptions::builder().build(),
+        };
 
         let mut cursor = match generate_cursor::<S>(
             &source.client,

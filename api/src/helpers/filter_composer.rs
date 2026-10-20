@@ -229,6 +229,8 @@ mod tests {
         data_var_modifiers: &[],
         data_var_companion: None,
         data_var_negation: false,
+        allowed_qsp: crate::helpers::dataset_config::GRID_QSP,
+        allowed_sources: &[],
     };
 
     fn null_tile() -> TileSpec {
@@ -543,6 +545,8 @@ mod tests {
         data_var_modifiers: &[],
         data_var_companion: None,
         data_var_negation: false,
+        allowed_qsp: crate::helpers::dataset_config::GRID_QSP,
+        allowed_sources: &[],
     };
 
     fn slabs() -> Vec<BsonDateTime> {

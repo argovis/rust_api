@@ -129,7 +129,20 @@ pub fn generate_tiles_with_slabs(
 ) -> Vec<TileSpec> {
     // id wins over everything else: it's a primary-key lookup, no tiling
     // adds value. One TileSpec with no extra constraints.
-    if params.get("id").is_some() {
+    //
+    // `platform` and `mostrecent` (profile-family qsps; the grids'
+    // validation rejects them before tiling) also bypass tiling, for
+    // different reasons: a platform is one float's profiles — naturally
+    // bounded (a float reports a few hundred cycles over its life), and
+    // splitting its drift track across spatial tiles would shred a
+    // "give me this float" request into dozens of pages. `mostrecent` is
+    // a global "N most recent matching" — the handler applies
+    // sort + limit(N), which both bounds the response and is semantically
+    // untileable (the N most recent docs don't respect tile boundaries).
+    if params.get("id").is_some()
+        || params.get("platform").is_some()
+        || params.get("mostrecent").is_some()
+    {
         return vec![TileSpec {
             tile_bbox: None,
             page_index: None,
@@ -643,6 +656,8 @@ mod tests {
         data_var_modifiers: &[],
         data_var_companion: None,
         data_var_negation: false,
+        allowed_qsp: crate::helpers::dataset_config::GRID_QSP,
+        allowed_sources: &[],
     };
 
     // ---- top-level dispatch --------------------------------------------------
@@ -1053,6 +1068,8 @@ mod tests {
         data_var_modifiers: &[],
         data_var_companion: None,
         data_var_negation: false,
+        allowed_qsp: crate::helpers::dataset_config::GRID_QSP,
+        allowed_sources: &[],
     };
 
     #[test]
@@ -1284,6 +1301,8 @@ mod tests {
             data_var_modifiers: &[],
             data_var_companion: None,
             data_var_negation: false,
+            allowed_qsp: crate::helpers::dataset_config::GRID_QSP,
+            allowed_sources: &[],
         };
         let tiles = generate_tiles(
             &json!({"box": "[[0,0],[10,10]]"}),
@@ -1308,6 +1327,8 @@ mod tests {
         data_var_modifiers: &[],
         data_var_companion: None,
         data_var_negation: false,
+        allowed_qsp: crate::helpers::dataset_config::GRID_QSP,
+        allowed_sources: &[],
     };
 
     fn bd(s: &str) -> BsonDateTime {
@@ -1381,6 +1402,29 @@ mod tests {
             assert_eq!(t.tile_bbox, None, "no spatial tile for center+radius");
             assert_eq!(t.page_index, Some(i), "slab pages in order");
         }
+    }
+
+    #[test]
+    fn platform_and_mostrecent_bypass_tiling() {
+        for params in [json!({"platform": "13857"}), json!({"mostrecent": "50"})] {
+            let tiles = generate_tiles_with_slabs(&params, &SLAB_TEST_CONFIG, &three_slabs());
+            assert_eq!(
+                tiles,
+                vec![TileSpec {
+                    tile_bbox: None,
+                    page_index: None
+                }],
+                "{:?} should produce a single passthrough tile",
+                params
+            );
+        }
+        // Even combined with geo params — the bounded mode wins.
+        let tiles = generate_tiles_with_slabs(
+            &json!({"platform": "13857", "box": "[[0,0],[10,10]]"}),
+            &SLAB_TEST_CONFIG,
+            &three_slabs(),
+        );
+        assert_eq!(tiles.len(), 1);
     }
 
     #[test]

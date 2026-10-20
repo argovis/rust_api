@@ -81,26 +81,11 @@ pub fn create_response<T: Serialize>(results: Vec<T>) -> HttpResponse {
     }
 }
 
-/// Whitelist of query-string parameter names recognised by the
-/// `/timeseries/*` endpoints. Any qsp not in this list is rejected with
-/// a 400 so typos (e.g. `start_Date` instead of `startDate`) fail loudly
-/// with a useful suggestion rather than getting silently ignored
-/// downstream. Update this list when adding a new qsp; keep it in sync
-/// with the table in `api/PAGINATION.md`.
-const ALLOWED_QSP: &[&str] = &[
-    "id",
-    "box",
-    "polygon",
-    "center",
-    "radius",
-    "verticalRange",
-    "startDate",
-    "endDate",
-    "data",
-    "compression",
-    "batchmeta",
-    "tile_index",
-];
+/// Hard cap on the `mostrecent` qsp: the mode bypasses tile pagination
+/// (a global "N most recent matching" can't be tiled), so N is the only
+/// thing bounding the response. 1000 slim docs is comfortably under one
+/// grid tile's worst case; revisit with usage.
+pub const MOSTRECENT_CAP: i64 = 1000;
 
 /// Levenshtein edit distance — used to suggest a "did you mean" target
 /// when a qsp doesn't match the whitelist. Iterative table with O(m*n)
@@ -140,9 +125,9 @@ fn edit_distance(a: &str, b: &str) -> usize {
 /// gets a useful suggestion — case differences between every letter
 /// would otherwise push the distance well past the threshold even
 /// though the user clearly meant the same name.
-fn suggest_qsp(unknown: &str) -> Option<&'static str> {
+fn suggest_qsp(unknown: &str, allowed: &'static [&'static str]) -> Option<&'static str> {
     let unknown_lower = unknown.to_lowercase();
-    ALLOWED_QSP
+    allowed
         .iter()
         .map(|allowed| (*allowed, edit_distance(&unknown_lower, &allowed.to_lowercase())))
         .filter(|(_, dist)| *dist <= 2)
@@ -150,26 +135,102 @@ fn suggest_qsp(unknown: &str) -> Option<&'static str> {
         .map(|(allowed, _)| allowed)
 }
 
-pub fn validate_query_params(params: &serde_json::Value) -> Result<(), HttpResponse> {
+pub fn validate_query_params(
+    params: &serde_json::Value,
+    config: &DatasetConfig,
+) -> Result<(), HttpResponse> {
 
     // Reject unknown qsp names before any further validation so a typo
     // (e.g. `start_Date` instead of `startDate`) fails loudly with a
     // useful suggestion rather than getting silently ignored downstream.
+    // The whitelist is per-dataset (`config.allowed_qsp`): /argo accepts
+    // profile-family params (`platform`, `source`, `mostrecent`) the
+    // grids reject, and the suggestion machinery follows the same list.
+    let allowed = config.allowed_qsp;
     if let Some(obj) = params.as_object() {
         for key in obj.keys() {
-            if !ALLOWED_QSP.contains(&key.as_str()) {
-                let msg = match suggest_qsp(key) {
+            if !allowed.contains(&key.as_str()) {
+                let msg = match suggest_qsp(key, allowed) {
                     Some(closest) => format!(
                         "Unknown query parameter '{}'. Did you mean '{}'? Allowed parameters: {}",
-                        key, closest, ALLOWED_QSP.join(", ")
+                        key, closest, allowed.join(", ")
                     ),
                     None => format!(
                         "Unknown query parameter '{}'. Allowed parameters: {}",
-                        key, ALLOWED_QSP.join(", ")
+                        key, allowed.join(", ")
                     ),
                 };
                 return Err(HttpResponse::BadRequest().json(json!({"error": msg})));
             }
+        }
+    }
+
+    // `platform` selects every profile of one float via an anchored _id
+    // prefix match. Restricting the value to alphanumerics keeps the
+    // regex we build from it literal (no metacharacters to escape) —
+    // WMO platform identifiers are alphanumeric in practice.
+    if let Some(platform) = params.get("platform") {
+        let ok = platform
+            .as_str()
+            .map_or(false, |p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric()));
+        if !ok {
+            return Err(HttpResponse::BadRequest().json(json!({
+                "error": "'platform' should be a non-empty alphanumeric float identifier, for example platform=13857"
+            })));
+        }
+    }
+
+    // `source` is a comma list of pipeline tags, each optionally negated
+    // with `~` (require absence). Tokens validate against the dataset's
+    // `allowed_sources`; a positive and negated copy of the same tag is
+    // unsatisfiable and rejected.
+    if let Some(source) = params.get("source") {
+        let raw = source.as_str().unwrap_or("");
+        let mut pos: Vec<&str> = Vec::new();
+        let mut neg: Vec<&str> = Vec::new();
+        for token in raw.split(',') {
+            if token.is_empty() {
+                return Err(HttpResponse::BadRequest().json(json!({
+                    "error": "'source' contains an empty token (likely a leading, trailing, or doubled comma)"
+                })));
+            }
+            let (bucket, tag) = match token.strip_prefix('~') {
+                Some(t) => (&mut neg, t),
+                None => (&mut pos, token),
+            };
+            if !config.allowed_sources.contains(&tag) {
+                return Err(HttpResponse::BadRequest().json(json!({
+                    "error": format!(
+                        "Unknown 'source' value '{}'. Allowed values: {} (prefix with ~ to require absence).",
+                        token,
+                        config.allowed_sources.join(", ")
+                    )
+                })));
+            }
+            bucket.push(tag);
+        }
+        if pos.iter().any(|p| neg.contains(p)) {
+            return Err(HttpResponse::BadRequest().json(json!({
+                "error": "'source' requires and negates the same tag — unsatisfiable"
+            })));
+        }
+    }
+
+    // `mostrecent` bypasses tile pagination (sort by timestamp desc +
+    // limit N), so N is the only response-size bound: it must be a
+    // positive integer at or under the cap.
+    if let Some(mostrecent) = params.get("mostrecent") {
+        let ok = mostrecent
+            .as_str()
+            .and_then(|m| m.parse::<i64>().ok())
+            .map_or(false, |n| n >= 1 && n <= MOSTRECENT_CAP);
+        if !ok {
+            return Err(HttpResponse::BadRequest().json(json!({
+                "error": format!(
+                    "'mostrecent' should be a positive integer no greater than {}",
+                    MOSTRECENT_CAP
+                )
+            })));
         }
     }
 
@@ -626,10 +687,39 @@ mod tests {
 
     // ---- validate_query_params -----------------------------------------------
 
+    /// Grid-shaped config for whitelist tests (GRID_QSP, no profile
+    /// params). Other knobs are irrelevant to validate_query_params.
+    const QSP_TEST_CONFIG: DatasetConfig = DatasetConfig {
+        tile_degrees: 10.0,
+        max_radius_meters: 1_000_000.0,
+        page_axis: PageAxis::Levels(&[0.0]),
+        coverage_bbox: None,
+        allowed_data_vars: &[],
+        data_var_modifiers: &[],
+        data_var_companion: None,
+        data_var_negation: false,
+        allowed_qsp: crate::helpers::dataset_config::GRID_QSP,
+        allowed_sources: &[],
+    };
+
+    /// Argo-shaped config for whitelist tests (ARGO_QSP + sources).
+    const ARGO_QSP_TEST_CONFIG: DatasetConfig = DatasetConfig {
+        tile_degrees: 5.0,
+        max_radius_meters: 1_000_000.0,
+        page_axis: PageAxis::TimeSlabs { width_days: 365 },
+        coverage_bbox: None,
+        allowed_data_vars: &[],
+        data_var_modifiers: &[],
+        data_var_companion: None,
+        data_var_negation: true,
+        allowed_qsp: crate::helpers::dataset_config::ARGO_QSP,
+        allowed_sources: crate::helpers::dataset_config::ARGO_SOURCES,
+    };
+
     #[test]
     fn validate_accepts_empty_params() {
         let params = json!({});
-        assert!(validate_query_params(&params).is_ok());
+        assert!(validate_query_params(&params, &QSP_TEST_CONFIG).is_ok());
     }
 
     #[test]
@@ -638,7 +728,7 @@ mod tests {
             "polygon": "[[0,0],[1,0],[1,1],[0,0]]",
             "box": "[[0,0],[1,1]]"
         });
-        let err = validate_query_params(&params).unwrap_err();
+        let err = validate_query_params(&params, &QSP_TEST_CONFIG).unwrap_err();
         assert_eq!(err.status(), 400);
     }
 
@@ -649,26 +739,26 @@ mod tests {
             "box": "[[0,0],[1,1]]",
             "center": "0,0"
         });
-        let err = validate_query_params(&params).unwrap_err();
+        let err = validate_query_params(&params, &QSP_TEST_CONFIG).unwrap_err();
         assert_eq!(err.status(), 400);
     }
 
     #[test]
     fn validate_rejects_center_without_radius() {
         let params = json!({"center": "0,0"});
-        assert!(validate_query_params(&params).is_err());
+        assert!(validate_query_params(&params, &QSP_TEST_CONFIG).is_err());
     }
 
     #[test]
     fn validate_rejects_radius_without_center() {
         let params = json!({"radius": "1000"});
-        assert!(validate_query_params(&params).is_err());
+        assert!(validate_query_params(&params, &QSP_TEST_CONFIG).is_err());
     }
 
     #[test]
     fn validate_accepts_center_and_radius() {
         let params = json!({"center": "0,0", "radius": "1000"});
-        assert!(validate_query_params(&params).is_ok());
+        assert!(validate_query_params(&params, &QSP_TEST_CONFIG).is_ok());
     }
 
     #[test]
@@ -676,7 +766,7 @@ mod tests {
         // 2.x format is comma-separated lon,lat; the old bracketed JSON
         // array form should 400 with a format hint rather than 500.
         let params = json!({"center": "[0,0]", "radius": "1000"});
-        assert!(validate_query_params(&params).is_err());
+        assert!(validate_query_params(&params, &QSP_TEST_CONFIG).is_err());
     }
 
     #[test]
@@ -684,7 +774,7 @@ mod tests {
         for bad in ["0", "0,0,0", "a,b", "0,", ",0", "0,inf"] {
             let params = json!({"center": bad, "radius": "1000"});
             assert!(
-                validate_query_params(&params).is_err(),
+                validate_query_params(&params, &QSP_TEST_CONFIG).is_err(),
                 "center '{}' should be rejected",
                 bad
             );
@@ -694,16 +784,16 @@ mod tests {
     #[test]
     fn validate_accepts_center_with_spaces_and_signs() {
         let params = json!({"center": "-20.5, 42", "radius": "1000"});
-        assert!(validate_query_params(&params).is_ok());
+        assert!(validate_query_params(&params, &QSP_TEST_CONFIG).is_ok());
     }
 
     #[test]
     fn validate_accepts_comma_separated_vertical_range() {
         let params = json!({"verticalRange": "0,10"});
-        assert!(validate_query_params(&params).is_ok());
+        assert!(validate_query_params(&params, &QSP_TEST_CONFIG).is_ok());
         // negative bounds are legitimate (e.g. heights above a datum)
         let params = json!({"verticalRange": "-5,5"});
-        assert!(validate_query_params(&params).is_ok());
+        assert!(validate_query_params(&params, &QSP_TEST_CONFIG).is_ok());
     }
 
     #[test]
@@ -711,7 +801,7 @@ mod tests {
         // 2.x format is comma-separated lo,hi; the old bracketed JSON
         // array form should 400 with a format hint rather than 500.
         let params = json!({"verticalRange": "[0,10]"});
-        assert!(validate_query_params(&params).is_err());
+        assert!(validate_query_params(&params, &QSP_TEST_CONFIG).is_err());
     }
 
     #[test]
@@ -719,7 +809,7 @@ mod tests {
         for bad in ["0", "0,10,20", "a,b", "0,", ",10", "0,inf"] {
             let params = json!({"verticalRange": bad});
             assert!(
-                validate_query_params(&params).is_err(),
+                validate_query_params(&params, &QSP_TEST_CONFIG).is_err(),
                 "verticalRange '{}' should be rejected",
                 bad
             );
@@ -729,43 +819,43 @@ mod tests {
     #[test]
     fn validate_rejects_polygon_too_few_points() {
         let params = json!({"polygon": "[[0,0],[1,0],[0,0]]"}); // only 3 points
-        assert!(validate_query_params(&params).is_err());
+        assert!(validate_query_params(&params, &QSP_TEST_CONFIG).is_err());
     }
 
     #[test]
     fn validate_rejects_polygon_not_closed() {
         let params = json!({"polygon": "[[0,0],[1,0],[1,1],[0,1]]"}); // first != last
-        assert!(validate_query_params(&params).is_err());
+        assert!(validate_query_params(&params, &QSP_TEST_CONFIG).is_err());
     }
 
     #[test]
     fn validate_rejects_polygon_with_bad_point() {
         let params = json!({"polygon": "[[0,0,0],[1,0],[1,1],[0,0,0]]"});
-        assert!(validate_query_params(&params).is_err());
+        assert!(validate_query_params(&params, &QSP_TEST_CONFIG).is_err());
     }
 
     #[test]
     fn validate_accepts_well_formed_polygon() {
         let params = json!({"polygon": "[[0,0],[1,0],[1,1],[0,1],[0,0]]"});
-        assert!(validate_query_params(&params).is_ok());
+        assert!(validate_query_params(&params, &QSP_TEST_CONFIG).is_ok());
     }
 
     #[test]
     fn validate_rejects_unparseable_polygon_string() {
         let params = json!({"polygon": "not json"});
-        assert!(validate_query_params(&params).is_err());
+        assert!(validate_query_params(&params, &QSP_TEST_CONFIG).is_err());
     }
 
     #[test]
     fn validate_rejects_bad_start_date() {
         let params = json!({"startDate": "yesterday"});
-        assert!(validate_query_params(&params).is_err());
+        assert!(validate_query_params(&params, &QSP_TEST_CONFIG).is_err());
     }
 
     #[test]
     fn validate_rejects_bad_end_date() {
         let params = json!({"endDate": "2020/01/01"});
-        assert!(validate_query_params(&params).is_err());
+        assert!(validate_query_params(&params, &QSP_TEST_CONFIG).is_err());
     }
 
     #[test]
@@ -774,7 +864,7 @@ mod tests {
             "startDate": "2020-01-01T00:00:00Z",
             "endDate":   "2020-12-31T23:59:59Z"
         });
-        assert!(validate_query_params(&params).is_ok());
+        assert!(validate_query_params(&params, &QSP_TEST_CONFIG).is_ok());
     }
 
     // ---- qsp whitelist --------------------------------------------------------
@@ -782,7 +872,7 @@ mod tests {
     #[test]
     fn validate_rejects_unknown_qsp() {
         let params = json!({"start_Date": "2020-01-01T00:00:00Z"});
-        let err = validate_query_params(&params).unwrap_err();
+        let err = validate_query_params(&params, &QSP_TEST_CONFIG).unwrap_err();
         assert_eq!(err.status(), 400);
     }
 
@@ -795,7 +885,7 @@ mod tests {
             "box": "[[0,0],[10,10]]",
             "frobnicate": "yes",
         });
-        let err = validate_query_params(&params).unwrap_err();
+        let err = validate_query_params(&params, &QSP_TEST_CONFIG).unwrap_err();
         assert_eq!(err.status(), 400);
     }
 
@@ -816,9 +906,86 @@ mod tests {
         ] {
             let params = json!({ key: value });
             assert!(
-                validate_query_params(&params).is_ok(),
+                validate_query_params(&params, &QSP_TEST_CONFIG).is_ok(),
                 "whitelist should accept '{}' but rejected it",
                 key
+            );
+        }
+    }
+
+    #[test]
+    fn whitelist_is_per_dataset() {
+        // Profile-family params 400 on a grid config but pass on argo's.
+        for key in ["platform", "source", "mostrecent"] {
+            let value = match key {
+                "platform" => "13857",
+                "source" => "argo_core",
+                _ => "10",
+            };
+            let params = json!({ key: value });
+            assert!(
+                validate_query_params(&params, &QSP_TEST_CONFIG).is_err(),
+                "grids should reject '{}'",
+                key
+            );
+            assert!(
+                validate_query_params(&params, &ARGO_QSP_TEST_CONFIG).is_ok(),
+                "argo should accept '{}'",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn validate_platform_shape() {
+        for bad in ["", "13857_068", "138 57", "^13857", "13857$"] {
+            let params = json!({"platform": bad});
+            assert!(
+                validate_query_params(&params, &ARGO_QSP_TEST_CONFIG).is_err(),
+                "platform '{}' should be rejected",
+                bad
+            );
+        }
+        let params = json!({"platform": "4902911"});
+        assert!(validate_query_params(&params, &ARGO_QSP_TEST_CONFIG).is_ok());
+    }
+
+    #[test]
+    fn validate_source_tokens() {
+        for ok in ["argo_core", "~argo_bgc", "argo_core,~argo_deep", "argo_core,argo_bgc"] {
+            let params = json!({"source": ok});
+            assert!(
+                validate_query_params(&params, &ARGO_QSP_TEST_CONFIG).is_ok(),
+                "source '{}' should be accepted",
+                ok
+            );
+        }
+        for bad in ["argo_frobnicate", "~bogus", "argo_core,", "argo_bgc,~argo_bgc"] {
+            let params = json!({"source": bad});
+            assert!(
+                validate_query_params(&params, &ARGO_QSP_TEST_CONFIG).is_err(),
+                "source '{}' should be rejected",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn validate_mostrecent_bounds() {
+        for ok in ["1", "50", "1000"] {
+            let params = json!({"mostrecent": ok});
+            assert!(
+                validate_query_params(&params, &ARGO_QSP_TEST_CONFIG).is_ok(),
+                "mostrecent '{}' should be accepted",
+                ok
+            );
+        }
+        for bad in ["0", "-5", "1001", "many", "1.5"] {
+            let params = json!({"mostrecent": bad});
+            assert!(
+                validate_query_params(&params, &ARGO_QSP_TEST_CONFIG).is_err(),
+                "mostrecent '{}' should be rejected",
+                bad
             );
         }
     }
@@ -836,10 +1003,10 @@ mod tests {
 
     #[test]
     fn suggest_qsp_finds_close_match() {
-        assert_eq!(suggest_qsp("start_Date"), Some("startDate"));
-        assert_eq!(suggest_qsp("startdate"), Some("startDate"));
-        assert_eq!(suggest_qsp("verticalrange"), Some("verticalRange"));
-        assert_eq!(suggest_qsp("Box"), Some("box"));
+        assert_eq!(suggest_qsp("start_Date", crate::helpers::dataset_config::GRID_QSP), Some("startDate"));
+        assert_eq!(suggest_qsp("startdate", crate::helpers::dataset_config::GRID_QSP), Some("startDate"));
+        assert_eq!(suggest_qsp("verticalrange", crate::helpers::dataset_config::GRID_QSP), Some("verticalRange"));
+        assert_eq!(suggest_qsp("Box", crate::helpers::dataset_config::GRID_QSP), Some("box"));
     }
 
     #[test]
@@ -848,9 +1015,9 @@ mod tests {
         // a useful suggestion — without case-folding, every letter
         // would count as a substitution and the distance would blow
         // past the threshold.
-        assert_eq!(suggest_qsp("STARTDATE"), Some("startDate"));
-        assert_eq!(suggest_qsp("StArTdAtE"), Some("startDate"));
-        assert_eq!(suggest_qsp("BOX"), Some("box"));
+        assert_eq!(suggest_qsp("STARTDATE", crate::helpers::dataset_config::GRID_QSP), Some("startDate"));
+        assert_eq!(suggest_qsp("StArTdAtE", crate::helpers::dataset_config::GRID_QSP), Some("startDate"));
+        assert_eq!(suggest_qsp("BOX", crate::helpers::dataset_config::GRID_QSP), Some("box"));
     }
 
     #[test]
@@ -858,8 +1025,8 @@ mod tests {
         // A name with no plausibly close match in the whitelist
         // should return None rather than reaching for the nearest
         // entry no matter how far.
-        assert_eq!(suggest_qsp("frobnicate"), None);
-        assert_eq!(suggest_qsp("xyzzy"), None);
+        assert_eq!(suggest_qsp("frobnicate", crate::helpers::dataset_config::GRID_QSP), None);
+        assert_eq!(suggest_qsp("xyzzy", crate::helpers::dataset_config::GRID_QSP), None);
     }
 
     // ---- validate_radius_cap -------------------------------------------------
@@ -875,6 +1042,8 @@ mod tests {
         data_var_modifiers: &[],
         data_var_companion: None,
         data_var_negation: false,
+        allowed_qsp: crate::helpers::dataset_config::GRID_QSP,
+        allowed_sources: &[],
     };
 
     /// Test config with a couple of allowed variable names, used by
@@ -888,6 +1057,8 @@ mod tests {
         data_var_modifiers: &[],
         data_var_companion: None,
         data_var_negation: false,
+        allowed_qsp: crate::helpers::dataset_config::GRID_QSP,
+        allowed_sources: &[],
     };
 
     // ---- validate_data_param --------------------------------------------------
@@ -964,6 +1135,8 @@ mod tests {
         data_var_modifiers: &["_std", "_med"],
         data_var_companion: Some("_argoqc"),
         data_var_negation: true,
+        allowed_qsp: crate::helpers::dataset_config::ARGO_QSP,
+        allowed_sources: crate::helpers::dataset_config::ARGO_SOURCES,
     };
 
     #[test]

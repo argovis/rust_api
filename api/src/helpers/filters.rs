@@ -43,8 +43,16 @@ pub fn filter_timeseries(params: serde_json::Value) -> mongodb::bson::Document {
 ///     else). For grids, dates are a transform over the shared time
 ///     axis; for profiles they're selection, full stop.
 ///   - no `verticalRange` → `level` clause: profiles have no scalar
-///     `level` field. (`verticalRange` row-slicing is a phase-2
-///     transform; until then the profile handler rejects the param.)
+///     `level` field (`verticalRange` is a per-level transform for
+///     profiles — see `transforms::filter_profile_levels`).
+///   - `platform=<float id>` becomes an anchored `_id` prefix regex
+///     (`^<id>_` — profile ids are `{platform}_{cycle}`), which Mongo
+///     serves from the `_id` index. The value is validated upstream to
+///     be alphanumeric, so the regex is always literal.
+///   - `source=<tags>` filters on the docs' `source.source` arrays:
+///     positive tags via `$all` (every one required), `~`-negated tags
+///     via `$nin` (none may appear). A doc with no `source` field
+///     matches every negation and no positive — absence is absence.
 ///
 /// The geo filters (id / polygon / box / center+radius) are the exact
 /// same builders the grids use — profile docs carry the same GeoJSON
@@ -55,6 +63,8 @@ pub fn filter_profile(params: serde_json::Value) -> mongodb::bson::Document {
     let center = params.get("center").map(|p| p.as_str().unwrap());
     let radius = params.get("radius").map(|d| d.as_str().unwrap().parse::<f64>().unwrap());
     let id = params.get("id").map(|p| p.as_str().unwrap());
+    let platform = params.get("platform").and_then(|p| p.as_str());
+    let source = params.get("source").and_then(|p| p.as_str());
     let start_date = params
         .get("startDate")
         .and_then(|v| v.as_str())
@@ -68,6 +78,18 @@ pub fn filter_profile(params: serde_json::Value) -> mongodb::bson::Document {
     if let Some(id) = id {
         filter = id_filter(id, filter);
     }
+    if let Some(platform) = platform {
+        // Anchored prefix match on `{platform}_{cycle}` ids. `id` wins
+        // if both are present (same key — but validation lets them
+        // coexist and an id lookup is strictly narrower, so only emit
+        // the platform clause when no id was given).
+        if filter.get("_id").is_none() {
+            filter.insert(
+                "_id",
+                mongodb::bson::doc! { "$regex": format!("^{}_", platform) },
+            );
+        }
+    }
     if let Some(polygon) = polygon {
         filter = polygon_filter(polygon, filter);
     }
@@ -76,6 +98,26 @@ pub fn filter_profile(params: serde_json::Value) -> mongodb::bson::Document {
     }
     if let (Some(center), Some(radius)) = (center, radius) {
         filter = center_filter(center, radius, filter);
+    }
+    if let Some(source) = source {
+        let mut pos: Vec<&str> = Vec::new();
+        let mut neg: Vec<&str> = Vec::new();
+        for token in source.split(',') {
+            match token.strip_prefix('~') {
+                Some(t) => neg.push(t),
+                None => pos.push(token),
+            }
+        }
+        let mut clause = mongodb::bson::Document::new();
+        if !pos.is_empty() {
+            clause.insert("$all", pos);
+        }
+        if !neg.is_empty() {
+            clause.insert("$nin", neg);
+        }
+        if !clause.is_empty() {
+            filter.insert("source.source", clause);
+        }
     }
     if start_date.is_some() || end_date.is_some() {
         let mut ts_clause = mongodb::bson::Document::new();
@@ -356,6 +398,49 @@ mod tests {
         let f = filter_profile(json!({"verticalRange": "0,100"}));
         assert!(f.get_document("level").is_err());
         assert!(f.is_empty(), "verticalRange is simply not this function's business");
+    }
+
+    #[test]
+    fn profile_platform_becomes_anchored_id_prefix_regex() {
+        let f = filter_profile(json!({"platform": "13857"}));
+        let clause = f.get_document("_id").unwrap();
+        assert_eq!(clause.get_str("$regex").unwrap(), "^13857_");
+    }
+
+    #[test]
+    fn profile_id_wins_over_platform() {
+        // An id lookup is strictly narrower; the platform clause must not
+        // clobber it (both target _id).
+        let f = filter_profile(json!({"id": "13857_068", "platform": "13857"}));
+        assert_eq!(f.get_str("_id").unwrap(), "13857_068");
+    }
+
+    #[test]
+    fn profile_source_positive_and_negated_tags() {
+        let f = filter_profile(json!({"source": "argo_core,~argo_deep,argo_bgc"}));
+        let clause = f.get_document("source.source").unwrap();
+        let all: Vec<&str> = clause
+            .get_array("$all")
+            .unwrap()
+            .iter()
+            .map(|b| b.as_str().unwrap())
+            .collect();
+        assert_eq!(all, vec!["argo_core", "argo_bgc"]);
+        let nin: Vec<&str> = clause
+            .get_array("$nin")
+            .unwrap()
+            .iter()
+            .map(|b| b.as_str().unwrap())
+            .collect();
+        assert_eq!(nin, vec!["argo_deep"]);
+    }
+
+    #[test]
+    fn profile_source_negation_only_emits_nin_alone() {
+        let f = filter_profile(json!({"source": "~argo_bgc"}));
+        let clause = f.get_document("source.source").unwrap();
+        assert!(clause.get_array("$all").is_err());
+        assert_eq!(clause.get_array("$nin").unwrap().len(), 1);
     }
 
     #[test]

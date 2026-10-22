@@ -20,6 +20,18 @@ Every response from the `/timeseries/...` endpoints is a JSON envelope:
 There is no separate "no results" status code: an empty response is
 `200 + {docs: [], next_url: null, ...}`, never `404`.
 
+## Datetime rendering
+
+Every datetime the API **emits** — timeseries axis strings, profile
+timestamps, source dates — is RFC-3339 with a fixed three fractional
+digits: `2020-01-01T00:00:00.000Z`, `1999-08-05T19:03:42.002Z`. This is
+a deliberate normalization over the 2.x API, which emitted whole
+seconds in some places: `...T00:00:00Z` (2.x) and `...T00:00:00.000Z`
+(3.x) denote the same instant, so parity checks against 2.x must
+compare dates *parsed*, not byte-wise. Datetime **inputs**
+(`startDate` / `endDate`) accept RFC-3339 with or without fractional
+seconds, unchanged.
+
 ## How pagination walks
 
 Server-side, each request's spatial parameters define a sequence of
@@ -95,22 +107,28 @@ antimeridian / north-pole docs aren't lost.
 | `center` + `radius` | comma-separated `lon,lat` (e.g. `center=0,0`) + km | Disk query, 2.x API format. Radius capped at the dataset's `max_radius_meters` (converted to km). |
 | `verticalRange` | comma-separated `lo,hi` (e.g. `verticalRange=0,10`) | Half-open depth range applied on top of tile-level pagination. 2.x API format. |
 | `startDate` / `endDate` | RFC-3339 string | Slices each doc's timeseries to this window. A doc whose timeseries is empty after windowing (no timestamps in range) is dropped from the response entirely — regardless of `data=` mode. |
-| `data` | comma-separated | Variables to include. Each token must be: a dataset-specific variable name (BSOSE: `THETA`, `SALT`; OI SST: `sst`), the universal `all` (keep everything) or `except-data-values` (keep schema, clear values), or an integer (QC filter). Unknown tokens are rejected with a 400 + a "did you mean" suggestion. If the doc has no data to return after filtering (no matching columns, or a time window that collapsed to zero points), the whole doc is dropped from the response. Omitting `data=` entirely also omits the `data` field from each response doc — use that for slim listings. `except-data-values` in the list keeps the row but clears the values (schema-only mode) — that's the one case where an empty `data` array doesn't drop the doc. `data=except-data-values` on its own is nonsense ("clear the values of nothing") and is silently normalized, 2.x-style, to the absent-`data=` behaviour. |
+| `data` | comma-separated | Variables to include. Each token must be: a dataset-specific variable name (BSOSE: `THETA`, `SALT`; OI SST: `sst`), the universal `all` (keep everything) or `except-data-values` (keep schema, clear values), or an integer (QC filter — only valid alongside at least one variable name or `all`; a list of bare integers like `data=1` is a 400). Unknown tokens are rejected with a 400 + a "did you mean" suggestion. If the doc has no data to return after filtering (no matching columns, or a time window that collapsed to zero points), the whole doc is dropped from the response. Omitting `data=` entirely also omits the `data` field from each response doc — use that for slim listings. `except-data-values` in the list keeps the row but clears the values (schema-only mode) — that's the one case where an empty `data` array doesn't drop the doc. `data=except-data-values` on its own is nonsense ("clear the values of nothing") and is silently normalized, 2.x-style, to the absent-`data=` behaviour. |
 | `compression` | `minimal` | See mode flags. |
 | `batchmeta` | any | See mode flags. |
 | `tile_index` | non-negative integer | Pagination cursor. Default `0`. Almost always supplied by the previous response's `next_url`. |
 
 ## Validation errors (HTTP 400)
 
-- Any query parameter not on the whitelist above. Unknown names are
-  rejected so typos (e.g. `start_Date` instead of `startDate`) fail
-  loudly instead of being silently ignored. When the typo is close to
+- Any query parameter not on the route's whitelist (per-dataset:
+  `DatasetConfig::allowed_qsp` — the table above is the grid set;
+  `/argo` additionally accepts `platform`, `source`, and `mostrecent`,
+  documented in ARGO-DESIGN.md). Unknown names are rejected so typos
+  (e.g. `start_Date` instead of `startDate`) fail loudly instead of
+  being silently ignored. When the typo is close to
   a real param name, the error message includes a "did you mean ..."
   suggestion.
 - Any token inside the `data=` list that isn't one of: the dataset's
   declared variable names, the universal `all` / `except-data-values`,
   or an integer (QC filter). Suggestions follow the same shape as the
   qsp-name check.
+- A `data=` list containing integer QC filters but no variable name or
+  `all` (e.g. `data=1`): a QC filter with nothing to filter is
+  rejected, matching 2.x.
 - More than one of `polygon` / `box` / `center` set.
 - `center` set without `radius`, or vice versa.
 - `center` not comma-separated `lon,lat`, or `verticalRange` not

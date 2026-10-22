@@ -34,7 +34,7 @@ use std::collections::HashSet;
 use async_stream::stream;
 use serde_json::{json, Value};
 
-use dataset_config::{DatasetConfig, DatasetSource};
+use dataset_config::{DatasetConfig, DatasetSource, ProfileSource};
 
 // Per-dataset source-of-truth: identity strings + the dataset's Mongo
 // client + values loaded from the dataset's meta doc at startup. The
@@ -56,6 +56,10 @@ static BSOSE_SOURCE: Lazy<Mutex<Option<DatasetSource>>> = Lazy::new(|| Mutex::ne
 static OISST_SOURCE: Lazy<Mutex<Option<DatasetSource>>> = Lazy::new(|| Mutex::new(None));
 static COPERNICUSSLA_SOURCE: Lazy<Mutex<Option<DatasetSource>>> = Lazy::new(|| Mutex::new(None));
 static CCMPWIND_SOURCE: Lazy<Mutex<Option<DatasetSource>>> = Lazy::new(|| Mutex::new(None));
+// The profile family's sources use the family's own struct (slab-start
+// cache instead of time axis + data_info) but the identical
+// Lazy<Mutex<Option<_>>> idiom.
+static ARGO_SOURCE: Lazy<Mutex<Option<ProfileSource>>> = Lazy::new(|| Mutex::new(None));
 
 // ---- route handlers --------------------------------------------------------
 //
@@ -155,6 +159,27 @@ async fn ccmpwind_handler(
     .await
 }
 
+#[get("/argo")]
+async fn argo_handler(
+    req: HttpRequest,
+    query_params: web::Query<serde_json::Value>,
+) -> impl Responder {
+    let source = ARGO_SOURCE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("ARGO_SOURCE not initialized at startup")
+        .clone();
+
+    serve_profile::<schema::ArgoSchema>(
+        req,
+        query_params.into_inner(),
+        &dataset_config::ARGO_CONFIG,
+        &source,
+    )
+    .await
+}
+
 // ---- generic timeseries handler --------------------------------------------
 
 /// Generic body of the `/timeseries/{dataset}` endpoint. Parameterized by
@@ -189,7 +214,7 @@ where
     let path = req.path().to_string();
 
     // ---- validation ---------------------------------------------------
-    if let Err(response) = helpers::validate_query_params(&params) {
+    if let Err(response) = helpers::validate_query_params(&params, config) {
         return response;
     }
     if let Err(response) = helpers::validate_radius_cap(&params, config) {
@@ -430,6 +455,259 @@ where
     }))
 }
 
+// ---- generic profile handler ------------------------------------------------
+
+/// Generic body of the `/argo`-style profile endpoints — the profile
+/// family's `serve_timeseries`. Deliberately a visible mirror rather
+/// than a shared mega-generic: the skeleton (validate → tiles →
+/// probe-forward → batchmeta | stream → envelope) is identical and the
+/// two bodies share the extracted helpers (`generate_cursor`,
+/// `next_url_value`, pagination, validation), but the five
+/// family-specific joints differ in *signature*, not just behaviour —
+/// transform (`transform_profile(params, doc)` vs the grids'
+/// axis-and-cache version), stub, tile generation (`_with_slabs`),
+/// filter composition (`compose_profile_filter_with_tile_slabs`), and
+/// the source struct. Collapsing both into one function means a trait
+/// over all five joints at once; worth it when a third family shows up,
+/// premature before.
+async fn serve_profile<S>(
+    req: HttpRequest,
+    params: serde_json::Value,
+    config: &DatasetConfig,
+    source: &ProfileSource,
+) -> HttpResponse
+where
+    S: schema::IsProfile
+        + DeserializeOwned
+        + Serialize
+        + Send
+        + Sync
+        + Unpin
+        + 'static,
+{
+    let path = req.path().to_string();
+
+    // ---- validation ---------------------------------------------------
+    if let Err(response) = helpers::validate_query_params(&params, config) {
+        return response;
+    }
+    if let Err(response) = helpers::validate_radius_cap(&params, config) {
+        return response;
+    }
+    if let Err(response) = helpers::validate_data_param(&params, config) {
+        return response;
+    }
+
+    let start_idx = match pagination::parse_tile_index(&params) {
+        Ok(i) => i,
+        Err(e) => return HttpResponse::BadRequest().json(json!({"error": e})),
+    };
+
+    // ---- tile sequence + startup-loaded state --------------------------
+    //
+    // The slab list is this request's page-axis source of truth: the
+    // generator indexes pages against it and the composer resolves those
+    // indexes back through it, so both get the same (cloned) list.
+    let slab_starts = source.slab_starts.clone();
+    let tiles = tile_generator::generate_tiles_with_slabs(&params, config, &slab_starts);
+
+    let compression: Option<String> = params
+        .get("compression")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let batchmeta: Option<String> = params
+        .get("batchmeta")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let is_minimal = matches!(compression.as_deref(), Some("minimal"));
+
+    // `mostrecent=N`: serve the N most recent matching profiles —
+    // sort by timestamp descending, limit N. Bypasses tiling (the tile
+    // generator emits a single passthrough tile when it's set), so N is
+    // the response-size bound; validation caps it.
+    let mostrecent: Option<i64> = params
+        .get("mostrecent")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
+
+    // ---- probe-forward loop -------------------------------------------
+    //
+    // Same contract as the grids: serve at most one non-empty tile per
+    // request, advancing past empties.
+    for tile_idx in start_idx..tiles.len() {
+        let tile = &tiles[tile_idx];
+        let filter = filter_composer::compose_profile_filter_with_tile_slabs(
+            params.clone(),
+            tile,
+            config,
+            &slab_starts,
+        );
+        let options = match mostrecent {
+            Some(n) => FindOptions::builder()
+                .sort(mongodb::bson::doc! { "timestamp": -1 })
+                .limit(n)
+                .build(),
+            None => FindOptions::builder().build(),
+        };
+
+        let mut cursor = match generate_cursor::<S>(
+            &source.client,
+            source.db_name,
+            source.collection,
+            filter,
+            Some(options),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Error opening cursor for tile {}: {}", tile_idx, e);
+                return HttpResponse::InternalServerError().finish();
+            }
+        };
+
+        if batchmeta.is_some() {
+            // ---- batchmeta branch --------------------------------------
+            let mut unique_metadata: HashSet<String> = HashSet::new();
+            while let Some(result) = cursor.next().await {
+                match result {
+                    Ok(doc) => {
+                        if let Some(t) = transforms::transform_profile(&params, doc) {
+                            for m in t.metadata().into_iter() {
+                                unique_metadata.insert(m);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Cursor error during batchmeta drain: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            if unique_metadata.is_empty() {
+                continue; // tile produced no metadata — try the next one.
+            }
+
+            let meta_filter = mongodb::bson::doc! {
+                "_id": { "$in": unique_metadata.into_iter().collect::<Vec<_>>() }
+            };
+            let meta_cursor = match generate_cursor::<Document>(
+                &source.client,
+                source.db_name,
+                source.meta_collection,
+                meta_filter,
+                None,
+            )
+            .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error opening metadata cursor: {}", e);
+                    return HttpResponse::InternalServerError().finish();
+                }
+            };
+            let docs: Vec<_> = meta_cursor.map(|d| d.unwrap()).collect().await;
+
+            return HttpResponse::Ok().json(json!({
+                "docs": docs,
+                "next_url": next_url_value(&path, &params, tile_idx, tiles.len()),
+                "message": format!("page {}", tile_idx),
+            }));
+        }
+
+        // ---- streaming branch ------------------------------------------
+        let mut first_doc: Option<S> = None;
+        while let Some(result) = cursor.next().await {
+            match result {
+                Ok(doc) => {
+                    if let Some(t) = transforms::transform_profile(&params, doc) {
+                        first_doc = Some(t);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Cursor error during peek for tile {}: {}", tile_idx, e);
+                    return HttpResponse::InternalServerError().finish();
+                }
+            }
+        }
+
+        let first_doc = match first_doc {
+            Some(d) => d,
+            None => continue, // tile contributed no surviving docs — try next.
+        };
+
+        let next_url = next_url_value(&path, &params, tile_idx, tiles.len());
+        let page_message = format!("page {}", tile_idx);
+        let params_for_stream = params.clone();
+
+        let body = stream! {
+            yield Ok::<_, Infallible>(web::Bytes::from_static(b"{\"docs\":["));
+
+            let first_bytes = if is_minimal {
+                let stub = schema::ProfileStub::from_profile(&first_doc);
+                serde_json::to_vec(&stub).expect("serializing one stub should not fail")
+            } else {
+                serde_json::to_vec(&first_doc)
+                    .expect("serializing a profile doc should not fail")
+            };
+            yield Ok(web::Bytes::from(first_bytes));
+
+            while let Some(result) = cursor.next().await {
+                match result {
+                    Ok(doc) => {
+                        if let Some(t) =
+                            transforms::transform_profile(&params_for_stream, doc)
+                        {
+                            let bytes = if is_minimal {
+                                let stub = schema::ProfileStub::from_profile(&t);
+                                serde_json::to_vec(&stub)
+                                    .expect("serializing one stub should not fail")
+                            } else {
+                                serde_json::to_vec(&t)
+                                    .expect("serializing a profile doc should not fail")
+                            };
+                            yield Ok(web::Bytes::from_static(b","));
+                            yield Ok(web::Bytes::from(bytes));
+                        }
+                    }
+                    Err(e) => {
+                        // Mid-stream error: status is already 200, so we
+                        // can only close the JSON cleanly and stop.
+                        eprintln!("Cursor error during stream: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            yield Ok(web::Bytes::from_static(b"],\"next_url\":"));
+            yield Ok(web::Bytes::from(
+                serde_json::to_vec(&next_url).unwrap_or_else(|_| b"null".to_vec()),
+            ));
+            yield Ok(web::Bytes::from_static(b",\"message\":"));
+            yield Ok(web::Bytes::from(
+                serde_json::to_vec(&page_message)
+                    .unwrap_or_else(|_| b"\"\"".to_vec()),
+            ));
+            yield Ok(web::Bytes::from_static(b"}"));
+        };
+
+        return HttpResponse::Ok()
+            .content_type("application/json")
+            .streaming(body);
+    }
+
+    // ---- no non-empty tile in the requested range ---------------------
+    HttpResponse::Ok().json(json!({
+        "docs": [],
+        "next_url": Value::Null,
+        "message": format!("no non-empty tiles from index {}", start_idx),
+    }))
+}
+
 /// Build the JSON value emitted as `next_url`. Returns `Value::Null` when
 /// the just-served tile was the last one (no further pages exist).
 fn next_url_value(
@@ -493,6 +771,94 @@ where
         meta_data_type,
         timeseries: meta.timeseries(),
         data_info: meta.data_info(),
+    })
+}
+
+/// Build a `ProfileSource` by reading the dataset's time span out of
+/// Mongo and generating the slab-start list.
+///
+/// Called once per profile dataset at server startup — the profile
+/// sibling of `load_dataset_source`. Where a grid reads its single meta
+/// doc (time axis, `data_info` default), a profile dataset has neither;
+/// its startup state is the `TimeSlabs` page-axis boundary list,
+/// computed from the collection's `[earliest, latest]` timestamp span
+/// (two index-backed sort+limit(1) queries) via
+/// `tile_generator::time_slab_starts`.
+///
+/// An *empty* collection yields an empty slab list, which downstream
+/// treats as the degenerate empty axis — we warn rather than panic so a
+/// fresh deployment can boot before its first ingestion. A doc missing
+/// the `timestamp` field, by contrast, is data corruption and panics
+/// loudly. Panics on a `Levels` config — grids load through
+/// `load_dataset_source`.
+async fn load_profile_source(
+    client: mongodb::Client,
+    db_name: &'static str,
+    collection: &'static str,
+    meta_collection: &'static str,
+    config: &DatasetConfig,
+) -> Result<ProfileSource> {
+    let width_days = match config.page_axis {
+        dataset_config::PageAxis::TimeSlabs { width_days } => width_days,
+        dataset_config::PageAxis::Levels(_) => panic!(
+            "load_profile_source called for a Levels dataset ({}.{}) — \
+             grids load through load_dataset_source",
+            db_name, collection
+        ),
+    };
+
+    // Earliest and latest timestamps, each via an index-backed
+    // sort + limit(1). Typed as raw Documents: we only need one field.
+    let mut span = Vec::with_capacity(2);
+    for direction in [1_i32, -1_i32] {
+        let options = FindOptions::builder()
+            .sort(mongodb::bson::doc! { "timestamp": direction })
+            .limit(1)
+            .build();
+        let mut cursor = generate_cursor::<Document>(
+            &client,
+            db_name,
+            collection,
+            mongodb::bson::doc! {},
+            Some(options),
+        )
+        .await?;
+        match cursor.next().await {
+            Some(Ok(doc)) => {
+                let ts = doc.get_datetime("timestamp").unwrap_or_else(|e| {
+                    panic!(
+                        "doc in {}.{} has no readable 'timestamp' ({}): {:?}",
+                        db_name, collection, e, doc.get("_id")
+                    )
+                });
+                span.push(*ts);
+            }
+            Some(Err(e)) => panic!(
+                "Error reading time span from {}.{}: {}",
+                db_name, collection, e
+            ),
+            None => {} // empty collection — handled below
+        }
+    }
+
+    let slab_starts = if span.len() == 2 {
+        tile_generator::time_slab_starts(span[0], span[1], width_days)
+    } else {
+        eprintln!(
+            "warning: {}.{} is empty — no time slabs generated; every \
+             paginated request will serve the degenerate empty page axis \
+             until data is ingested and the API restarted",
+            db_name, collection
+        );
+        Vec::new()
+    };
+
+    Ok(ProfileSource {
+        client,
+        db_name,
+        collection,
+        meta_collection,
+        slab_starts,
     })
 }
 
@@ -584,19 +950,41 @@ async fn main() -> std::io::Result<()> {
         enabled_ccmpwind = true;
     }
 
-    if !enabled_bsose && !enabled_oisst && !enabled_copernicussla && !enabled_ccmpwind {
+    let mut enabled_argo = false;
+    if let Some(client) = dataset_client("MONGODB_URI_ARGO").await {
+        let argo = load_profile_source(
+            client,
+            "argo",
+            "argo",
+            "argoMeta",
+            &dataset_config::ARGO_CONFIG,
+        )
+        .await
+        .expect("failed to load Argo profile source at startup");
+        *ARGO_SOURCE.lock().unwrap() = Some(argo);
+        enabled_argo = true;
+    }
+
+    if !enabled_bsose
+        && !enabled_oisst
+        && !enabled_copernicussla
+        && !enabled_ccmpwind
+        && !enabled_argo
+    {
         eprintln!(
             "warning: no datasets enabled. Set at least one of \
              MONGODB_URI_BSOSE / MONGODB_URI_NOAAOISST / \
-             MONGODB_URI_COPERNICUSSLA / MONGODB_URI_CCMPWIND."
+             MONGODB_URI_COPERNICUSSLA / MONGODB_URI_CCMPWIND / \
+             MONGODB_URI_ARGO."
         );
     } else {
         println!(
-            "Datasets enabled:{}{}{}{}",
+            "Datasets enabled:{}{}{}{}{}",
             if enabled_bsose { " bsose" } else { "" },
             if enabled_oisst { " noaaoisst" } else { "" },
             if enabled_copernicussla { " copernicussla" } else { "" },
             if enabled_ccmpwind { " ccmpwind" } else { "" },
+            if enabled_argo { " argo" } else { "" },
         );
     }
 
@@ -616,6 +1004,9 @@ async fn main() -> std::io::Result<()> {
             }
             if enabled_ccmpwind {
                 cfg.service(ccmpwind_handler);
+            }
+            if enabled_argo {
+                cfg.service(argo_handler);
             }
         })
     })

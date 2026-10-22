@@ -1,8 +1,9 @@
 //! Per-dataset configuration governing request-size limits.
 //!
 //! This is the seam where pagination decisions hang off the dataset
-//! identity. `tile_degrees` drives spatial tile generation; `levels`
-//! defines the discrete depth pages within each spatial tile;
+//! identity. `tile_degrees` drives spatial tile generation; `page_axis`
+//! defines the inner page dimension within each spatial tile (discrete
+//! depth levels for grids, time slabs for in situ data);
 //! `max_radius_meters` caps `center + radius` queries (which go through
 //! MongoDB `$near` and aren't paginated, so the cap is the only thing
 //! preventing a runaway disk-of-most-of-the-globe); `coverage_bbox`
@@ -27,6 +28,101 @@ use mongodb::bson::DateTime as BsonDateTime;
 use super::geometry::BoundingBox;
 use super::schema::DataInfo;
 
+/// The dataset's second pagination axis — the "inner" page dimension
+/// crossed with spatial tiles.
+///
+/// For the gridded timeseries datasets this is the discrete vertical
+/// `Levels` axis: page `i` within a spatial tile is the depth bracket
+/// `[L_i, L_{i+1})` (final bracket open-ended). For in situ point
+/// observations (Argo profiles) there is no per-doc `level` field to
+/// page on — each doc is a whole water column at one (point, time) —
+/// so the page axis is `TimeSlabs`: page `i` is the time bracket
+/// `[T_i, T_{i+1})` over the doc's scalar `timestamp` (final bracket
+/// open-ended, mirroring levels).
+///
+/// The two arms are deliberately isomorphic: a page index resolves to a
+/// half-open bracket over a scalar field, and everything downstream
+/// (tile crossing, probe-forward, `next_url`) is arm-agnostic. The only
+/// asymmetry is *where the bracket boundaries live*: levels are static
+/// config, but slab boundaries depend on the dataset's time span, which
+/// is only known at runtime (loaded at startup). So `TimeSlabs` carries
+/// just the slab width; the actual slab-start list is computed by
+/// `tile_generator::time_slab_starts` and threaded through the
+/// `*_with_slabs` entry points. The plain `generate_tiles` /
+/// `compose_filter_with_tile` signatures — the ones the grid handlers
+/// call — don't take slabs and are byte-for-byte the old behaviour.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PageAxis {
+    /// Discrete vertical levels, strictly increasing, shallowest first.
+    /// Page `i` ⇒ `level: { $gte: L_i, $lt: L_{i+1} }` (no `$lt` for
+    /// the deepest level).
+    Levels(&'static [f64]),
+    /// Fixed-width time slabs over the doc's scalar `timestamp`.
+    /// Page `i` ⇒ `timestamp: { $gte: T_i, $lt: T_{i+1} }` (no `$lt`
+    /// for the final slab). Width is in days — calendar-agnostic
+    /// arithmetic on epoch millis; slab boundaries are aesthetic, not
+    /// semantic, so day-based math keeps the generator pure and simple.
+    TimeSlabs { width_days: i64 },
+}
+
+impl PageAxis {
+    /// The level values when this axis is `Levels`, or an empty slice
+    /// otherwise. Exists so config invariants and tests can keep
+    /// reading "the levels" without matching on the enum everywhere.
+    pub fn levels(&self) -> &'static [f64] {
+        match self {
+            PageAxis::Levels(l) => l,
+            PageAxis::TimeSlabs { .. } => &[],
+        }
+    }
+}
+
+/// Query-string parameters recognised by the gridded `/timeseries/*`
+/// endpoints. Unknown qsp names are rejected with a 400 + "did you
+/// mean" suggestion (see `helpers::validate_query_params`). Keep in
+/// sync with the table in `api/PAGINATION.md`.
+pub const GRID_QSP: &[&str] = &[
+    "id",
+    "box",
+    "polygon",
+    "center",
+    "radius",
+    "verticalRange",
+    "startDate",
+    "endDate",
+    "data",
+    "compression",
+    "batchmeta",
+    "tile_index",
+];
+
+/// Query-string parameters recognised by `/argo` — the grid set plus the
+/// profile family's own: `platform` (all profiles of one float, bypasses
+/// tiling), `source` (pipeline-tag filters, `~`-negatable), and
+/// `mostrecent` (N most recent matching profiles, bypasses tiling).
+pub const ARGO_QSP: &[&str] = &[
+    "id",
+    "box",
+    "polygon",
+    "center",
+    "radius",
+    "verticalRange",
+    "startDate",
+    "endDate",
+    "data",
+    "compression",
+    "batchmeta",
+    "tile_index",
+    "platform",
+    "source",
+    "mostrecent",
+];
+
+/// The `source` tags `/argo` accepts (upstream pipeline provenance, the
+/// `source[].source` arrays on the docs). Positive tokens require the
+/// tag; `~`-prefixed tokens require its absence.
+pub const ARGO_SOURCES: &[&str] = &["argo_core", "argo_bgc", "argo_deep"];
+
 /// Per-dataset request-size policy.
 ///
 /// `tile_degrees`: edge length (degrees of longitude and latitude) of one
@@ -39,11 +135,14 @@ use super::schema::DataInfo;
 /// Mongo's `$near` enforces its own bound; we cap the bound so a
 /// malicious or naive caller can't ask for a half-globe disk.
 ///
-/// `levels`: the discrete vertical levels the dataset is sampled at, in
-/// strictly increasing order (shallowest first). Pagination treats each
-/// level as a separate page within a spatial tile. Datasets without a
-/// vertical dimension can pass a single-element slice (effectively a
-/// single "level" per tile).
+/// `page_axis`: the dataset's inner pagination dimension (see
+/// `PageAxis`). Grids use `Levels(...)` — the discrete vertical levels
+/// the dataset is sampled at, in strictly increasing order (shallowest
+/// first); pagination treats each level as a separate page within a
+/// spatial tile, and datasets without a vertical dimension pass a
+/// single-element slice (effectively a single "level" per tile). In
+/// situ datasets use `TimeSlabs { width_days }` and page through time
+/// brackets instead.
 ///
 /// `coverage_bbox`: optional rectangle the dataset's data is known to
 /// live inside. The tile generator drops any spatial tile that doesn't
@@ -53,18 +152,56 @@ use super::schema::DataInfo;
 /// rectangle is treated as inclusive on its edges; a doc lying exactly
 /// on the coverage boundary is preserved.
 ///
-/// `allowed_data_vars`: the per-dataset variable names accepted in the
-/// `data=` qsp. Used by `validate_data_param` to reject typos (and to
-/// power the "did you mean" suggestion). Does not include the universal
-/// tokens (`all`, `except-data-values`) or integer QC filters —
-/// those are accepted regardless of dataset and handled by the
+/// `allowed_data_vars`: the per-dataset *base* variable names accepted
+/// in the `data=` qsp. Used by `validate_data_param` to reject typos
+/// (and to power the "did you mean" suggestion). Does not include the
+/// universal tokens (`all`, `except-data-values`) or integer QC filters
+/// — those are accepted regardless of dataset and handled by the
 /// validator directly.
+///
+/// `data_var_modifiers` / `data_var_companion`: the dataset's token
+/// *grammar* on top of the base names. A valid variable token is
+/// `base[modifier][companion]` — e.g. Argo's `doxy_med_argoqc` =
+/// base `doxy` + modifier `_med` + companion `_argoqc`, per the 2.x
+/// validator pattern. The validator strips one optional companion, then
+/// one optional modifier, then looks the base up in
+/// `allowed_data_vars`. Datasets without suffixed variables (all the
+/// grids) declare `&[]` / `None` and get exact-match behaviour,
+/// unchanged.
+///
+/// `data_var_negation`: whether `data=` tokens may carry a `~` prefix
+/// (e.g. `data=salinity,~doxy`) — a *profile-level presence filter*:
+/// keep only docs that do NOT list the negated variable in their
+/// `data_info`. Meaningful for heterogeneous in situ collections (core
+/// vs BGC floats); meaningless for grids, where every doc carries the
+/// same variables — grids declare `false` and `~` tokens are rejected.
 pub struct DatasetConfig {
     pub tile_degrees: f64,
     pub max_radius_meters: f64,
-    pub levels: &'static [f64],
+    pub page_axis: PageAxis,
     pub coverage_bbox: Option<BoundingBox>,
     pub allowed_data_vars: &'static [&'static str],
+    pub data_var_modifiers: &'static [&'static str],
+    pub data_var_companion: Option<&'static str>,
+    pub data_var_negation: bool,
+    /// The query-string parameter names this dataset's route accepts
+    /// (GRID_QSP for the grids, ARGO_QSP for /argo). Unknown names 400
+    /// with a suggestion computed against this list.
+    pub allowed_qsp: &'static [&'static str],
+    /// The `source=` tags this dataset accepts (empty for datasets
+    /// without a `source` qsp — the whitelist rejects the param before
+    /// token validation matters).
+    pub allowed_sources: &'static [&'static str],
+}
+
+impl DatasetConfig {
+    /// Convenience passthrough to `PageAxis::levels()` — the level
+    /// values for `Levels` datasets, empty for `TimeSlabs`. Keeps the
+    /// pre-`PageAxis` call sites (`config.levels` → `config.levels()`)
+    /// reading naturally.
+    pub fn levels(&self) -> &'static [f64] {
+        self.page_axis.levels()
+    }
 }
 
 /// Per-dataset identity + Mongo client + startup-loaded metadata, built
@@ -128,12 +265,17 @@ pub const BSOSE_LEVELS: &[f64] = &[2.1, 6.7, 12.15, 18.55, 26.25, 35.25, 45.0, 5
 pub const BSOSE_CONFIG: DatasetConfig = DatasetConfig {
     tile_degrees: 5.0,
     max_radius_meters: 100_000.0, // 100 km — bump if users complain
-    levels: BSOSE_LEVELS,
+    page_axis: PageAxis::Levels(BSOSE_LEVELS),
     coverage_bbox: Some(BoundingBox {
         sw: [-180.0, -90.0],
         ne: [180.0, -30.0],
     }),
     allowed_data_vars: &["THETA", "SALT"],
+    data_var_modifiers: &[],
+    data_var_companion: None,
+    data_var_negation: false,
+    allowed_qsp: GRID_QSP,
+    allowed_sources: &[],
 };
 
 /// OI SST has a single vertical level (the sea surface). We model it as
@@ -157,9 +299,14 @@ pub const OISST_LEVELS: &[f64] = &[0.0];
 pub const OISST_CONFIG: DatasetConfig = DatasetConfig {
     tile_degrees: 5.0,
     max_radius_meters: 100_000.0, // 100 km — relax once usage informs us
-    levels: OISST_LEVELS,
+    page_axis: PageAxis::Levels(OISST_LEVELS),
     coverage_bbox: None,
     allowed_data_vars: &["sst"],
+    data_var_modifiers: &[],
+    data_var_companion: None,
+    data_var_negation: false,
+    allowed_qsp: GRID_QSP,
+    allowed_sources: &[],
 };
 
 /// Copernicus SLA is a sea-surface product: like OI SST, a single
@@ -178,9 +325,14 @@ pub const COPERNICUSSLA_LEVELS: &[f64] = &[0.0];
 pub const COPERNICUSSLA_CONFIG: DatasetConfig = DatasetConfig {
     tile_degrees: 5.0,
     max_radius_meters: 100_000.0, // 100 km — same starting cap as OI SST
-    levels: COPERNICUSSLA_LEVELS,
+    page_axis: PageAxis::Levels(COPERNICUSSLA_LEVELS),
     coverage_bbox: None,
     allowed_data_vars: &["sla", "adt", "ugosa", "ugos", "vgosa", "vgos"],
+    data_var_modifiers: &[],
+    data_var_companion: None,
+    data_var_negation: false,
+    allowed_qsp: GRID_QSP,
+    allowed_sources: &[],
 };
 
 /// CCMP wind is a sea-surface product: single vertical level modeled as
@@ -197,9 +349,14 @@ pub const CCMPWIND_LEVELS: &[f64] = &[0.0];
 pub const CCMPWIND_CONFIG: DatasetConfig = DatasetConfig {
     tile_degrees: 5.0,
     max_radius_meters: 100_000.0, // 100 km — same starting cap as the others
-    levels: CCMPWIND_LEVELS,
+    page_axis: PageAxis::Levels(CCMPWIND_LEVELS),
     coverage_bbox: None,
     allowed_data_vars: &["uwnd", "vwnd", "ws", "nobs"],
+    data_var_modifiers: &[],
+    data_var_companion: None,
+    data_var_negation: false,
+    allowed_qsp: GRID_QSP,
+    allowed_sources: &[],
 };
 
 #[cfg(test)]
@@ -237,7 +394,7 @@ mod tests {
         // Pagination treats each level as a page; an empty level list would
         // produce a dataset with zero pages, which is almost certainly a
         // misconfiguration rather than an intentional state.
-        assert!(!BSOSE_CONFIG.levels.is_empty());
+        assert!(!BSOSE_CONFIG.levels().is_empty());
     }
 
     #[test]
@@ -245,7 +402,7 @@ mod tests {
         // The tile generator will rely on level order to map a level index
         // to a (lower, upper) depth bracket. If two levels collide or the
         // sequence reverses, that mapping is ambiguous.
-        for w in BSOSE_CONFIG.levels.windows(2) {
+        for w in BSOSE_CONFIG.levels().windows(2) {
             assert!(
                 w[0] < w[1],
                 "levels must be strictly increasing; found {} not < {}",
@@ -260,7 +417,7 @@ mod tests {
         // Depth is conventionally positive-downward in oceanographic data;
         // a negative value would indicate a sign-convention bug we'd want
         // to catch early.
-        for &d in BSOSE_CONFIG.levels {
+        for &d in BSOSE_CONFIG.levels() {
             assert!(d >= 0.0, "level depths should be non-negative; got {}", d);
         }
     }
@@ -291,7 +448,7 @@ mod tests {
         // Even a single-level dataset must have a one-element levels
         // array so the tile generator emits one tile per spatial cell.
         // An empty list would produce zero pages.
-        assert!(!OISST_CONFIG.levels.is_empty());
+        assert!(!OISST_CONFIG.levels().is_empty());
     }
 
     #[test]
@@ -301,8 +458,8 @@ mod tests {
         // composer code path work without special-casing "no vertical
         // dimension". If this ever changes, we should pause and think
         // about what multi-level OI SST would mean physically.
-        assert_eq!(OISST_CONFIG.levels.len(), 1);
-        assert!((OISST_CONFIG.levels[0] - 0.0).abs() < 1e-9);
+        assert_eq!(OISST_CONFIG.levels().len(), 1);
+        assert!((OISST_CONFIG.levels()[0] - 0.0).abs() < 1e-9);
     }
 
     #[test]
@@ -337,8 +494,8 @@ mod tests {
         // Sea level anomaly is by construction a surface product; the
         // single-element levels array keeps the tile generator on the
         // no-special-case path (see OI SST).
-        assert_eq!(COPERNICUSSLA_CONFIG.levels.len(), 1);
-        assert!((COPERNICUSSLA_CONFIG.levels[0] - 0.0).abs() < 1e-9);
+        assert_eq!(COPERNICUSSLA_CONFIG.levels().len(), 1);
+        assert!((COPERNICUSSLA_CONFIG.levels()[0] - 0.0).abs() < 1e-9);
     }
 
     #[test]
@@ -383,8 +540,8 @@ mod tests {
     fn ccmpwind_has_exactly_one_surface_level() {
         // Surface wind product; the single-element levels array keeps
         // the tile generator on the no-special-case path (see OI SST).
-        assert_eq!(CCMPWIND_CONFIG.levels.len(), 1);
-        assert!((CCMPWIND_CONFIG.levels[0] - 0.0).abs() < 1e-9);
+        assert_eq!(CCMPWIND_CONFIG.levels().len(), 1);
+        assert!((CCMPWIND_CONFIG.levels()[0] - 0.0).abs() < 1e-9);
     }
 
     #[test]
@@ -403,4 +560,169 @@ mod tests {
             &["uwnd", "vwnd", "ws", "nobs"]
         );
     }
+
+    // ---- Argo config invariants ---------------------------------------------
+
+    #[test]
+    fn argo_tile_degrees_is_positive_and_divides_a_hemisphere() {
+        assert!(ARGO_CONFIG.tile_degrees > 0.0);
+        assert!(
+            (180.0_f64 % ARGO_CONFIG.tile_degrees).abs() < 1e-9,
+            "tile_degrees should evenly divide 180° for clean global coverage"
+        );
+        assert!(
+            (360.0_f64 % ARGO_CONFIG.tile_degrees).abs() < 1e-9,
+            "tile_degrees should evenly divide 360° for clean global coverage"
+        );
+    }
+
+    #[test]
+    fn argo_max_radius_is_positive_and_subhemispheric() {
+        assert!(ARGO_CONFIG.max_radius_meters > 0.0);
+        assert!(ARGO_CONFIG.max_radius_meters < 1.0e7);
+        // Deliberately larger than the grids' cap — sparse in situ data.
+        assert!(ARGO_CONFIG.max_radius_meters > BSOSE_CONFIG.max_radius_meters);
+    }
+
+    #[test]
+    fn argo_page_axis_is_yearly_time_slabs() {
+        match ARGO_CONFIG.page_axis {
+            PageAxis::TimeSlabs { width_days } => {
+                assert!(width_days > 0, "slab width must be positive");
+                assert_eq!(width_days, 365, "yearly slabs per ARGO-DESIGN.md");
+            }
+            PageAxis::Levels(_) => panic!("Argo pages through time, not levels"),
+        }
+        // And therefore no level values to bracket.
+        assert!(ARGO_CONFIG.levels().is_empty());
+    }
+
+    #[test]
+    fn argo_has_global_coverage() {
+        assert!(ARGO_CONFIG.coverage_bbox.is_none(), "floats drift everywhere");
+    }
+
+    #[test]
+    fn argo_vocabulary_is_bases_only_with_suffix_grammar() {
+        // Structural invariants: core variables present, the list holds
+        // *base* names only (suffixed forms come from the token grammar,
+        // not enumeration), and the grammar fields carry the 2.x
+        // pattern's suffixes.
+        for core in ["pressure", "temperature", "salinity"] {
+            assert!(ARGO_CONFIG.allowed_data_vars.contains(&core));
+        }
+        for var in ARGO_CONFIG.allowed_data_vars {
+            assert!(
+                !var.ends_with("_argoqc") && !var.ends_with("_std") && !var.ends_with("_med"),
+                "'{}' looks suffixed — the vocabulary should hold bases only",
+                var
+            );
+        }
+        assert_eq!(ARGO_CONFIG.data_var_modifiers, &["_std", "_med"]);
+        assert_eq!(ARGO_CONFIG.data_var_companion, Some("_argoqc"));
+        assert!(ARGO_CONFIG.data_var_negation, "~ negation is a 2.x argo feature");
+        // And the grids stay exact-match, no negation.
+        assert!(BSOSE_CONFIG.data_var_modifiers.is_empty());
+        assert_eq!(BSOSE_CONFIG.data_var_companion, None);
+        assert!(!BSOSE_CONFIG.data_var_negation);
+    }
+}
+
+// argo (profile family) ///////////////////////////////////////////////////////
+
+/// Base variable names accepted in `/argo`'s `data=` qsp — transcribed
+/// from the 2.x validator's `argo_data_keys` pattern, which is the
+/// authority on the vocabulary. A full token is
+/// `base[_std|_med][_argoqc]` (see `data_var_modifiers` /
+/// `data_var_companion` on `ARGO_CONFIG`): the suffix grammar lives in
+/// config, so this list stays bases-only — adding a variable is one
+/// line. No single Argo doc carries all of these (core vs BGC vs deep
+/// differ per float); a validated-but-absent variable simply drops the
+/// doc downstream, per the drop-on-empty rule.
+///
+/// Not yet carried over from the 2.x pattern: the `~` negation prefix
+/// (semantics to be pinned down before implementing — see
+/// ARGO-DESIGN.md open questions), and 2.x's integer tokens being
+/// non-negative only (`[0-9]+`) where our shared validator accepts any
+/// signed integer, a harmless superset.
+pub const ARGO_VARS: &[&str] = &[
+    "bbp470",
+    "bbp532",
+    "bbp700",
+    "bbp700_2",
+    "bisulfide",
+    "cdom",
+    "chla",
+    "cndc",
+    "cndx",
+    "cp660",
+    "down_irradiance380",
+    "down_irradiance412",
+    "down_irradiance442",
+    "down_irradiance443",
+    "down_irradiance490",
+    "down_irradiance555",
+    "down_irradiance670",
+    "downwelling_par",
+    "doxy",
+    "doxy2",
+    "doxy3",
+    "molar_doxy",
+    "nitrate",
+    "ph_in_situ_total",
+    "pressure",
+    "salinity",
+    "salinity_sfile",
+    "temperature",
+    "temperature_sfile",
+    "turbidity",
+    "up_radiance412",
+    "up_radiance443",
+    "up_radiance490",
+    "up_radiance555",
+];
+
+/// Configuration for the Argo profile dataset.
+///
+/// 5° tiles match the grids (uniformity); the page axis is yearly time
+/// slabs (ARGO-DESIGN.md sizing: ~50–100 profiles per tile-year on
+/// average — revisit with real per-tile-slab counts). The radius cap is
+/// 500 km, deliberately larger than the grids' 100 km: Argo is sparse
+/// (one profile per ~3°/10 days), so a small disk often catches
+/// nothing, and the time-slab page axis bounds per-page cost in a way
+/// the unpaginated 2.x `$near` couldn't. `coverage_bbox: None` — floats
+/// drift everywhere.
+pub const ARGO_CONFIG: DatasetConfig = DatasetConfig {
+    tile_degrees: 5.0,
+    max_radius_meters: 500_000.0, // 500 km — sparse in situ data needs reach
+    page_axis: PageAxis::TimeSlabs { width_days: 365 },
+    coverage_bbox: None,
+    allowed_data_vars: ARGO_VARS,
+    data_var_modifiers: &["_std", "_med"],
+    data_var_companion: Some("_argoqc"),
+    data_var_negation: true,
+    allowed_qsp: ARGO_QSP,
+    allowed_sources: ARGO_SOURCES,
+};
+
+/// Per-dataset identity + Mongo client + startup-loaded state for the
+/// *profile* family — the sibling of `DatasetSource` with the family's
+/// own startup cache. Where a grid caches its meta doc's time axis and
+/// `data_info` default, a profile dataset has neither (no single meta
+/// doc, per-doc `data_info`); what it caches instead is the slab-start
+/// list for the `TimeSlabs` page axis, computed once at startup from
+/// the collection's `[earliest, latest]` timestamp span via
+/// `tile_generator::time_slab_starts`.
+///
+/// Same `Clone` rationale as `DatasetSource`: handlers copy it out of a
+/// `Lazy<Mutex<Option<_>>>` static at the top of each request so the
+/// mutex is never held across `.await`. The clone is cheap — the client
+/// is Arc-backed and the slab list is a few hundred datetimes at most.
+#[derive(Clone)]
+pub struct ProfileSource {
+    pub client: mongodb::Client,
+    pub db_name: &'static str,
+    pub collection: &'static str,
+    pub meta_collection: &'static str,
+    pub slab_starts: Vec<BsonDateTime>,
 }

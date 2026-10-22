@@ -45,7 +45,7 @@ jobs:
 
       # Pinned to match the Rust version in the Dockerfile. Bump both
       # together when you decide to move.
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.89
 
       # Caches ~/.cargo and api/target between runs, keyed off Cargo.lock.
       # Roughly halves CI time on the second run onward.
